@@ -706,6 +706,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             allow_vllm_cutlass=True,
         )
 
+        # Scratchpad for MoE monokernel.
+        # (more than) enough space for
+        # BS+8 x N             fp32
+        # BS                   fp32
+        # BS   x HIDDEN_STATES fp16
+        # with BS = 1024:  4MB + <1MB + 10MB < 4M x 4byte
+        self.moe_monokernel_scratchpad = torch.empty((1024, 4096),
+                                                     dtype=torch.float32,
+                                                     device=f"cuda:{torch.distributed.get_rank()}")
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -966,6 +976,22 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # MoE monokernel for BS <= 64
+        # Supports Llama4 Maverick & Scout with TP = 8
+        E, M, N, K = layer.global_num_experts, x.size(0), layer.w13_weight.size(1), x.size(1)
+        if (E == 16 or E == 128) and M <= 64 and K == 5120 and N == 2048:
+            if self.moe_monokernel_scratchpad.device != x.device:
+                self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(x.device)
+            return torch.ops.vllm.moe_monokernel(
+                x,
+                router_logits,
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                self.moe_monokernel_scratchpad
+            )
+
         assert self.moe_kernel is not None
         return self.moe_kernel.apply_monolithic(
             x,

@@ -58,6 +58,63 @@ void shuffle_rows(const torch::Tensor& input_tensor,
                   torch::Tensor& output_tensor);
 
 #ifndef USE_ROCM
+void moe_monokernel_BS8_E16_TP8_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+void moe_monokernel_BS8_E16_TP4_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+void moe_monokernel_BS64_E16_TP8_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+void moe_monokernel_BS64_E16_TP4_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+void moe_monokernel_BS8_E128_TP8_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+void moe_monokernel_BS64_E128_TP8_impl(
+    const torch::Tensor& activations_in,
+    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down,
+    torch::Tensor& activations_out,
+    torch::Tensor& gemmspec);
+#endif
+
+#ifndef USE_ROCM
 // cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
 torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
                                     torch::Tensor const& weight);
