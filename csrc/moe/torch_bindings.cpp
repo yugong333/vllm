@@ -23,6 +23,35 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
 #ifndef USE_ROCM
+  // Moe Monokernel for Llama4 Scout - TP8
+  m.def("moe_monokernel_BS8_E16_TP8(Tensor activations_in,"
+  "Tensor router_logits,"
+  "Tensor expert_weights_up, Tensor expert_scales_up,"
+  "Tensor expert_weights_down, Tensor expert_scales_down,"
+  "Tensor! activations_out, Tensor! scratchpad) -> ()");
+  m.impl("moe_monokernel_BS8_E16_TP8", torch::kCUDA, &moe_monokernel_BS8_E16_TP8_impl);
+  m.def("moe_monokernel_BS64_E16_TP8(Tensor activations_in,"
+  "Tensor router_logits,"
+  "Tensor expert_weights_up, Tensor expert_scales_up,"
+  "Tensor expert_weights_down, Tensor expert_scales_down,"
+  "Tensor! activations_out, Tensor! scratchpad) -> ()");
+  m.impl("moe_monokernel_BS64_E16_TP8", torch::kCUDA, &moe_monokernel_BS64_E16_TP8_impl);
+  // Moe Monokernel for Llama4 Maverick - TP8
+  m.def("moe_monokernel_BS8_E128_TP8(Tensor activations_in,"
+  "Tensor router_logits,"
+  "Tensor expert_weights_up, Tensor expert_scales_up,"
+  "Tensor expert_weights_down, Tensor expert_scales_down,"
+  "Tensor! activations_out, Tensor! scratchpad) -> ()");
+  m.impl("moe_monokernel_BS8_E128_TP8", torch::kCUDA, &moe_monokernel_BS8_E128_TP8_impl);
+  m.def("moe_monokernel_BS64_E128_TP8(Tensor activations_in,"
+  "Tensor router_logits,"
+  "Tensor expert_weights_up, Tensor expert_scales_up,"
+  "Tensor expert_weights_down, Tensor expert_scales_down,"
+  "Tensor! activations_out, Tensor! scratchpad) -> ()");
+  m.impl("moe_monokernel_BS64_E128_TP8", torch::kCUDA, &moe_monokernel_BS64_E128_TP8_impl);
+#endif
+
+#ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
       "Tensor b_scales, Tensor? b_qzeros, "
