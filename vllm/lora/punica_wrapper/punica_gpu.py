@@ -393,6 +393,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             expand_config.get("BLOCK_SIZE_K", expand_config.get("block_k")),
             expand_config.get("GROUP_SIZE_M", expand_config.get("group_m")),
             expand_config.get("num_warps", 4),
-            expand_config.get("num_stages", 3),
+            expand_config.get("num_stages", 3), 
             mul_routed_weight,
         )
