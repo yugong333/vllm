@@ -858,7 +858,7 @@ class InputBatch:
         return prompt_token_ids_cpu_tensor.to(device=self.device, non_blocking=True)
 
     def make_lora_inputs(
-        self, num_scheduled_tokens: np.ndarray
+        self, num_scheduled_tokens: np.ndarray, num_sampled_tokens: np.ndarray
     ) -> tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:
         """
         Given the num_scheduled_tokens for each request in the batch, return
@@ -872,7 +872,8 @@ class InputBatch:
         """
 
         req_lora_mapping = self.request_lora_mapping[: self.num_reqs]
-        prompt_lora_mapping = tuple(req_lora_mapping)
+        # prompt_lora_mapping = tuple(req_lora_mapping)
+        prompt_lora_mapping = tuple(req_lora_mapping.repeat(num_sampled_tokens))
         token_lora_mapping = tuple(req_lora_mapping.repeat(num_scheduled_tokens))
         active_lora_requests: set[LoRARequest] = set(
             self.lora_id_to_lora_request.values()
