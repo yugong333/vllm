@@ -70,7 +70,9 @@ class LoRAModelRunnerMixin:
             raise RuntimeError("LoRA is not enabled. Use --enable-lora to enable LoRA.")
 
     def set_active_loras(
-        self, input_batch: InputBatch, num_scheduled_tokens: np.ndarray,
+        self,
+        input_batch: InputBatch,
+        num_scheduled_tokens: np.ndarray,
         num_sampled_tokens: np.ndarray | None = None,
     ) -> None:
         if num_sampled_tokens is None:
@@ -167,7 +169,7 @@ class LoRAModelRunnerMixin:
                 for lora_id in range(1, num_loras + 1)
             }
 
-            ## TODO 
+            ## TODO
             self._set_active_loras(
                 tuple(sample_lora_mapping), tuple(token_lora_mapping), lora_requests
             )
