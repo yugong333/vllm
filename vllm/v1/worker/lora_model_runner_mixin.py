@@ -187,8 +187,7 @@ class LoRAModelRunnerMixin:
         with (
             self.maybe_setup_dummy_loras(lora_config, remove_lora),
             self.maybe_select_dummy_loras(
-                lora_config, num_scheduled_tokens, num_sampled_tokens,
-                activate_lora
+                lora_config, num_scheduled_tokens, num_sampled_tokens, activate_lora
             ),
         ):
             yield
