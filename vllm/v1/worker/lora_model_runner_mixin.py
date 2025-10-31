@@ -73,7 +73,7 @@ class LoRAModelRunnerMixin:
         self,
         input_batch: InputBatch,
         num_scheduled_tokens: np.ndarray,
-        num_sampled_tokens: Optional[np.ndarray] = None,
+        num_sampled_tokens: np.ndarray | None = None,
     ) -> None:
         if num_sampled_tokens is None:
             num_sampled_tokens = np.ones_like(num_scheduled_tokens, dtype=np.int32)
@@ -127,9 +127,9 @@ class LoRAModelRunnerMixin:
     @contextmanager
     def maybe_select_dummy_loras(
         self,
-        lora_config: Optional[LoRAConfig],
+        lora_config: LoRAConfig | None,
         num_scheduled_tokens: np.ndarray,
-        num_sampled_tokens: Optional[np.ndarray] = None,
+        num_sampled_tokens: np.ndarray | None = None,
         activate_lora: bool = True,
     ):
         if num_sampled_tokens is None:
