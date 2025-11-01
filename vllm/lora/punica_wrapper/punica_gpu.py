@@ -51,8 +51,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             self.max_loras, max_num_batched_tokens, device=device
         )
 
+        # prompt_mapping_meta stores per-request (token-level for sampler)
+        # metadata. It must be able to hold up to `max_num_batched_tokens`
+        # entries (not just `max_batches`). Using `max_batches` here caused
+        # a size mismatch when sampler indices exceeded the smaller
+        # `max_batches` value (e.g., during speculative decoding).
         self.prompt_mapping_meta = LoRAKernelMeta.make(
-            self.max_loras, max_batches, device=device
+            self.max_loras, max_num_batched_tokens, device=device
         )
 
     def update_metadata(
