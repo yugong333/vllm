@@ -82,7 +82,6 @@ def _fused_moe_lora_kernel(
     # Meta-parameters
     num_slice_a: tl.constexpr,
     num_slice_c: tl.constexpr,
-    max_loras: tl.constexpr,
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     USE_B_L2_CACHE: tl.constexpr,  # new, enable .ca load for B
