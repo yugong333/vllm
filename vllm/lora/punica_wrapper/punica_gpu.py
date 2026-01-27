@@ -357,7 +357,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         )
 
         (token_lora_mapping, _, _, _, lora_ids, _, _) = (
-            self.token_mapping_meta.meta_args(num_tokens)
+            self.token_mapping_meta.meta_args(
+                num_tokens, self.lora_config.specialize_active_lora
+            )
         )
 
         ops.moe_lora_align_block_size(
@@ -402,7 +404,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
         """
         (_, _, _, _, lora_ids, _, num_active_loras) = self.token_mapping_meta.meta_args(
-            x.size(0)
+            x.size(0), self.lora_config.specialize_active_lora
         )
         fused_moe_lora(
             y,
@@ -435,5 +437,4 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             mul_routed_weight,
             fully_sharded,
             offset,
-            self.lora_config.specialize_active_lora,
         )
