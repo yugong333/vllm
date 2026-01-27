@@ -266,8 +266,6 @@ def _fused_moe_lora_shrink(
 
     b_ptr = _get_ptr(lora_a_stacked, device)
 
-    # Grid dimension for LoRA: use num_active_loras when specializing,
-    # otherwise use max_loras + 1 to account for the -1 (no-lora) case
     grid = lambda META: (
         split_k
         * triton.cdiv(EM, META["BLOCK_SIZE_M"])
@@ -373,8 +371,6 @@ def _fused_moe_lora_expand(
         "launch_pdl": use_gdc,  # triton kernel metadata
     }
 
-    # Grid dimension for LoRA: use num_active_loras when specializing,
-    # otherwise use max_loras + 1 to account for the -1 (no-lora) case
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         len(lora_b_stacked),
