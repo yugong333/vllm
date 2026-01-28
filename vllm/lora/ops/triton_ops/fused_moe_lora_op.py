@@ -102,16 +102,15 @@ def _fused_moe_lora_kernel(
     if lora_id == -1:
         # Early exit for the no-lora case.
         return
+    # The grid's axis-2 dimension may differ from max_loras when specializing.
+    # This guard MUST come before any access using lora_id to prevent
+    # out-of-bounds memory access on adapter_enabled, sorted_token_ids,
+    # expert_ids, or the lora weight tensors.
+    if lora_id >= max_loras:
+        return
     moe_enabled = tl.load(adapter_enabled + lora_id)
     if moe_enabled == 0:
         # Early exit for the no moe lora case.
-        return
-    # The grid's axis-2 dimension is max_loras + 1 to accommodate the -1 sentinel.
-    # This guard ensures we don't access sorted_token_ids / expert_ids /
-    # num_tokens_post_padded beyond their allocated bounds if an invalid
-    # lora_id somehow appears. Although the caller should pass correct
-    # max_loras, defensive programming prevents accidental out-of-bounds.
-    if lora_id >= max_loras:
         return
     grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
 
@@ -288,7 +287,7 @@ def _fused_moe_lora_shrink(
         num_experts,
         lora_ids,
         adapter_enabled,
-        lora_a_stacked[0].shape[0] + 1,
+        lora_a_stacked[0].shape[0],
         qcurr_hidden_states.stride(0),
         qcurr_hidden_states.stride(1),
         w1_lora_a_stacked.stride(0),
@@ -391,7 +390,7 @@ def _fused_moe_lora_expand(
         num_experts,
         lora_ids,
         adapter_enabled,
-        lora_b_stacked[0].shape[0] + 1,
+        lora_b_stacked[0].shape[0],
         a_intermediate_cache1.stride(0),
         a_intermediate_cache1.stride(1),
         w1_lora_b_stacked.stride(0),
