@@ -235,6 +235,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                         self.max_loras, -1
                     )
                 #
+                print("*" * 20, "W13 Kernels", "*" * 20)
+                print(f"num_slices: {len(self.w13_lora_a_stacked)}")
+                for i in range(len(self.w13_lora_a_stacked)):
+                    print(
+                        f"w13_lora_a_stacked[{i}].shape: {self.w13_lora_a_stacked[i].shape}"
+                    )
+                    print(
+                        f"w13_lora_b_stacked[{i}].shape: {self.w13_lora_b_stacked[i].shape}"
+                    )
+                print(f"topK is {top_k}")
 
                 self.punica_wrapper.add_lora_fused_moe(
                     input.view(-1, top_k, input.shape[-1]),
@@ -303,7 +313,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 intermediate_cache3 = args[0]
 
                 shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
-
+                # print("*" * 20, "W2 Kernels", "*" * 20)
+                # print(f"num_slices: {len(self.w2_lora_a_stacked)}")
+                # for i in range(len(self.w2_lora_a_stacked)):
+                #     print(f"w2_lora_a_stacked[{i}].shape: {self.w2_lora_a_stacked[i].shape}")
+                #     print(f"w2_lora_b_stacked[{i}].shape: {self.w2_lora_b_stacked[i].shape}")
                 self.punica_wrapper.add_lora_fused_moe(
                     intermediate_cache3,
                     intermediate_cache2,
