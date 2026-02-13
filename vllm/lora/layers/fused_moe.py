@@ -153,13 +153,28 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         def fwd_decorator(layer, func):
             def wrapper(*args, **kwargs):
-                moe_state_dict["hidden_states"] = kwargs["hidden_states"]
-                moe_state_dict["topk_ids"] = kwargs["topk_ids"]
-                moe_state_dict["topk_weights"] = kwargs["topk_weights"]
-                moe_state_dict["expert_map"] = kwargs["expert_map"]
-                moe_state_dict["apply_router_weight_on_input"] = kwargs[
-                    "apply_router_weight_on_input"
-                ]
+                # Handle both positional and keyword arguments.
+                # forward(hidden_states, w1, w2, topk_weights, topk_ids, ...)
+                # Note: self is already bound, so args[0] = hidden_states
+                if "hidden_states" in kwargs:
+                    moe_state_dict["hidden_states"] = kwargs["hidden_states"]
+                elif len(args) > 0:
+                    moe_state_dict["hidden_states"] = args[0]
+
+                if "topk_ids" in kwargs:
+                    moe_state_dict["topk_ids"] = kwargs["topk_ids"]
+                elif len(args) > 4:
+                    moe_state_dict["topk_ids"] = args[4]
+
+                if "topk_weights" in kwargs:
+                    moe_state_dict["topk_weights"] = kwargs["topk_weights"]
+                elif len(args) > 3:
+                    moe_state_dict["topk_weights"] = args[3]
+
+                moe_state_dict["expert_map"] = kwargs.get("expert_map")
+                moe_state_dict["apply_router_weight_on_input"] = kwargs.get(
+                    "apply_router_weight_on_input", False
+                )
                 result = func(*args, **kwargs)
                 return result
 
@@ -239,10 +254,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 print(f"num_slices: {len(self.w13_lora_a_stacked)}")
                 for i in range(len(self.w13_lora_a_stacked)):
                     print(
-                        f"w13_lora_a_stacked[{i}].shape: {self.w13_lora_a_stacked[i].shape}"
+                        f"w13_lora_a_stacked[{i}].shape: \
+                            {self.w13_lora_a_stacked[i].shape}"
                     )
                     print(
-                        f"w13_lora_b_stacked[{i}].shape: {self.w13_lora_b_stacked[i].shape}"
+                        f"w13_lora_b_stacked[{i}].shape: \
+                            {self.w13_lora_b_stacked[i].shape}"
                     )
                 print(f"topK is {top_k}")
 
@@ -313,11 +330,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 intermediate_cache3 = args[0]
 
                 shard_size_w2 = divide(self.base_layer.hidden_size, self.tp_size)
-                # print("*" * 20, "W2 Kernels", "*" * 20)
-                # print(f"num_slices: {len(self.w2_lora_a_stacked)}")
-                # for i in range(len(self.w2_lora_a_stacked)):
-                #     print(f"w2_lora_a_stacked[{i}].shape: {self.w2_lora_a_stacked[i].shape}")
-                #     print(f"w2_lora_b_stacked[{i}].shape: {self.w2_lora_b_stacked[i].shape}")
+                print("*" * 20, "W2 Kernels", "*" * 20)
+                print(f"num_slices: {len(self.w2_lora_a_stacked)}")
+                for i in range(len(self.w2_lora_a_stacked)):
+                    print(
+                        f"w2_lora_a_stacked[{i}].shape: \
+                            {self.w2_lora_a_stacked[i].shape}"
+                    )
+                    print(
+                        f"w2_lora_b_stacked[{i}].shape: \
+                            {self.w2_lora_b_stacked[i].shape}"
+                    )
                 self.punica_wrapper.add_lora_fused_moe(
                     intermediate_cache3,
                     intermediate_cache2,
