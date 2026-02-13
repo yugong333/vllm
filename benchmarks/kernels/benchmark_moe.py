@@ -828,6 +828,60 @@ def main(args: argparse.Namespace):
     config = get_config(model=args.model, trust_remote_code=args.trust_remote_code)
     if args.model_prefix:
         config = getattr(config, args.model_prefix)
+
+    # Print the full quantization_config from model to help determine --dtype
+    print(f"\n{'=' * 60}")
+    print("Model Quantization Config (from HuggingFace config):")
+    quantization_config = getattr(config, "quantization_config", None)
+    if quantization_config is not None:
+        print(f"  quantization_config type: {type(quantization_config)}")
+        if isinstance(quantization_config, dict):
+            for key, value in quantization_config.items():
+                print(f"    {key}: {value}")
+        else:
+            print(f"  quantization_config: {quantization_config}")
+        # Check for common FP8 indicators
+        quant_method = (
+            quantization_config.get("quant_method", None)
+            if isinstance(quantization_config, dict)
+            else getattr(quantization_config, "quant_method", None)
+        )
+        print(f"\n  Detected quant_method: {quant_method}")
+
+        # Also check for modelopt format (NVIDIA's quantization format)
+        # modelopt uses: quantization.quant_algo instead of quant_method
+        modelopt_quant = None
+        if isinstance(quantization_config, dict):
+            quant_info = quantization_config.get("quantization", {})
+            if isinstance(quant_info, dict):
+                modelopt_quant = quant_info.get("quant_algo", None)
+                print(f"  Detected modelopt quant_algo: {modelopt_quant}")
+
+        if quant_method in ["fp8", "fbgemm_fp8"]:
+            print("  >>> SUGGESTION: Use --dtype fp8_w8a8 for this model")
+        elif modelopt_quant and "FP8" in str(modelopt_quant).upper():
+            print(
+                "  >>> SUGGESTION: Use --dtype fp8_w8a8 for this model"
+                " (modelopt FP8 detected)"
+            )
+        elif quant_method in ["compressed-tensors"]:
+            # Check for FP8 in compressed-tensors
+            config_groups = (
+                quantization_config.get("config_groups", {})
+                if isinstance(quantization_config, dict)
+                else {}
+            )
+            for group_name, group_config in config_groups.items():
+                weights_config = group_config.get("weights", {})
+                weight_type = weights_config.get("type", None)
+                print(f"    config_group '{group_name}' weight type: {weight_type}")
+                if weight_type and "float8" in str(weight_type).lower():
+                    print("  >>> SUGGESTION: Use --dtype fp8_w8a8 for this model")
+    else:
+        print("  No quantization_config found in model config")
+        print(f"  Model dtype: {getattr(config, 'torch_dtype', 'unknown')}")
+    print(f"{'=' * 60}\n")
+
     E, topk, intermediate_size, hidden_size = get_model_params(config)
     enable_ep = bool(args.enable_expert_parallel)
     if enable_ep:
@@ -854,6 +908,16 @@ def main(args: argparse.Namespace):
         # For int4_w4a16, block_shape = [0, group_size]
         # block_shape[0]=0 means no block quantization on N dimension
         block_quant_shape = [0, group_size]
+
+    # Print quantization settings for confirmation
+    print(f"\n{'=' * 60}")
+    print("Quantization Configuration:")
+    print(f"  args.dtype: {args.dtype}")
+    print(f"  use_fp8_w8a8: {use_fp8_w8a8}")
+    print(f"  use_int8_w8a16: {use_int8_w8a16}")
+    print(f"  block_quant_shape: {block_quant_shape}")
+    print(f"  model dtype: {dtype}")
+    print(f"{'=' * 60}\n")
 
     if args.batch_size is None:
         batch_sizes = [
