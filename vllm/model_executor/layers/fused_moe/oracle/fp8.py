@@ -283,6 +283,16 @@ def select_fp8_moe_backend(
                 backend, config, weight_key, activation_key, activation_format
             )
 
+    # Handle explicit TRITON FP8 configuration.
+    if envs.is_set("VLLM_MOE_FORCE_TRITON") and envs.VLLM_MOE_FORCE_TRITON:
+        backend = (
+            Fp8MoeBackend.TRITON
+            if activation_format == mk.FusedMoEActivationFormat.Standard
+            else Fp8MoeBackend.BATCHED_TRITON
+        )
+        logger.info_once(_make_log_backend(backend), scope="local")
+        return backend, backend_to_kernel_cls(backend)
+
     # Handle explicit MARLIN FP8 configuration.
     if envs.VLLM_TEST_FORCE_FP8_MARLIN:
         backend = Fp8MoeBackend.MARLIN

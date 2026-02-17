@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_TPU_USING_PATHWAYS: bool = False
     VLLM_USE_DEEP_GEMM: bool = True
     VLLM_MOE_USE_DEEP_GEMM: bool = True
+    VLLM_MOE_FORCE_TRITON: bool = False
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -851,6 +852,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TEST_FORCE_FP8_MARLIN": lambda: (
         os.environ.get("VLLM_TEST_FORCE_FP8_MARLIN", "0").strip().lower()
         in ("1", "true")
+    ),
+    # If set, forces Triton backend for FP8 MoE layers regardless of
+    # is_supported_config checks (useful for non-gated MoE models).
+    "VLLM_MOE_FORCE_TRITON": lambda: (
+        os.environ.get("VLLM_MOE_FORCE_TRITON", "0").strip().lower() in ("1", "true")
     ),
     "VLLM_TEST_FORCE_LOAD_FORMAT": lambda: os.getenv(
         "VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"
