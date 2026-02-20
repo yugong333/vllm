@@ -26,7 +26,11 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     modular_triton_fused_moe,
     try_get_optimal_moe_config,
 )
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+from vllm.model_executor.layers.quantization.mxfp4 import (
+    Mxfp4Backend,
+    Mxfp4Config,
+    Mxfp4MoEMethod,
+)
 
 
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
@@ -35,12 +39,48 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.base_layer = base_layer
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.device = base_layer.w2_weight.device
+        # Get device from available weight tensors (w2_weight may be None
+        # for some quantization backends like MXFP4 Triton)
+        self.device = self._get_device(base_layer)
         self._inject_lora_into_fused_moe()
+
+    def _get_device(self, base_layer: FusedMoE) -> torch.device:
+        """Get device from any available weight tensor."""
+        # Try w2_weight first (most common)
+        if base_layer.w2_weight is not None:
+            return base_layer.w2_weight.device
+        # Fall back to w2_weight_scale (always present for quantized models)
+        if (
+            hasattr(base_layer, "w2_weight_scale")
+            and base_layer.w2_weight_scale is not None
+        ):
+            return base_layer.w2_weight_scale.device
+        # Fall back to w13_weight
+        if base_layer.w13_weight is not None:
+            return base_layer.w13_weight.device
+        # Fall back to w13_weight_scale
+        if (
+            hasattr(base_layer, "w13_weight_scale")
+            and base_layer.w13_weight_scale is not None
+        ):
+            return base_layer.w13_weight_scale.device
+        # Last resort: use CUDA device
+        return torch.device("cuda")
 
     def _inject_lora_into_fused_moe(self):
         moe_state_dict = {}
         top_k = self.base_layer.top_k
+
+        # Check if MXFP4 Triton backend is being used - not supported with LoRA
+        if (
+            isinstance(self.base_layer.quant_method, Mxfp4MoEMethod)
+            and self.base_layer.quant_method.mxfp4_backend == Mxfp4Backend.TRITON
+        ):
+            raise NotImplementedError(
+                "LoRA with MoE is not supported with MXFP4 Triton backend. "
+                "Please use MXFP4 Marlin backend by setting "
+                "VLLM_MXFP4_USE_MARLIN=1 environment variable."
+            )
 
         if self.base_layer.quant_config is None:
             quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
