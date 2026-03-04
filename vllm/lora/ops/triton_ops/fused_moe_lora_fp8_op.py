@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-
-from typing import List  # noqa: UP035
+from __future__ import annotations
 
 import torch
 
@@ -10,9 +8,12 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.lora.ops.triton_ops.utils import supports_pdl
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.torch_utils import direct_register_custom_op
+
+from .utils import supports_pdl, supports_tma
 
 
 @triton.jit
@@ -72,7 +73,39 @@ def _get_token_offs(
         )
 
 
+@triton.jit
+def _get_c_ptrs(
+    cur_c_ptr,
+    lora_id,
+    pid_m,
+    offs,
+    offs_token,
+    offs_cn,
+    stride_cm,
+    stride_cn,
+    EM: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    sort_c: tl.constexpr,
+):
+    # When sort_c is true, store the output in c_ptr using token order defined
+    # in sorted_token_ids_ptr; otherwise, use the original token order from the prompt
+    if sort_c:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        c_ptrs = (
+            cur_c_ptr
+            + lora_id * EM * stride_cm
+            + stride_cm * offs_token_id[:, None]
+            + stride_cn * offs_cn[None, :]
+        )
+    else:
+        c_ptrs = (
+            cur_c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        )
+    return c_ptrs
+
+
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
+_LORA_SCALE_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
 
 
 def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
@@ -94,6 +127,23 @@ def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
 
     _LORA_PTR_DICT[key] = ptr_tensor
     return _LORA_PTR_DICT.get(key)
+
+
+def _get_scale_ptr(lora_scales: list[torch.Tensor], device: torch.device):
+    """
+    Separate pointer cache for scale tensors, kept distinct from
+    `_LORA_PTR_DICT` to avoid mixing weight and scale pointers.
+    """
+    key = tuple(s.data_ptr() for s in lora_scales)
+
+    if (ptr_tensor := _LORA_SCALE_PTR_DICT.get(key)) is not None:
+        return ptr_tensor
+
+    tensor_ptrs = [s.data_ptr() for s in lora_scales]
+    ptr_tensor = torch.tensor(tensor_ptrs, device=device, dtype=torch.uint64)
+
+    _LORA_SCALE_PTR_DICT[key] = ptr_tensor
+    return _LORA_SCALE_PTR_DICT.get(key)
 
 
 def _adjust_kernel_inputs(
@@ -122,12 +172,15 @@ def _adjust_kernel_inputs(
         "stride_tl",
         "stride_el",
         "slice_a_size",
+        "slice_a_scale_size",
         "slice_c_size",
     ]
 )
-def _fused_moe_lora_kernel_fp8(
+def _fp8_fused_moe_lora_kernel_tma(
     a_ptr,
+    a_desc,
     b_ptr,
+    b_desc,
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
@@ -145,11 +198,7 @@ def _fused_moe_lora_kernel_fp8(
     top_k_num,
     lora_ids,
     adapter_enabled,
-    max_loras,  # <<< PR2: rename, used for masks when grid axis-2 != max_loras
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    max_loras,
     stride_am,
     stride_ak,
     stride_bl,
@@ -170,6 +219,7 @@ def _fused_moe_lora_kernel_fp8(
     group_n: tl.constexpr,
     group_k: tl.constexpr,
     slice_a_size,
+    slice_a_scale_size,
     slice_c_size,
     # Meta-parameters
     num_slice_a: tl.constexpr,
@@ -190,10 +240,11 @@ def _fused_moe_lora_kernel_fp8(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    sort_c: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
-    use_int8_w8a8: tl.constexpr,
-    use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
@@ -203,15 +254,32 @@ def _fused_moe_lora_kernel_fp8(
     lora_idx = tl.program_id(axis=2)
     pid_sk = pid % SPLIT_K
     pid_m_n = pid // SPLIT_K
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    if SWAP_AB:
+        # When swapping: iterate over N first (as if it's M)
+        # for better perf with small M
+        num_pid_m = tl.cdiv(N, BLOCK_SIZE_N)  # N becomes the "M" dimension for grouping
+        num_pid_n = tl.cdiv(
+            EM, BLOCK_SIZE_M
+        )  # EM becomes the "N" dimension for grouping
+    else:
+        num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid_m_n // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
-    pid_n = (pid_m_n % num_pid_in_group) // group_size_m
+    pid_m_raw = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
+    pid_n_raw = (pid_m_n % num_pid_in_group) // group_size_m
+
+    if SWAP_AB:
+        # Swap the pid assignments back to original meaning
+        pid_n = pid_m_raw  # pid_m_raw indexed into N
+        pid_m = pid_n_raw  # pid_n_raw indexed into EM (actual M)
+    else:
+        pid_m = pid_m_raw
+        pid_n = pid_n_raw
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
 
@@ -264,75 +332,297 @@ def _fused_moe_lora_kernel_fp8(
     )
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
-    cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
+    cur_b_ptr = (
+        tl.load(b_ptr + slice_id).to(tl.pointer_type(tl.float8e4nv))
+        if b_scale_ptr is not None
+        else tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
+    )
     cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
 
     # remove modulo wrap-around
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
+    # offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     token_mask = offs_token < num_valid_tokens
 
-    # get a_ptrs,b_ptrs
-    a_ptrs = cur_a_ptr + (
-        offs_token[:, None] // token_mapping_factor * stride_am
-        + offs_k[None, :] * stride_ak
-    )
+    if USE_TMA and a_desc is not None:
+        # Expand path - with TMA enabled, we load from A using TMA
+        if naive_block_assignment:
+            # Naive path: cache is in simple token order (M*top_k, rank),
+            # each pid_m maps to exactly one token-expert pair.
+            offs_am = pid_m
+        else:
+            # Sorted path: cache is (num_active_loras, EM, rank)
+            offs_am = (
+                slice_id * max_loras * EM
+                + lora_id * EM
+                + pid_m * BLOCK_SIZE_M // token_mapping_factor
+            )
+        offs_ak = pid_sk * BLOCK_SIZE_K
+        # Row offsets into the flattened intermediate cache for scale loading.
+        # Must match the rows that TMA loads from a_desc.
+        if naive_block_assignment:
+            a_scale_row_offs = tl.where(offs == 0, pid_m, num_valid_tokens)
+        else:
+            a_scale_row_offs = offs_am + offs // token_mapping_factor
+    else:
+        # Shrink path - load hidden states based on order defined in
+        # 'sorted_token_ids_ptr' then store them in c_ptr in this same sorted order
+        tl.static_assert(a_desc is None, "a_desc must be none")
+        cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
+        if SWAP_AB:
+            # Swapped: A^T: [K, M] - load A with K as rows
+            a_ptrs = cur_a_ptr + (
+                offs_k[:, None] * stride_ak  # K dimension as rows
+                + offs_token[None, :]
+                // token_mapping_factor
+                * stride_am  # M dimension as cols
+            )
+        else:
+            a_ptrs = cur_a_ptr + (
+                offs_token[:, None] // token_mapping_factor * stride_am
+                + offs_k[None, :] * stride_ak
+            )
+        # For non-TMA paths, scale rows match token order
+        a_scale_row_offs = offs_token // token_mapping_factor
 
-    b_ptrs = (
-        cur_b_ptr
-        + lora_id * stride_bl
-        + expert_id * stride_be
-        + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
+    if USE_TMA:
+        offs_bn = pid_n * BLOCK_SIZE_N
+        offs_bk = pid_sk * BLOCK_SIZE_K
+        if b_desc is None:
+            # Note(@gnovack) - Allocation of TMA descriptors on-device
+            # can cause conflicts when running in parallel via PDL
+            if USE_GDC and not IS_PRIMARY:
+                tl.extra.cuda.gdc_wait()
+
+            cur_b_ptr = (
+                tl.load(b_ptr + slice_id).to(tl.pointer_type(tl.float8e4nv))
+                if b_scale_ptr is not None
+                else tl.load(b_ptr + slice_id).to(
+                    tl.pointer_type(c_ptr.dtype.element_ty)
+                )
+            )
+
+            b_desc = tl.make_tensor_descriptor(
+                cur_b_ptr,
+                shape=[max_loras, num_experts, N, K],
+                strides=[stride_bl, stride_be, stride_bn, stride_bk],
+                block_shape=[1, 1, BLOCK_SIZE_N, BLOCK_SIZE_K],
+            )
+    else:
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
+        if SWAP_AB:
+            # Swapped: B^T: [N, K] - load B with N as rows, K as cols
+            b_ptrs = (
+                cur_b_ptr
+                + lora_id * stride_bl
+                + expert_id * stride_be
+                + offs_bn[:, None] * stride_bn  # N dimension as rows
+                + offs_k[None, :] * stride_bk  # K dimension as cols
+            )
+        else:
+            b_ptrs = (
+                cur_b_ptr
+                + lora_id * stride_bl
+                + expert_id * stride_be
+                + offs_k[:, None] * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+
+    if use_fp8_w8a8:
+        cur_b_scale_ptr = tl.load(b_scale_ptr + slice_id).to(
+            tl.pointer_type(tl.float32)
+        )
+        cur_a_scale_ptr = a_scale_ptr + (slice_id % num_slice_a) * slice_a_scale_size
+        # When USE_TMA is true, offs_bn is a scalar offset; we need a vector
+        # for per-channel and block-wise scale indexing.
+        if USE_TMA:
+            offs_bn_vec = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int32)
+        else:
+            offs_bn_vec = offs_bn
+        # block-wise scale ptrs
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = cur_a_scale_ptr + a_scale_row_offs * stride_asm
+            offs_bsn = offs_bn_vec // group_n
+            b_scale_ptrs = (
+                cur_b_scale_ptr
+                + lora_id * stride_bsl
+                + expert_id * stride_bse
+                + offs_bsn * stride_bsn
+            )
+        elif per_channel_quant:
+            b_scale_ptrs = (
+                cur_b_scale_ptr
+                + lora_id * stride_bsl
+                + expert_id * stride_bse
+                + offs_bn_vec[None, :] * stride_bsn
+            )
+            b_scale = tl.load(b_scale_ptrs)
+            # load per-token scale for activations
+            a_scale_ptrs = cur_a_scale_ptr + a_scale_row_offs * stride_asm
+            a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)[:, None]
+        # tensor-wise
+        else:
+            a_scale = tl.load(cur_a_scale_ptr)
+            b_scale = tl.load(cur_b_scale_ptr + lora_id * stride_bsl + expert_id)
 
     if USE_GDC and IS_PRIMARY:
         # GDC launch dependents hints the runtime system to launch dependent kernels.
         tl.extra.cuda.gdc_launch_dependents()
 
     # accumulator
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if SWAP_AB:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     if USE_GDC and not IS_PRIMARY:
         tl.extra.cuda.gdc_wait()
 
     for k in range(0, grid_k):
-        k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
+        cur_k_offset = k * (BLOCK_SIZE_K * SPLIT_K)
+        k_remaining = K - cur_k_offset
+        # Pre-load scales before dot product to overlap memory latency
+        # with the weight/activation loads below.
+        if use_fp8_w8a8 and group_n > 0 and group_k > 0:
+            k_start = k * BLOCK_SIZE_K * SPLIT_K
+            offs_ks = k_start // group_k
+            a_scale = tl.load(
+                a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+            )
+            b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
         # GDC wait waits for ALL programs in the prior kernel to complete
         # before continuing.
         # pre-fetch lora weight
         # add (offs_bn < N) mask; optional .ca for B
-        b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
-        if USE_B_L2_CACHE:
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0, cache_modifier=".ca")
+        if SWAP_AB:
+            b_mask = (offs_k[None, :] < k_remaining) & (offs_bn[:, None] < N)
         else:
-            b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            b_mask = (offs_k[:, None] < k_remaining) & (offs_bn[None, :] < N)
+        if b_desc is not None:
+            if SWAP_AB:
+                # SWAP_AB: keep B as [N, K] (no transpose needed)
+                b = b_desc.load(
+                    [lora_id, expert_id, offs_bn, offs_bk + cur_k_offset]
+                ).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+            else:
+                # Standard: transpose to get [K, N] for A @ B
+                b = (
+                    b_desc.load([lora_id, expert_id, offs_bn, offs_bk + cur_k_offset])
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    .T
+                )
+        else:
+            if USE_B_L2_CACHE:
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0, cache_modifier=".ca")
+            else:
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+            b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
         if USE_GDC and not IS_PRIMARY:
             tl.extra.cuda.gdc_wait()
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
-            other=0.0,
-        )
-        accumulator += tl.dot(a, b)
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+
+        if a_desc is not None:
+            if SWAP_AB:
+                # SWAP_AB: need [K, M], so transpose the [M, K] load
+                a = a_desc.load([offs_am, offs_ak + cur_k_offset]).T
+            else:
+                a = a_desc.load([offs_am, offs_ak + cur_k_offset])
+        else:
+            if SWAP_AB:
+                # Load A^T block [BLOCK_K, BLOCK_M]
+                a = tl.load(
+                    a_ptrs,
+                    mask=(offs_k[:, None] < k_remaining) & token_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                    other=0.0,
+                )
+            a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+
+        # GDC wait waits for ALL programs in the the prior kernel to complete
+        # before continuing.
+        if USE_GDC and not IS_PRIMARY:
+            tl.extra.cuda.gdc_wait()
+        if SWAP_AB:
+            # Compute B^T @ A^T =
+            #  [BLOCK_N, BLOCK_K] @ [BLOCK_K, BLOCK_M] = [BLOCK_N, BLOCK_M]
+            if use_fp8_w8a8:
+                if group_n > 0 and group_k > 0:
+                    k_start = k * BLOCK_SIZE_K * SPLIT_K
+                    offs_ks = k_start // group_k
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                    b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                    # Pre-compute combined scale matrix
+                    scale = b_scale[:, None] * a_scale[None, :]
+                    accumulator += tl.dot(b, a) * scale
+                else:
+                    if use_fp8_w8a8:
+                        accumulator = tl.dot(b, a, acc=accumulator)
+                    else:
+                        accumulator += tl.dot(b, a)
+            else:
+                accumulator += tl.dot(b, a)
+        else:
+            if use_fp8_w8a8:
+                if group_n > 0 and group_k > 0:
+                    k_start = k * BLOCK_SIZE_K * SPLIT_K
+                    offs_ks = k_start // group_k
+                    a_scale = tl.load(
+                        a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    )
+                    b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                else:
+                    if use_fp8_w8a8:
+                        accumulator = tl.dot(a, b, acc=accumulator)
+                    else:
+                        accumulator += tl.dot(a, b)
+            else:
+                accumulator += tl.dot(a, b)
+
+    if SWAP_AB:
+        # Transpose accumulator from [BLOCK_N, BLOCK_M] to [BLOCK_M, BLOCK_N]
+        accumulator = tl.trans(accumulator)
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         accumulator = accumulator * moe_weight[:, None]
-    accumulator = accumulator.to(c_ptr.dtype.element_ty)
+
+    if use_fp8_w8a8:
+        if group_k > 0 and group_n > 0:
+            accumulator = accumulator.to(c_ptr.dtype.element_ty)
+        else:
+            accumulator = (accumulator * a_scale * b_scale).to(c_ptr.dtype.element_ty)
+    else:
+        accumulator = accumulator.to(c_ptr.dtype.element_ty)
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = cur_c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    # When sort_c is true, store the output in c_ptr using token order defined
+    # in sorted_token_ids_ptr; otherwise, use the original token order from the prompt
+    c_ptrs = _get_c_ptrs(
+        cur_c_ptr,
+        lora_id,
+        pid_m,
+        offs,
+        offs_token,
+        offs_cn,
+        stride_cm,
+        stride_cn,
+        EM,
+        BLOCK_SIZE_M,
+        sort_c,
+    )
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
     if SPLIT_K == 1:
         if ADD_INPUTS:
-            prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
-            tl.store(c_ptrs, prev + accumulator, mask=c_mask)
+            tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
         else:
             tl.store(c_ptrs, accumulator, mask=c_mask)
     else:
@@ -340,7 +630,7 @@ def _fused_moe_lora_kernel_fp8(
 
 
 @torch.inference_mode()
-def _fused_moe_lora_shrink_fp8(
+def _fp8_fused_moe_lora_shrink(
     a_intermediate_cache1: torch.Tensor,
     # (num_slices, num_tokens, top_k_num, max_lora_rank)
     qcurr_hidden_states: torch.Tensor,  # (num_tokens, K,)
@@ -351,7 +641,7 @@ def _fused_moe_lora_shrink_fp8(
     sorted_token_ids: torch.Tensor | None,  # (max_loras, _)
     expert_ids: torch.Tensor,  # (max_loras, _ ,) or (num_tokens * top_k,)
     num_tokens_post_padded: torch.Tensor | None,  # (max_loras, )
-    token_lora_mapping: torch.Tensor,
+    token_lora_mapping: torch.Tensor,  ## New
     top_k_num: int,
     lora_ids: torch.Tensor,
     adapter_enabled: torch.Tensor,
@@ -372,17 +662,16 @@ def _fused_moe_lora_shrink_fp8(
     num_stages: int,
     split_k: int,
     num_active_loras: int,
-    lora_a_scale_stacked: list[torch.Tensor],
     mul_routed_weight: bool = False,
     use_gdc: bool = False,
+    use_tma: bool = False,
     act_scale: torch.Tensor | None = None,
+    lora_a_scale_stacked: list[torch.Tensor] | None = None,
     use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
     per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
+    block_shape: list[int] | None = None,
 ) -> None:
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_fp8_w8a8:
         assert lora_a_scale_stacked is not None, (
             "lora_a_scale_stacked must be provided for w8a8 quantization"
         )
@@ -396,25 +685,18 @@ def _fused_moe_lora_shrink_fp8(
         ) == lora_a_scale_stacked[0].size(-1), (
             "Incompatible block shape for lora_a_scale_stacked.size(-1) "
         )
-    elif use_int8_w8a16:
-        assert lora_a_scale_stacked is not None, (
-            "lora_a_scale_stacked must be provided for w8a16 quantization"
-        )
-        assert block_shape is None or block_shape[0] == 0, (
-            "Block shape for activation must be 0 for w8a16"
-        )
     else:
         assert act_scale is None
         assert lora_a_scale_stacked is None
 
+    w1_lora_a_stacked = lora_a_stacked[0]
+
     if block_shape is not None:
         block_size_k = min(block_size_k, min(block_shape[0], block_shape[1]))
 
-    if lora_a_scale_stacked is not None:
-        b_scale_ptr = _get_ptr(lora_a_scale_stacked, device)
-        w1_lora_a_scale_stacked = lora_a_scale_stacked[0]
+    # Enable swap AB when BLOCK_SIZE_M < 64 for better performance with small M
+    swap_ab = block_size_m < 64
 
-    w1_lora_a_stacked = lora_a_stacked[0]
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -425,14 +707,19 @@ def _fused_moe_lora_shrink_fp8(
         "SPLIT_K": split_k,
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
+        "USE_TMA": use_tma,
+        "SWAP_AB": swap_ab,
     }
 
     b_ptr = _get_ptr(lora_a_stacked, device)
 
+    if lora_a_scale_stacked is not None:
+        b_scale_ptr = _get_scale_ptr(lora_a_scale_stacked, device)
+        w1_lora_a_scale_stacked = lora_a_scale_stacked[0]
+
     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
         num_active_loras, sorted_token_ids, expert_ids
     )
-
     grid = lambda META: (
         split_k
         * triton.cdiv(EM, META["BLOCK_SIZE_M"])
@@ -440,9 +727,18 @@ def _fused_moe_lora_shrink_fp8(
         len(lora_a_stacked),
         grid_lora_dim,
     )
-    _fused_moe_lora_kernel_fp8[grid](
+    a_desc = None
+    b_desc = None
+    if use_tma and num_slices == 1:
+        b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+            lora_a_stacked[0],
+            [1, 1, shrink_config["BLOCK_SIZE_N"], shrink_config["BLOCK_SIZE_K"]],
+        )
+    _fp8_fused_moe_lora_kernel_tma[grid](
         qcurr_hidden_states,
+        a_desc,
         b_ptr,
+        b_desc,
         a_intermediate_cache1,
         act_scale,
         b_scale_ptr if lora_a_scale_stacked is not None else None,
@@ -487,6 +783,7 @@ def _fused_moe_lora_shrink_fp8(
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         slice_a_size=qcurr_hidden_states.numel(),
+        slice_a_scale_size=act_scale.numel() if act_scale is not None else 0,
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
         num_slice_a=1,
         num_slice_c=num_slices,
@@ -495,19 +792,19 @@ def _fused_moe_lora_shrink_fp8(
         MUL_ROUTED_WEIGHT=False,
         ADD_INPUTS=False,
         USE_B_L2_CACHE=True,  # new
+        sort_c=use_tma and sorted_token_ids is not None,
         IS_PRIMARY=True,
         use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         **shrink_config,
     )
 
 
 @torch.inference_mode()
-def _fused_moe_lora_expand_fp8(
+def _fp8_fused_moe_lora_expand(
     output: torch.Tensor,  # (num_tokens, top_k_num, N*len(lora_a_stacked),)
     a_intermediate_cache1: torch.Tensor,  # (num_slices, M, top_k_num, max_lora_rank)
+    ## b_intermediate_cache1 removed
     lora_b_stacked: list[
         torch.Tensor
     ],  # [(max_loras, num_experts, max_lora_rank, K,),...]
@@ -515,7 +812,7 @@ def _fused_moe_lora_expand_fp8(
     sorted_token_ids: torch.Tensor | None,  # (max_loras, _)
     expert_ids: torch.Tensor,  # (max_loras, _ ,) or (num_tokens * top_k,)
     num_tokens_post_padded: torch.Tensor | None,  # (max_loras, )
-    token_lora_mapping: torch.Tensor,
+    token_lora_mapping: torch.Tensor,  ## New
     top_k_num: int,
     lora_ids: torch.Tensor,
     adapter_enabled: torch.Tensor,
@@ -538,18 +835,17 @@ def _fused_moe_lora_expand_fp8(
     num_stages: int,
     split_k: int,
     num_active_loras: int,
-    lora_b_scale_stacked: list[torch.Tensor],
     mul_routed_weight: bool = False,
     offset: int = 0,
     use_gdc: bool = False,
+    use_tma: bool = False,
     act_scale: torch.Tensor | None = None,
+    lora_b_scale_stacked: list[torch.Tensor] | None = None,
     use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
     per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
+    block_shape: list[int] | None = None,
 ) -> None:
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_fp8_w8a8:
         assert lora_b_scale_stacked is not None, (
             "lora_b_scale_stacked must be provided for w8a8 quantization"
         )
@@ -563,23 +859,9 @@ def _fused_moe_lora_expand_fp8(
         ) == lora_b_scale_stacked[0].size(-1), (
             "Incompatible block shape for lora_b_scale_stacked.size(-1) "
         )
-    elif use_int8_w8a16:
-        assert lora_b_scale_stacked is not None, (
-            "lora_b_scale_stacked must be provided for w8a16 quantization"
-        )
-        assert block_shape is None or block_shape[0] == 0, (
-            "Block shape for activation must be 0 for w8a16"
-        )
     else:
         assert act_scale is None
         assert lora_b_scale_stacked is None
-
-    if lora_b_scale_stacked is not None:
-        b_scale_ptr = _get_ptr(lora_b_scale_stacked, device)
-        w1_lora_b_scale_stacked = lora_b_scale_stacked[0]
-
-    if block_shape is not None:
-        block_size_k = min(block_size_k, min(block_shape[0], block_shape[1]))
 
     b_ptr = _get_ptr(lora_b_stacked, device)
     K = max_lora_rank
@@ -587,9 +869,19 @@ def _fused_moe_lora_expand_fp8(
 
     w1_lora_b_stacked = lora_b_stacked[0]
 
+    if lora_b_scale_stacked is not None:
+        b_scale_ptr = _get_scale_ptr(lora_b_scale_stacked, device)
+        w1_lora_b_scale_stacked = lora_b_scale_stacked[0]
+
     a_intermediate_cache1 = a_intermediate_cache1.view(
-        -1, a_intermediate_cache1.shape[3]
+        -1, a_intermediate_cache1.shape[-1]
     )
+
+    if block_shape is not None:
+        block_size_k = min(block_size_k, min(block_shape[0], block_shape[1]))
+
+    # Enable swap AB when BLOCK_SIZE_M < 64 for better performance with small M
+    swap_ab = block_size_m < 64
 
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
@@ -601,6 +893,8 @@ def _fused_moe_lora_expand_fp8(
         "SPLIT_K": 1,  # Set split_k = 1 for expand calls
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
+        "USE_TMA": use_tma,
+        "SWAP_AB": swap_ab,
     }
 
     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
@@ -616,10 +910,26 @@ def _fused_moe_lora_expand_fp8(
     # Fast path: directly accumulate into the corresponding slice interval of output.
     out_view = output[:, :, offset : offset + num_slices * N]
     slice_c_size = N * out_view.stride(2)
+    a_desc = None
+    b_desc = None
+    if use_tma:
+        a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+            a_intermediate_cache1,
+            [expand_config["BLOCK_SIZE_M"], expand_config["BLOCK_SIZE_K"]],
+        )
+        if num_slices == 1:
+            b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+                lora_b_stacked[0],
+                [1, 1, expand_config["BLOCK_SIZE_N"], expand_config["BLOCK_SIZE_K"]],
+            )
+    else:
+        b_desc = None
 
-    _fused_moe_lora_kernel_fp8[grid](
+    _fp8_fused_moe_lora_kernel_tma[grid](
         a_intermediate_cache1,
+        a_desc,
         b_ptr,
+        b_desc,
         out_view,
         act_scale,
         b_scale_ptr if lora_b_scale_stacked is not None else None,
@@ -664,6 +974,7 @@ def _fused_moe_lora_expand_fp8(
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
+        slice_a_scale_size=act_scale.numel() if act_scale is not None else 0,
         slice_c_size=slice_c_size,
         num_slice_a=num_slices,
         num_slice_c=num_slices,
@@ -672,10 +983,9 @@ def _fused_moe_lora_expand_fp8(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         ADD_INPUTS=True,
         USE_B_L2_CACHE=True,  # new
+        sort_c=False,
         IS_PRIMARY=False,
         use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         **expand_config,
     )
@@ -723,10 +1033,8 @@ def _fused_moe_lora_fp8(
     fully_sharded: bool = False,
     offset: int = 0,
     use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
     per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
+    block_shape: list[int] | None = None,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert topk_weights.dim() == qcurr_hidden_states.dim() == 2
@@ -749,6 +1057,12 @@ def _fused_moe_lora_fp8(
         )
     assert output.shape[0] == topk_weights.shape[0]
     assert top_k_num == topk_weights.shape[1]
+    # Convert empty lists to None for internal functions
+    # (custom op schema requires List[Tensor], but internals expect None)
+    if not lora_a_scale_stacked:
+        lora_a_scale_stacked = None  # type: ignore[assignment]
+    if not lora_b_scale_stacked:
+        lora_b_scale_stacked = None  # type: ignore[assignment]
     device = qcurr_hidden_states.device
     num_slices = len(lora_a_stacked)
     w1_lora_b_stacked = lora_b_stacked[0]
@@ -765,14 +1079,40 @@ def _fused_moe_lora_fp8(
         else num_tokens * shrink_block_size_m
     )
 
+    # TMA is not currently compatible with fully_sharded due to the non-determinism
+    # of token id sorting across ranks.
+    use_tma = supports_tma(device) and not fully_sharded
+
+    intermediate_cache_shape = (
+        num_slices,
+        M,
+        top_k_num,
+        max_lora_rank,
+    )
+    if use_tma:
+        if num_slices > 1:
+            # if num_slices > 1, we construct TMA descriptors for LoRA
+            # weights within the kernel, which requires us to first set an allocator
+            set_triton_allocator(device)
+
+        # When storing intermediate data in sorted order for TMA, we
+        # need an extra 'num_active_loras' dim in the cache to avoid conflicts
+        if sorted_token_ids is not None:
+            intermediate_cache_shape = (
+                num_slices,
+                sorted_token_ids.shape[0],
+                EM,
+                max_lora_rank,
+            )
+
     a_intermediate_cache1 = torch.zeros(
-        (num_slices, M, top_k_num, max_lora_rank),
+        intermediate_cache_shape,
         dtype=output.dtype,
         device=device,
     )
 
     use_gdc = supports_pdl(device) and not fully_sharded
-    _fused_moe_lora_shrink_fp8(
+    _fp8_fused_moe_lora_shrink(
         a_intermediate_cache1,
         qcurr_hidden_states,
         lora_a_stacked,
@@ -801,13 +1141,12 @@ def _fused_moe_lora_fp8(
         shrink_num_stages,
         shrink_split_k,
         num_active_loras,
-        lora_a_scale_stacked,
+        lora_a_scale_stacked=lora_a_scale_stacked,
         mul_routed_weight=mul_routed_weight,
         use_gdc=use_gdc,
+        use_tma=use_tma,
         act_scale=shrink_act_scale,
         use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
@@ -825,7 +1164,31 @@ def _fused_moe_lora_fp8(
             # reset max_lora_rank to the full rank after allgather
             max_lora_rank = a_intermediate_cache1.shape[-1]
 
-    _fused_moe_lora_expand_fp8(
+    # Dynamic quantization of intermediate cache for the expand pass.
+    # The shrink kernel outputs in output.dtype (bf16/fp16).
+    # The expand kernel needs FP8 activations to do FP8 dot with FP8 lora_b.
+    if use_fp8_w8a8:
+        orig_shape = a_intermediate_cache1.shape
+        flat_intermediate = a_intermediate_cache1.view(-1, orig_shape[-1])
+        quant_dtype = torch.float8_e4m3fn
+        # Clamp block_shape for intermediate cache: max_lora_rank may be
+        # smaller than the original block dimensions.
+        intermediate_block_shape = block_shape
+        if block_shape is not None:
+            intermediate_block_shape = [
+                min(block_shape[0], orig_shape[-1]),
+                min(block_shape[1], orig_shape[-1]),
+            ]
+        flat_intermediate, expand_act_scale = moe_kernel_quantize_input(
+            A=flat_intermediate,
+            A_scale=expand_act_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=intermediate_block_shape,
+        )
+        a_intermediate_cache1 = flat_intermediate.view(orig_shape)
+
+    _fp8_fused_moe_lora_expand(
         output,
         a_intermediate_cache1,
         lora_b_stacked,
@@ -856,20 +1219,19 @@ def _fused_moe_lora_fp8(
         expand_num_stages,
         expand_split_k,
         num_active_loras,
-        lora_b_scale_stacked,
+        lora_b_scale_stacked=lora_b_scale_stacked,
         mul_routed_weight=mul_routed_weight,
         offset=offset,
         use_gdc=use_gdc,
+        use_tma=use_tma,
         act_scale=expand_act_scale,
         use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
 
 
-def _fused_moe_lora_fp8_fake(
+def _fused_moe_lora_fake(
     output: torch.Tensor,
     qcurr_hidden_states: torch.Tensor,
     lora_a_stacked: list[torch.Tensor],
@@ -898,23 +1260,14 @@ def _fused_moe_lora_fp8_fake(
     expand_num_warps: int,
     expand_num_stages: int,
     expand_split_k: int,
-    lora_a_scale_stacked: list[torch.Tensor],
-    lora_b_scale_stacked: list[torch.Tensor],
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
-    shrink_act_scale: torch.Tensor | None = None,
-    expand_act_scale: torch.Tensor | None = None,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
 ) -> None:
     return
 
 
-def _fused_moe_lora_shrink_fp8_fake(
+def _fused_moe_lora_shrink_fake(
     a_intermediate_cache1: torch.Tensor,
     qcurr_hidden_states: torch.Tensor,
     lora_a_stacked: list[torch.Tensor],
@@ -942,20 +1295,13 @@ def _fused_moe_lora_shrink_fp8_fake(
     num_stages: int,
     split_k: int,
     num_active_loras: int,
-    lora_a_scale_stacked: list[torch.Tensor],
     mul_routed_weight: bool = False,
     use_gdc: bool = False,
-    act_scale: torch.Tensor | None = None,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
 ) -> None:
     return
 
 
-def _fused_moe_lora_expand_fp8_fake(
+def _fused_moe_lora_expand_fake(
     output: torch.Tensor,
     a_intermediate_cache1: torch.Tensor,
     lora_b_stacked: list[torch.Tensor],
@@ -985,15 +1331,8 @@ def _fused_moe_lora_expand_fp8_fake(
     num_stages: int,
     split_k: int,
     num_active_loras: int,
-    act_scale: torch.Tensor,
-    lora_b_scale_stacked: list[torch.Tensor],
     mul_routed_weight: bool = False,
     offset: int = 0,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    per_channel_quant: bool = False,
-    block_shape: List[int] | None = None,  # noqa: UP006, UP007
     use_gdc: bool = False,
 ) -> None:
     return
@@ -1004,21 +1343,21 @@ try:
         op_name="fused_moe_lora_fp8",
         op_func=_fused_moe_lora_fp8,
         mutates_args=["output"],
-        fake_impl=_fused_moe_lora_fp8_fake,
+        fake_impl=_fused_moe_lora_fake,
     )
 
     direct_register_custom_op(
         op_name="fused_moe_lora_shrink_fp8",
-        op_func=_fused_moe_lora_shrink_fp8,
+        op_func=_fp8_fused_moe_lora_shrink,
         mutates_args=["a_intermediate_cache1"],
-        fake_impl=_fused_moe_lora_shrink_fp8_fake,
+        fake_impl=_fused_moe_lora_shrink_fake,
     )
 
     direct_register_custom_op(
         op_name="fused_moe_lora_expand_fp8",
-        op_func=_fused_moe_lora_expand_fp8,
+        op_func=_fp8_fused_moe_lora_expand,
         mutates_args=["output"],
-        fake_impl=_fused_moe_lora_expand_fp8_fake,
+        fake_impl=_fused_moe_lora_expand_fake,
     )
 
     fused_moe_lora_fp8 = torch.ops.vllm.fused_moe_lora_fp8
@@ -1027,5 +1366,5 @@ try:
 
 except AttributeError:
     fused_moe_lora_fp8 = _fused_moe_lora_fp8
-    fused_moe_lora_shrink_fp8 = _fused_moe_lora_shrink_fp8
-    fused_moe_lora_expand_fp8 = _fused_moe_lora_expand_fp8
+    fused_moe_lora_shrink_fp8 = _fp8_fused_moe_lora_shrink
+    fused_moe_lora_expand_fp8 = _fp8_fused_moe_lora_expand
