@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from __future__ import annotations
-
 import torch
 
 from vllm.distributed import (
@@ -358,8 +356,10 @@ def _fp8_fused_moe_lora_kernel_tma(
                 + pid_m * BLOCK_SIZE_M // token_mapping_factor
             )
         offs_ak = pid_sk * BLOCK_SIZE_K
-        # Row offsets into the flattened intermediate cache for scale loading.
-        # Must match the rows that TMA loads from a_desc.
+        # Row offsets for activation scale loading in the expand TMA path.
+        # The scale was quantized in the same flattened order as the cache,
+        # so we must index it with the same offsets used for TMA loads
+        # rather than offs_token (which is in token order).
         if naive_block_assignment:
             a_scale_row_offs = tl.where(offs == 0, pid_m, num_valid_tokens)
         else:
@@ -382,7 +382,7 @@ def _fp8_fused_moe_lora_kernel_tma(
                 offs_token[:, None] // token_mapping_factor * stride_am
                 + offs_k[None, :] * stride_ak
             )
-        # For non-TMA paths, scale rows match token order
+        # Non-TMA: scale rows match token order
         a_scale_row_offs = offs_token // token_mapping_factor
 
     if USE_TMA:
@@ -1169,7 +1169,6 @@ def _fused_moe_lora_fp8(
     # The expand kernel needs FP8 activations to do FP8 dot with FP8 lora_b.
     if use_fp8_w8a8:
         orig_shape = a_intermediate_cache1.shape
-        flat_intermediate = a_intermediate_cache1.view(-1, orig_shape[-1])
         quant_dtype = torch.float8_e4m3fn
         # Clamp block_shape for intermediate cache: max_lora_rank may be
         # smaller than the original block dimensions.
@@ -1179,14 +1178,17 @@ def _fused_moe_lora_fp8(
                 min(block_shape[0], orig_shape[-1]),
                 min(block_shape[1], orig_shape[-1]),
             ]
-        flat_intermediate, expand_act_scale = moe_kernel_quantize_input(
-            A=flat_intermediate,
+        # Flatten to 2D for quantization.  The expand kernel also flattens
+        # the cache with view(-1, rank), so we keep it 2D and skip the
+        # redundant reshape back to 4D.
+        a_intermediate_cache1 = a_intermediate_cache1.view(-1, orig_shape[-1])
+        a_intermediate_cache1, expand_act_scale = moe_kernel_quantize_input(
+            A=a_intermediate_cache1,
             A_scale=expand_act_scale,
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
             block_shape=intermediate_block_shape,
         )
-        a_intermediate_cache1 = flat_intermediate.view(orig_shape)
 
     _fp8_fused_moe_lora_expand(
         output,

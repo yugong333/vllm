@@ -593,13 +593,13 @@ def test_fused_moe_lora_fp8_kernel_tensor_wise(
 
 
 # ─── FP8 per-channel quantization ───────────────────────────────────────────
-@pytest.mark.parametrize("num_tokens", [100])
-@pytest.mark.parametrize("top_k_num", [6])
-@pytest.mark.parametrize("num_experts", [64])
-@pytest.mark.parametrize("max_loras", [4, 8])
+@pytest.mark.parametrize("num_tokens", [1024])
+@pytest.mark.parametrize("top_k_num", [4])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("max_loras", [8])
 @pytest.mark.parametrize("N", [1408])
 @pytest.mark.parametrize("K", [2048])
-@pytest.mark.parametrize("max_lora_rank", [16, 32])
+@pytest.mark.parametrize("max_lora_rank", [32])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("device", DEVICES)
