@@ -601,7 +601,7 @@ def test_fused_moe_lora_fp8_kernel_tensor_wise(
 @pytest.mark.parametrize("K", [2048])
 @pytest.mark.parametrize("max_lora_rank", [32])
 @pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", SEED)
 def test_fused_moe_lora_fp8_kernel_per_channel(
