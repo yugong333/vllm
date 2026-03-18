@@ -344,18 +344,11 @@ def _fp8_fused_moe_lora_kernel_tma(
     token_mask = offs_token < num_valid_tokens
 
     if USE_TMA and a_desc is not None:
-        # Expand path - with TMA enabled, we load from A using TMA
-        if naive_block_assignment:
-            # Naive path: cache is in simple token order (M*top_k, rank),
-            # each pid_m maps to exactly one token-expert pair.
-            offs_am = pid_m
-        else:
-            # Sorted path: cache is (num_active_loras, EM, rank)
-            offs_am = (
-                slice_id * max_loras * EM
-                + lora_id * EM
-                + pid_m * BLOCK_SIZE_M // token_mapping_factor
-            )
+        offs_am = (
+            slice_id * max_loras * EM
+            + lora_id * EM
+            + pid_m * BLOCK_SIZE_M // token_mapping_factor
+        )
         offs_ak = pid_sk * BLOCK_SIZE_K
         # Row offsets for activation scale loading in the expand TMA path.
         # The scale was quantized in the same flattened order as the cache,
@@ -920,10 +913,11 @@ def _fp8_fused_moe_lora_expand(
     a_desc = None
     b_desc = None
     if use_tma:
-        a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
-            a_intermediate_cache1,
-            [expand_config["BLOCK_SIZE_M"], expand_config["BLOCK_SIZE_K"]],
-        )
+        if sorted_token_ids is not None:
+            a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+                a_intermediate_cache1,
+                [expand_config["BLOCK_SIZE_M"], expand_config["BLOCK_SIZE_K"]],
+            )
         if num_slices == 1:
             b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
                 lora_b_stacked[0],
