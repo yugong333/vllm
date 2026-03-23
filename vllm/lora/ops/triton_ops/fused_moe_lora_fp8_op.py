@@ -689,7 +689,7 @@ def _fp8_fused_moe_lora_shrink(
         block_size_k = min(block_size_k, min(block_shape[0], block_shape[1]))
 
     # Enable swap AB when BLOCK_SIZE_M < 64 for better performance with small M
-    swap_ab = block_size_m < 64
+    swap_ab = block_size_m < 64 and block_size_n >= 64
 
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
@@ -875,7 +875,7 @@ def _fp8_fused_moe_lora_expand(
         block_size_k = min(block_size_k, min(block_shape[0], block_shape[1]))
 
     # Enable swap AB when BLOCK_SIZE_M < 64 for better performance with small M
-    swap_ab = block_size_m < 64
+    swap_ab = block_size_m < 64 and block_size_n >= 64
 
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
