@@ -410,14 +410,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         self.disable_expert_map = False
 
         # Scratchpad for MoE monokernel.
-        # (more than) enough space for 
+        # (more than) enough space for
         # BS+8 x N             fp32
         # BS                   fp32
         # BS   x HIDDEN_STATES fp16
         # with BS = 1024:  4MB + <1MB + 10MB < 4M x 4byte
-        self.moe_monokernel_scratchpad = torch.empty((1024, 4096),
-                                                     dtype=torch.float32,
-                                                     device=f"cuda:{torch.distributed.get_rank()}")
+        self.moe_monokernel_scratchpad = torch.empty(
+            (1024, 4096),
+            dtype=torch.float32,
+            device=f"cuda:{torch.distributed.get_rank()}")
+
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
                        params_dtype: torch.dtype, **extra_weight_attrs):
@@ -654,24 +656,20 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             raise NotImplementedError(
                 "EPLB not supported for "
                 "`CompressedTensorsW8A8Fp8MoEMethod` yet.")
-        
+
         # MoE monokernel for BS <= 64
         # Supports Llama4 Maverick & Scout with TP = 8
-        E, M, N, K = global_num_experts, x.size(0), layer.w13_weight.size(1), x.size(1)
+        E, M, N, K = global_num_experts, x.size(0), layer.w13_weight.size(
+            1), x.size(1)
         if (E == 16 or E == 128) and M <= 64 and K == 5120 and N == 2048:
             # Migrate scratchpad to appropriate device
             if self.moe_monokernel_scratchpad.device != x.device:
-                self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(x.device)
+                self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(
+                    x.device)
             return torch.ops.vllm.moe_monokernel(
-                x,
-                router_logits,
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                self.moe_monokernel_scratchpad
-            )
-
+                x, router_logits, layer.w13_weight, layer.w13_weight_scale,
+                layer.w2_weight, layer.w2_weight_scale,
+                self.moe_monokernel_scratchpad)
 
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,

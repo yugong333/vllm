@@ -2415,7 +2415,7 @@ index 000000000..717b9668a
 + * @brief Scales activation values in shared memory.
 + *
 + * It is used only for BS8. The function expects that the activations have been transferred to shared memory already.
-+ * Fetch them with @c moe_scale_activation_BS8 well before this call (sychronization required).
++ * Fetch them with @c moe_scale_activation_BS8 well before this call (synchronization required).
 + *
 + * Each warp scales one token, i.e. do not call this function on more warps than tokens.
 + * For the details of the conversion, @see BF16x8::to_fp8x8
