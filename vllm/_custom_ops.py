@@ -14,6 +14,7 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -205,17 +206,19 @@ def paged_attention_v2(
     )
 
 
-def moe_monokernel(activations_in: torch.Tensor,
-                   router_logits: torch.Tensor,
-                   expert_weights_up: torch.Tensor,
-                   expert_scales_up: torch.Tensor,
-                   expert_weights_down: torch.Tensor,
-                   expert_scales_down: torch.Tensor,
-                   scratchpad: torch.Tensor
+def moe_monokernel(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
 ) -> torch.Tensor:
     if not current_platform.is_cuda():
         raise NotImplementedError(
-            "The optimized moe kernel is only available on CUDA platforms")
+            "The optimized moe kernel is only available on CUDA platforms"
+        )
 
     assert activations_in.dim() == 2
     assert router_logits.dim() == 2
@@ -232,51 +235,100 @@ def moe_monokernel(activations_in: torch.Tensor,
     assert expert_scales_down.is_contiguous()
 
     TP = torch.distributed.get_world_size()
-    E, M, N, K = router_logits.size(1), activations_in.size(0), 2*8192//TP, 5120
+    E, M, N, K = router_logits.size(1), activations_in.size(0), 2 * 8192 // TP, 5120
     assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
     assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
     assert expert_scales_up.size() == (E, N, 1), f"size is: {expert_scales_up.size()}"
-    assert expert_weights_down.size() == (E, K, N//2), f"size is: {expert_weights_down.size()}"
-    assert expert_scales_down.size() == (E, K, 1), f"size is: {expert_scales_down.size()}"
+    assert expert_weights_down.size() == (E, K, N // 2), (
+        f"size is: {expert_weights_down.size()}"
+    )
+    assert expert_scales_down.size() == (E, K, 1), (
+        f"size is: {expert_scales_down.size()}"
+    )
 
-    assert activations_in.dtype is torch.bfloat16, f"type of x is: {activations_in.type()}"
-    assert router_logits.dtype is torch.bfloat16, f"type of x is: {router_logits.type()}"
-    assert expert_weights_up.dtype is torch.float8_e4m3fn, f"type of x is: {expert_weights_up.type()}"
-    assert expert_scales_up.dtype is torch.float32, f"type of x is: {expert_scales_up.type()}"
-    assert expert_weights_down.dtype is torch.float8_e4m3fn, f"type of x is: {expert_weights_down.type()}"
-    assert expert_scales_down.dtype is torch.float32, f"type of x is: {expert_scales_down.type()}"
+    assert activations_in.dtype is torch.bfloat16, (
+        f"type of x is: {activations_in.type()}"
+    )
+    assert router_logits.dtype is torch.bfloat16, (
+        f"type of x is: {router_logits.type()}"
+    )
+    assert expert_weights_up.dtype is torch.float8_e4m3fn, (
+        f"type of x is: {expert_weights_up.type()}"
+    )
+    assert expert_scales_up.dtype is torch.float32, (
+        f"type of x is: {expert_scales_up.type()}"
+    )
+    assert expert_weights_down.dtype is torch.float8_e4m3fn, (
+        f"type of x is: {expert_weights_down.type()}"
+    )
+    assert expert_scales_down.dtype is torch.float32, (
+        f"type of x is: {expert_scales_down.type()}"
+    )
 
     assert M <= 64
     assert TP == 8
+    # logger.debug("moe_monokernel dispatching: M=%d, E=%d, N=%d, K=%d, TP=%d", M, E, N, K, TP)
     if E == 16:
         if M <= 8:
-            torch.ops._moe_C.moe_monokernel_BS8_E16_TP8(activations_in, router_logits, expert_weights_up, expert_scales_up,
-                                                        expert_weights_down, expert_scales_down, activations_in, scratchpad)
+            torch.ops._moe_C.moe_monokernel_BS8_E16_TP8(
+                activations_in,
+                router_logits,
+                expert_weights_up,
+                expert_scales_up,
+                expert_weights_down,
+                expert_scales_down,
+                activations_in,
+                scratchpad,
+            )
         else:
-            torch.ops._moe_C.moe_monokernel_BS64_E16_TP8(activations_in, router_logits, expert_weights_up, expert_scales_up,
-                                                         expert_weights_down, expert_scales_down, activations_in, scratchpad)
+            torch.ops._moe_C.moe_monokernel_BS64_E16_TP8(
+                activations_in,
+                router_logits,
+                expert_weights_up,
+                expert_scales_up,
+                expert_weights_down,
+                expert_scales_down,
+                activations_in,
+                scratchpad,
+            )
     elif E == 128:
         if M <= 8:
-            torch.ops._moe_C.moe_monokernel_BS8_E128_TP8(activations_in, router_logits, expert_weights_up, expert_scales_up,
-                                                         expert_weights_down, expert_scales_down, activations_in, scratchpad)
+            torch.ops._moe_C.moe_monokernel_BS8_E128_TP8(
+                activations_in,
+                router_logits,
+                expert_weights_up,
+                expert_scales_up,
+                expert_weights_down,
+                expert_scales_down,
+                activations_in,
+                scratchpad,
+            )
         else:
-            torch.ops._moe_C.moe_monokernel_BS64_E128_TP8(activations_in, router_logits, expert_weights_up, expert_scales_up,
-                                                          expert_weights_down, expert_scales_down, activations_in, scratchpad)
+            torch.ops._moe_C.moe_monokernel_BS64_E128_TP8(
+                activations_in,
+                router_logits,
+                expert_weights_up,
+                expert_scales_up,
+                expert_weights_down,
+                expert_scales_down,
+                activations_in,
+                scratchpad,
+            )
     return activations_in
 
 
-def moe_monokernel_fake(activations_in: torch.Tensor,
-                        router_logits: torch.Tensor,
-                        expert_weights_up: torch.Tensor,
-                        expert_scales_up: torch.Tensor,
-                        expert_weights_down: torch.Tensor,
-                        expert_scales_down: torch.Tensor,
-                        gemmspec: torch.Tensor
+def moe_monokernel_fake(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    gemmspec: torch.Tensor,
 ) -> torch.Tensor:
     return activations_in
 
 
-from vllm.utils import direct_register_custom_op
 direct_register_custom_op(
     op_name="moe_monokernel",
     op_func=moe_monokernel,
