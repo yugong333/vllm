@@ -1035,6 +1035,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_MOE_WNA16_SRC
     "csrc/moe/moe_wna16.cu")
 
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
+    set(SRCS
+       "csrc/moe/moe_monokernel/moe_wrapper.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "9.0a")
+    list(APPEND VLLM_MOE_EXT_SRC "${SRCS}")
+    message(STATUS "Building optimized MoE kernel for archs: 9.0a")
+  else()
+    if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
+      message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
+                     "not >= 12.0, we recommend upgrading to CUDA 12.0 or "
+                     "later if you intend on running FP8 quantized models on "
+                     "Hopper.")
+    else()
+      message(STATUS "Not building optimized MoE kernel as no compatible archs found "
+                     "in CUDA target architectures")
+    endif()
+  endif()
+
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_MOE_WNA16_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
