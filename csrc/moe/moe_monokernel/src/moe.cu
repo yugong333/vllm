@@ -1,8 +1,8 @@
 /**
- * This is the main file of the MoE monokernel.
+ * This is the main file of the MoE monokernel for Qwen3-Coder (top-K path).
  * It is designed so that you just need to build this file. It includes all
  * relevant implementations. For documentation of the main entry function
- * moe_kernel, see moe_interface.h
+ * moe_kernel_topk, see moe_interface.h
  */
 
 #include <cooperative_groups.h>
@@ -21,167 +21,229 @@
 
 namespace moe_monokernel {
 
+/**
+ * @brief Top-K MoE kernel — split-phase path for BS <= 8.
+ *
+ * Compact SHM layout with unions:
+ *   a: fp8 up-activations / fp8 down-activations
+ *   w[2]: double-buffered orig(bf16) / w_up(fp8) / w_down(fp8)
+ *   partial_result: up / down scratch
+ *
+ * Pipeline:
+ *   Phase 1: fetch orig into w[0].orig || routing + topK
+ *   Phase 2: quantize w[0].orig → a.up || prefetch w_up into w[1].up
+ *   Phase 3: up-proj loop (double-buffered w[].up)
+ *            → SiLU → write fp32 to spec->temp
+ *   grid.sync()
+ *   Phase 4: down-proj loop (double-buffered w[].down)
+ *            → per expert: load fp32 from spec->temp, quantize → a.down fp8
+ *            → MMA fp8×fp8 → accumulate out_accum
+ *   Phase 5: writeback out_accum → global bf16
+ *
+ * 1 grid sync total.
+ */
 template <typename Dims>
-__device__ void moe_kernel_BS64(const A_element* __restrict__ activations_in,
-                                std::uint32_t batch_size,
-                                const __nv_bfloat16* __restrict__ router_logits,
-                                const W_element* __restrict expert_weights_up,
-                                const S_element* __restrict expert_scales_up,
-                                const W_element* __restrict expert_weights_down,
-                                const S_element* __restrict expert_scales_down,
-                                R_element* __restrict activations_out,
-                                MoEGemmSpec<Dims>* __restrict__ spec,
-                                MoE_SHM<Dims>* __restrict__ shmem) {
-  if (is_calc_warp<Dims>()) {
-    top1_BS64<Dims>(router_logits, batch_size, shmem);
-  }
-  __syncthreads();
-  prepare_moe_BSx_Ey<Dims>(batch_size, shmem);
-  __syncthreads();
-  assert(shmem->experts[shmem->expert_count - 1].last_token == batch_size);
-
-  moe_scale_activation_BSx<Dims>(activations_in, batch_size, spec, shmem);
-
-#ifdef DEBUG_MOE
-  if (blockIdx.x == 0) {
-    for (int i = threadIdx.x; i < batch_size; i += blockDim.x) {
-      spec->token_indexes[i] = shmem->token_indexes[i];
-    }
-  }
-#endif
-
-  moe_up_projection<Dims>(expert_weights_up, expert_scales_up, spec, shmem);
-  cooperative_groups::this_grid().sync();
-  moe_down_projection<Dims>(batch_size, expert_weights_down, expert_scales_down,
-                            activations_out, spec, shmem);
-}
-
-template <typename Dims>
-__device__ void moe_kernel_BS8(const A_element* __restrict__ activations_in,
-                               std::uint32_t batch_size,
-                               const __nv_bfloat16* __restrict__ router_logits,
-                               const W_element* __restrict expert_weights_up,
-                               const S_element* __restrict expert_scales_up,
-                               const W_element* __restrict expert_weights_down,
-                               const S_element* __restrict expert_scales_down,
-                               R_element* __restrict activations_out,
-                               MoEGemmSpec<Dims>* __restrict__ spec,
-                               MoE_SHM<Dims>* __restrict__ shmem) {
+__device__ void moe_kernel_topk_BS8(
+    const A_element* __restrict__ activations_in, std::uint32_t batch_size,
+    const __nv_bfloat16* __restrict__ router_logits,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ activations_out, uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize,
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem) {
   static_assert(Dims::BS <= 8);
-
   using CoreDims = MoECoreDims<Dims>;
 
   cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-  if (is_prefetch_warp<Dims>()) {
-    // Prefetch activations for rescaling
-    const std::uint32_t warp = get_prefetch_warp<Dims>();
-    for (std::uint32_t token = warp; token < batch_size;
-         token += CoreDims::PREFETCH_WARP_COUNT) {
-      moe_fetch_activation_async<Dims>(
-          activations_in + token * Dims::HIDDEN_STATES,
-          shmem->u.tiny.w[0].orig[token], pipe);
-    }
-  } else {
-    top1_BS8<Dims>(router_logits, batch_size, shmem);
-    sync_calc_threads<Dims>();
-    prepare_moe_BS8<Dims>(batch_size, shmem);
-  }
+  auto* shm = &shmem->u.tiny;
 
+  // ── Phase 1: prefetch activations into w[0].orig || routing ─────────────
+  if (is_prefetch_warp<Dims>()) {
+    const std::uint32_t pw = get_prefetch_warp<Dims>();
+    for (std::uint32_t tok = pw; tok < batch_size;
+         tok += CoreDims::PREFETCH_WARP_COUNT)
+      moe_fetch_activation_async<Dims>(
+          activations_in + tok * Dims::HIDDEN_STATES, shm->w[0].orig[tok],
+          pipe);
+  } else {
+    topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
+                   shmem);
+    sync_calc_threads<Dims>();
+    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem);
+  }
   cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
+
+  // ── Phase 2: quantize w[0].orig → a.up || prefetch w_up[0] into w[1] ───
   if (is_prefetch_warp<Dims>()) {
-    //
-    // Prefetch first expert weights
-    //
     pipe.producer_acquire();
-
-    // bring in first W tile
     moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-        expert_weights_up, shmem->expert_ids & 0xff, shmem->u.tiny.w[1].up,
-        pipe);
-
+        expert_weights_up, shmem->experts[0].id, shm->w[1].up, pipe);
     pipe.producer_commit();
   } else {
-    //
-    // Rescale activations
-    //
-    const std::uint32_t warp = get_calc_warp<Dims>();
-    if (warp < batch_size) {
-      moe_scale_activation_BS8<Dims>(shmem->u.tiny.w[0].orig[warp],
-                                     (AQ_element*)shmem->u.tiny.a.up[warp],
-                                     shmem->topk_weights[warp]);
+    const std::uint32_t cw = get_calc_warp<Dims>();
+    if (cw < batch_size) {
+      float act_scale =
+          moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw]);
+      if (get_thread<Dims>() == 0) shmem->act_scale[cw] = act_scale;
     }
   }
-
   __syncthreads();
 
-#ifdef DEBUG_MOE
-  if (blockIdx.x == 0) {
-    for (int i = threadIdx.x; i < batch_size; i += blockDim.x) {
-      spec->token_indexes[i] = shmem->token_indexes[i];
+  // ── Phase 3: Up-projection — all experts, double-buffered w[].up ────────
+  moe_up_projection_BS8_allexperts<Dims>(expert_weights_up, expert_scales_up,
+                                         top_k, batch_size, spec, shmem);
+
+  // ── Single grid.sync — all blocks finish writing spec->temp ─────────────
+  cooperative_groups::this_grid().sync();
+
+  // Zero the per-block fp32 output accumulator in SHM.
+  const unsigned base_row_dn = blockIdx.x * CoreDims::W_DOWN_TILE;
+  for (unsigned idx = threadIdx.x; idx < Dims::BS * CoreDims::W_DOWN_TILE;
+       idx += blockDim.x)
+    ((T_element*)shm->out_accum)[idx] = 0.f;
+  __syncthreads();
+
+  // ── Phase 4: Down-projection — all experts, double-buffered w[].down ────
+  // For each expert: load fp32 from spec->temp, quantize to fp8 → a.down,
+  // then MMA fp8×fp8 with w[].down.
+  moe_down_projection_BS8_allexperts<Dims>(
+      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem);
+
+  // ── Phase 5: Writeback SHM fp32 accumulator → global bf16 output ────────
+  for (unsigned tok = 0; tok < batch_size; ++tok) {
+    for (unsigned col = threadIdx.x; col < CoreDims::W_DOWN_TILE;
+         col += blockDim.x) {
+      activations_out[tok * Dims::HIDDEN_STATES + base_row_dn + col] =
+          (R_element)shm->out_accum[tok][col];
     }
   }
-#endif
-
-  std::uint32_t w_index = moe_up_projection_tiny<Dims>(
-      expert_weights_up, expert_scales_up, expert_weights_down,
-      expert_scales_down, 1, spec, shmem, pipe);
-  cooperative_groups::this_grid().sync();
-  moe_down_projection_tiny<Dims>(batch_size, expert_weights_down,
-                                 expert_scales_down, w_index, activations_out,
-                                 spec, shmem, pipe);
 }
 
+/**
+ * @brief Top-K MoE kernel — single-pass path for BS > 8.
+ *
+ * Two-phase pipeline:
+ *
+ *  Phase 1: Calc warps compute all K expert selections into shmem flat arrays,
+ *           then sort the virtual batch (num_tokens * top_k) by expert.
+ *
+ *  Phase 2: Quantize activations once per original token. Separate act_scale
+ *           (for up-proj inside silu) from routing_weight (for down-proj).
+ *
+ *  Then: up-projection over sorted virtual batch → grid.sync →
+ *        down-projection accumulating += into original token positions.
+ *
+ * The output buffer must be zeroed before calling this function.
+ */
 template <typename Dims>
-__global__ void moe_kernel(const A_element* __restrict__ activations_in,
-                           std::uint32_t token_count,
-                           const __nv_bfloat16* __restrict__ router_logits,
-                           const W_element* __restrict__ expert_weights_up,
-                           const S_element* __restrict__ expert_scales_up,
-                           const W_element* __restrict__ expert_weights_down,
-                           const S_element* __restrict__ expert_scales_down,
-                           R_element* __restrict__ activations_out,
-                           void* __restrict__ scratchpad,
-                           size_t scratchpad_size, size_t shmem_size) {
-  // we require 8 warps per SM and assume X to be the only relevant dimension
+__device__ void moe_kernel_topk_BS64(
+    const A_element* __restrict__ activations_in, std::uint32_t token_count,
+    const __nv_bfloat16* __restrict__ router_logits,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ activations_out, uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize,
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem) {
+  static_assert(Dims::BS > 8);
+
+  // Step 1: compute all K selections into shmem flat arrays
+  if (is_calc_warp<Dims>()) {
+    topK_BS64<Dims>(top_k, scoring_func, renormalize, router_logits,
+                    token_count, shmem);
+  }
+  __syncthreads();
+
+  // Step 2: sort BS*top_k virtual rows by expert, build token_indexes_topk
+  //         and token_weights
+  prepare_moe_topk_BSx_Ey<Dims>(token_count, top_k, shmem);
+  __syncthreads();
+
+  // Step 3: quantize activations once per original token.
+  // Writes spec->activations[tok] (fp8) and shmem->act_scale[tok].
+  moe_scale_activation_BSx<Dims>(activations_in, token_count, spec, shmem);
+
+  // Step 3b: for each sorted slot, store act_scale in token_weights (for
+  // up-proj inside silu) and routing_weight in topk_weights_flat (for
+  // down-proj). token_weights[sorted_pos] was set to routing_weight in prepare
+  // step.
+  {
+    const uint32_t virtual_batch = token_count * top_k;
+    for (uint32_t sp = threadIdx.x; sp < virtual_batch; sp += blockDim.x) {
+      uint32_t tok = shmem->path.bs64.token_indexes_topk[sp];
+      float rw =
+          shmem->path.bs64.token_weights[sp];   // routing_weight (from prepare)
+      float as = shmem->act_scale[tok];         // act_scale (from step 3)
+      shmem->path.bs64.token_weights[sp] = as;  // act_scale for up-proj
+      shmem->topk_weights_flat[sp] = rw;        // routing_weight for down-proj
+    }
+  }
+  __syncthreads();
+
+  // Step 4: up-projection (reads token_weights per sorted slot)
+  moe_up_projection_topk<Dims>(expert_weights_up, expert_scales_up, spec,
+                               shmem);
+  cooperative_groups::this_grid().sync();
+
+  // Step 5: down-projection (accumulates += into original token positions)
+  moe_down_projection_topk<Dims>(expert_weights_down, expert_scales_down,
+                                 activations_out, spec, shmem);
+}
+
+/**
+ * @brief Top-K MoE kernel with configurable scoring and renormalization.
+ *
+ * Dispatches to moe_kernel_topk_BS8 (BS <= 8) or moe_kernel_topk_BS64 (BS > 8).
+ */
+template <typename Dims>
+__global__ void moe_kernel_topk(
+    const A_element* __restrict__ activations_in, std::uint32_t token_count,
+    const __nv_bfloat16* __restrict__ router_logits,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
+    size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize) {
   assert(MoECoreDims<Dims>::THREADS_PER_WARP == 32);
   assert(blockDim.x == Dims::KernelConfig::BLOCK_SIZE);
   assert(blockDim.y == 1);
   assert(blockDim.z == 1);
-
   assert(gridDim.x == Dims::KernelConfig::GRID_SIZE);
   assert(gridDim.y == 1);
   assert(gridDim.z == 1);
 
-  static_assert(Dims::M <= Dims_Max::M,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::N <= Dims_Max::N,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::K <= Dims_Max::K,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::NUM_EXPERTS <= Dims_Max::NUM_EXPERTS,
-                "Dimension larger than the maximum supported dimension.");
-
   assert(token_count <= Dims::BS);
   assert(token_count > 0);
+  assert(top_k >= 1 && top_k <= MoE_SHM<Dims>::MAX_TOPK);
 
-  assert((uintptr_t)scratchpad % alignof(MoEGemmSpec<Dims>) == 0);
-  assert(scratchpad_size >= get_moe_scratchpad_size<Dims>());
   MoEGemmSpec<Dims>* spec = reinterpret_cast<MoEGemmSpec<Dims>*>(scratchpad);
-
-  assert(shmem_size >= get_moe_shmem_size<Dims>());
 
   extern __shared__ char shmem_buffer[];
   MoE_SHM<Dims>* shmem = reinterpret_cast<MoE_SHM<Dims>*>(shmem_buffer);
 
+  // Zero output before accumulation
+  for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+       i < token_count * Dims::HIDDEN_STATES; i += blockDim.x * gridDim.x) {
+    activations_out[i] = (__nv_bfloat16)0.0f;
+  }
+  cooperative_groups::this_grid().sync();
+
   if constexpr (Dims::BS <= 8) {
-    moe_kernel_BS8(activations_in, token_count, router_logits,
-                   expert_weights_up, expert_scales_up, expert_weights_down,
-                   expert_scales_down, activations_out, spec, shmem);
+    moe_kernel_topk_BS8<Dims>(
+        activations_in, token_count, router_logits, expert_weights_up,
+        expert_scales_up, expert_weights_down, expert_scales_down,
+        activations_out, top_k, scoring_func, renormalize, spec, shmem);
   } else {
-    moe_kernel_BS64(activations_in, token_count, router_logits,
-                    expert_weights_up, expert_scales_up, expert_weights_down,
-                    expert_scales_down, activations_out, spec, shmem);
+    moe_kernel_topk_BS64<Dims>(
+        activations_in, token_count, router_logits, expert_weights_up,
+        expert_scales_up, expert_weights_down, expert_scales_down,
+        activations_out, top_k, scoring_func, renormalize, spec, shmem);
   }
 }
 

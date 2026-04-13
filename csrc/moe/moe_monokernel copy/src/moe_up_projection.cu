@@ -482,7 +482,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
       }
 
@@ -539,7 +539,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
         shm->partial_result[warp][thread + 0] = d0;
         shm->partial_result[warp][thread + 32] = d1;
@@ -575,156 +575,6 @@ __device__ inline void moe_up_projection_topk(
                                temp);
       }
     }
-  }
-}
-
-}  // namespace moe_monokernel
-
-/**
- * @brief Split-phase up-projection for BS8: iterates over ALL experts,
- *        writing fp32 SiLU output to spec->temp.
- *
- * Uses double-buffered w_up[2] for pipelining: while computing expert e
- * with w_up[cur], prefetch warps load expert e+1 into w_up[next].
- *
- * a_up (quantized fp8 activations) is persistent in SHM across all experts.
- *
- * For each expert, each block computes W_UP_TILE/2 = 8 columns of the
- * N-wide SiLU output for all tokens routed to that expert.  The result
- * is written to spec->temp[row * N + col] where row is a virtual-batch
- * index assigned per (token, expert) pair.
- *
- * @param expert_weights_up  [E, 2*N, K] fp8 weights in global memory.
- * @param expert_scales_up   [E, 2*N] fp32 scales in global memory.
- * @param top_k              Number of experts per token.
- * @param batch_size         Number of active tokens.
- * @param spec               Global scratchpad (receives output in spec->temp).
- * @param shmem              Shared memory with routing info and a_up.
- */
-namespace moe_monokernel {
-
-template <typename Dims>
-__device__ inline void moe_up_projection_BS8_allexperts(
-    const W_element* __restrict__ expert_weights_up,
-    const S_element* __restrict__ expert_scales_up, std::uint32_t top_k,
-    std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem) {
-  static_assert(Dims::BS <= 8);
-  using CoreDims = MoECoreDims<Dims>;
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-
-  const unsigned thread = get_thread<Dims>();
-  const unsigned warp = get_any_warp<Dims>();
-
-  const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
-
-  auto* shm = &shmem->u.tiny;
-  const std::uint32_t expert_count = shmem->expert_count;
-
-  cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-
-  // w_up[0] was already prefetched into w[1].up by phase 2 in moe.cu.
-  // We start with w_cur=1 (the buffer that has the first expert's weights).
-  std::uint32_t w_cur = 1;
-
-  for (std::uint32_t e = 0; e < expert_count; ++e) {
-    const std::uint32_t id = shmem->experts[e].id;
-    const S_element* scales_up = expert_scales_up + id * 2 * Dims::N;
-
-    float ws0 = (base_row_up + thread / 4 < Dims::N)
-                    ? scales_up[base_row_up + thread / 4]
-                    : 0.f;
-    float ws1 = (base_row_up + thread / 4 < Dims::N)
-                    ? scales_up[base_row_up + thread / 4 + Dims::N]
-                    : 0.f;
-
-    // Wait for current expert's weights
-    cuda::pipeline_consumer_wait_prior<0>(pipe);
-    __syncthreads();
-
-    if (is_prefetch_warp<Dims>()) {
-      // Prefetch NEXT expert's up-weights into the other buffer
-      if (e + 1 < expert_count) {
-        pipe.producer_acquire();
-        moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-            expert_weights_up, shmem->experts[e + 1].id, shm->w[w_cur ^ 1].up,
-            pipe);
-        pipe.producer_commit();
-      }
-    } else {
-      // ── MMA: a.up × w[w_cur].up ──────────────────────────────────────
-      float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-      for (unsigned bc = warp * CoreDims::K_TILE, i = 0;
-           i < Dims::HIDDEN_STATES / CoreDims::BLOCK_STRIDE;
-           ++i, bc += CoreDims::BLOCK_STRIDE) {
-        unsigned r = thread / 4, c = 4 * (thread % 4);
-        __nv_fp8x4_e4m3 w0 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
-                                  .up[r + 0][rotate_col_32(bc + c + 0, r)];
-        __nv_fp8x4_e4m3 w1 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
-                                  .up[r + 8][rotate_col_32(bc + c + 0, r)];
-        __nv_fp8x4_e4m3 w2 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
-                                  .up[r + 0][rotate_col_32(bc + c + 16, r)];
-        __nv_fp8x4_e4m3 w3 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
-                                  .up[r + 8][rotate_col_32(bc + c + 16, r)];
-        __nv_fp8x4_e4m3 a02 =
-            *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 0, r)];
-        __nv_fp8x4_e4m3 a13 =
-            *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 16, r)];
-        mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
-      }
-      // Swap d1↔d2 for gate/up layout
-      {
-        float tmp = d1;
-        d1 = d2;
-        d2 = tmp;
-      }
-      shm->partial_result.up[warp][thread + 0] = d0;
-      shm->partial_result.up[warp][thread + 32] = d1;
-      shm->partial_result.up[warp][thread + 64] = d2;
-      shm->partial_result.up[warp][thread + 96] = d3;
-    }
-    __syncthreads();
-
-    // ── Reduction → SiLU → write to spec->temp ───────────────────────────
-    if (warp < 2) {
-      const std::uint32_t row = (thread % 4) * 2 + warp;
-      bool store = false;
-      float rw = 0.f;
-      std::uint32_t virtual_row = 0;
-
-      if (row < batch_size) {
-        for (uint32_t k = 0; k < top_k; k++) {
-          if (shmem->topk_ids_flat[row * MAX_TOPK + k] == (uint8_t)id) {
-            store = true;
-            rw = shmem->topk_weights_flat[row * MAX_TOPK + k];
-            virtual_row = row * top_k + k;
-            break;
-          }
-        }
-      }
-
-      if (store) {
-        float as = shmem->act_scale[row];
-        float d0 = shm->partial_result.up[0][thread + warp * 64 + 0] +
-                   shm->partial_result.up[1][thread + warp * 64 + 0];
-        float d2 = shm->partial_result.up[0][thread + warp * 64 + 32] +
-                   shm->partial_result.up[1][thread + warp * 64 + 32];
-        for (unsigned i = 2; i < CoreDims::CALC_WARP_COUNT; i += 2) {
-          d0 += shm->partial_result.up[i][thread + warp * 64 + 0] +
-                shm->partial_result.up[i + 1][thread + warp * 64 + 0];
-          d2 += shm->partial_result.up[i][thread + warp * 64 + 32] +
-                shm->partial_result.up[i + 1][thread + warp * 64 + 32];
-        }
-        float x0 = d0 * as * ws0, w0v = d2 * as * ws1;
-        if ((thread / 4) + base_row_up < Dims::N) {
-          spec->temp[virtual_row * Dims::N + (thread / 4) + base_row_up] =
-              rw * (w0v * x0) / (1.f + expf(-x0));
-        }
-      }
-    }
-
-    w_cur ^= 1;
-    __syncthreads();
   }
 }
 

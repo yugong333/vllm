@@ -10,44 +10,55 @@
 
 namespace moe_monokernel {
 
-// Native Hopper FP8 MMA (m16n8k32) — single instruction, no conversion
-// overhead.
-//
-// A-matrix (weights): 4 regs, each holding 4 × e4m3 elements (16 total, k=32).
-//   {a0, a1, a2, a3} maps to the m16n8k32 layout:
-//     a0 → rows [groupID],   k[ 0:15]  (low K half, top 8 rows)
-//     a1 → rows [groupID],   k[16:31]  (high K half, top 8 rows)
-//     a2 → rows [groupID+8], k[ 0:15]  (low K half, bottom 8 rows)
-//     a3 → rows [groupID+8], k[16:31]  (high K half, bottom 8 rows)
-//
-// B-matrix (activations): 2 regs, each holding 4 × e4m3 elements (8 total,
-// k=32).
-//   {b0, b1} maps to:
-//     b0 → k[ 0:15]
-//     b1 → k[16:31]
-//
-// Callers that previously loaded:
-//   w0 = weight[row+0][col+ 0]  w1 = weight[row+8][col+ 0]
-//   w2 = weight[row+0][col+16]  w3 = weight[row+8][col+16]
-// should call:  mma_fp8_fp8(d, w0, w2, w1, w3, a02, a13, c)
-//                              ^^  ^^  ^^  ^^
-//                              a0  a1  a2  a3  (interleaved for k=32 layout)
 __device__ static inline void mma_fp8_fp8(
     float& d0, float& d1, float& d2, float& d3, __nv_fp8x4_e4m3 const& a0,
     __nv_fp8x4_e4m3 const& a1, __nv_fp8x4_e4m3 const& a2,
-    __nv_fp8x4_e4m3 const& a3, __nv_fp8x4_e4m3 const& b0,
-    __nv_fp8x4_e4m3 const& b1, float const& c0, float const& c1,
+    __nv_fp8x4_e4m3 const& a3, __nv_fp8x4_e4m3 const& b02,
+    __nv_fp8x4_e4m3 const& b13, float const& c0, float const& c1,
     float const& c2, float const& c3) {
 #define X2U(x) reinterpret_cast<const unsigned&>(x)
   asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-      "{%0, %1, %2, %3}, "
-      "{%4, %5, %6, %7}, "
-      "{%8, %9}, "
+      "{"
+      ".reg .b16 lo0, lo1, lo2, lo3;\n"
+      ".reg .b16 hi0, hi1, hi2, hi3;\n"
+      ".reg .b16 bh0, bh1, bh2, bh3;\n"
+      ".reg .b32 al0, al1, al2, al3;\n"
+      ".reg .b32 ah0, ah1, ah2, ah3;\n"
+      ".reg .b32 b0, b1, b2, b3;\n"
+      ".reg .b32 t0, t1, t2, t3;\n"
+      "mov.b32 {lo0, hi0}, %4;\n"
+      "mov.b32 {lo1, hi1}, %5;\n"
+      "mov.b32 {lo2, hi2}, %6;\n"
+      "mov.b32 {lo3, hi3}, %7;\n"
+      "cvt.rn.f16x2.e4m3x2 al0, lo0;\n"
+      "cvt.rn.f16x2.e4m3x2 ah0, hi0;\n"
+      "cvt.rn.f16x2.e4m3x2 al1, lo1;\n"
+      "cvt.rn.f16x2.e4m3x2 ah1, hi1;\n"
+      "cvt.rn.f16x2.e4m3x2 al2, lo2;\n"
+      "cvt.rn.f16x2.e4m3x2 ah2, hi2;\n"
+      "cvt.rn.f16x2.e4m3x2 al3, lo3;\n"
+      "cvt.rn.f16x2.e4m3x2 ah3, hi3;\n"
+      "mov.b32 {bh0, bh2}, %8;\n"
+      "mov.b32 {bh1, bh3}, %9;\n"
+      "cvt.rn.f16x2.e4m3x2 b0, bh0;\n"
+      "cvt.rn.f16x2.e4m3x2 b1, bh1;\n"
+      "cvt.rn.f16x2.e4m3x2 b2, bh2;\n"
+      "cvt.rn.f16x2.e4m3x2 b3, bh3;\n"
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{t0, t1, t2, t3}, "
+      "{al0, al1, al2, al3}, "
+      "{b0, b1}, "
       "{%10, %11, %12, %13};\n"
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{ah0, ah1, ah2, ah3}, "
+      "{b2, b3}, "
+      "{t0, t1, t2, t3};\n"
+      "}\n"
       : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(X2U(a0)), "r"(X2U(a1)), "r"(X2U(a2)), "r"(X2U(a3)), "r"(X2U(b0)),
-        "r"(X2U(b1)), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+      : "r"(X2U(a0)), "r"(X2U(a1)), "r"(X2U(a2)), "r"(X2U(a3)), "r"(X2U(b02)),
+        "r"(X2U(b13)), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+
 #undef X2U
 }
 

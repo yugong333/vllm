@@ -206,7 +206,12 @@ def paged_attention_v2(
     )
 
 
-def moe_monokernel(
+# Scoring function constants matching the CUDA enum ScoringFunc
+MOE_SCORING_SIGMOID = 0
+MOE_SCORING_SOFTMAX = 1
+
+
+def moe_monokernel_topk(
     activations_in: torch.Tensor,
     router_logits: torch.Tensor,
     expert_weights_up: torch.Tensor,
@@ -214,7 +219,29 @@ def moe_monokernel(
     expert_weights_down: torch.Tensor,
     expert_scales_down: torch.Tensor,
     scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
 ) -> torch.Tensor:
+    """MoE monokernel with configurable top-K routing, scoring function,
+    and renormalization.
+
+    Supports top_k from 1 to 8, softmax or sigmoid scoring, and optional
+    weight renormalization. Designed for models like Qwen3 Coder FP8
+    (128 experts, top_k=8, softmax, renormalize=True).
+
+    Args:
+        activations_in: Input activations [M, K] in bfloat16
+        router_logits: Router logits [M, E] in bfloat16
+        expert_weights_up: Up-projection weights [E, 2*N, K] in fp8
+        expert_scales_up: Up-projection scales [E, 2*N, 1] in float32
+        expert_weights_down: Down-projection weights [E, K, N] in fp8
+        expert_scales_down: Down-projection scales [E, K, 1] in float32
+        scratchpad: Temporary storage tensor
+        top_k: Number of experts per token (1-8)
+        scoring_func: "softmax" or "sigmoid"
+        renormalize: Whether to renormalize top-K weights to sum to 1
+    """
     if not current_platform.is_cuda():
         raise NotImplementedError(
             "The optimized moe kernel is only available on CUDA platforms"
@@ -234,8 +261,21 @@ def moe_monokernel(
     assert expert_weights_down.is_contiguous()
     assert expert_scales_down.is_contiguous()
 
-    TP = torch.distributed.get_world_size()
-    E, M, N, K = router_logits.size(1), activations_in.size(0), 2 * 8192 // TP, 5120
+    assert 1 <= top_k <= 8, f"top_k must be between 1 and 8, got {top_k}"
+    assert scoring_func in ("softmax", "sigmoid"), (
+        f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func}"
+    )
+
+    scoring_func_int = (
+        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
+    )
+
+    E = router_logits.size(1)
+    M = activations_in.size(0)
+    # Derive N and K from actual tensor shapes — works for any model/TP config
+    N = expert_weights_up.size(1)  # gate+up fused: 2*N_half
+    K = expert_weights_up.size(2)  # hidden states
+
     assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
     assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
     assert expert_scales_up.size() == (E, N, 1), f"size is: {expert_scales_up.size()}"
@@ -246,94 +286,75 @@ def moe_monokernel(
         f"size is: {expert_scales_down.size()}"
     )
 
-    assert activations_in.dtype is torch.bfloat16, (
-        f"type of x is: {activations_in.type()}"
-    )
-    assert router_logits.dtype is torch.bfloat16, (
-        f"type of x is: {router_logits.type()}"
-    )
-    assert expert_weights_up.dtype is torch.float8_e4m3fn, (
-        f"type of x is: {expert_weights_up.type()}"
-    )
-    assert expert_scales_up.dtype is torch.float32, (
-        f"type of x is: {expert_scales_up.type()}"
-    )
-    assert expert_weights_down.dtype is torch.float8_e4m3fn, (
-        f"type of x is: {expert_weights_down.type()}"
-    )
-    assert expert_scales_down.dtype is torch.float32, (
-        f"type of x is: {expert_scales_down.type()}"
-    )
+    assert activations_in.dtype is torch.bfloat16
+    assert router_logits.dtype is torch.bfloat16
+    assert expert_weights_up.dtype is torch.float8_e4m3fn
+    assert expert_scales_up.dtype is torch.float32
+    assert expert_weights_down.dtype is torch.float8_e4m3fn
+    assert expert_scales_down.dtype is torch.float32
 
     assert M <= 64
-    assert TP == 8
-    # logger.debug("moe_monokernel dispatching: M=%d, E=%d, N=%d, K=%d, TP=%d", M, E, N, K, TP)
-    if E == 16:
-        if M <= 8:
-            torch.ops._moe_C.moe_monokernel_BS8_E16_TP8(
-                activations_in,
-                router_logits,
-                expert_weights_up,
-                expert_scales_up,
-                expert_weights_down,
-                expert_scales_down,
-                activations_in,
-                scratchpad,
-            )
-        else:
-            torch.ops._moe_C.moe_monokernel_BS64_E16_TP8(
-                activations_in,
-                router_logits,
-                expert_weights_up,
-                expert_scales_up,
-                expert_weights_down,
-                expert_scales_down,
-                activations_in,
-                scratchpad,
-            )
-    elif E == 128:
-        if M <= 8:
-            torch.ops._moe_C.moe_monokernel_BS8_E128_TP8(
-                activations_in,
-                router_logits,
-                expert_weights_up,
-                expert_scales_up,
-                expert_weights_down,
-                expert_scales_down,
-                activations_in,
-                scratchpad,
-            )
-        else:
-            torch.ops._moe_C.moe_monokernel_BS64_E128_TP8(
-                activations_in,
-                router_logits,
-                expert_weights_up,
-                expert_scales_up,
-                expert_weights_down,
-                expert_scales_down,
-                activations_in,
-                scratchpad,
-            )
-    return activations_in
+
+    # Allocate output tensor (separate from input for top-K accumulation)
+    activations_out = torch.zeros_like(activations_in)
+
+    # Dispatch to Qwen3-Coder-30B-A3B kernel (E=128, N=1536, K=2048, TP=1)
+    assert E == 128 and N == 1536 and K == 2048, (
+        f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
+        "Supported: E=128 N=1536 K=2048 (Qwen3-Coder)."
+    )
+    if M <= 8:
+        torch.ops._moe_C.moe_monokernel_topk_BS8_E128_Qwen3Coder(
+            activations_in,
+            router_logits,
+            expert_weights_up,
+            expert_scales_up,
+            expert_weights_down,
+            expert_scales_down,
+            activations_out,
+            scratchpad,
+            top_k,
+            scoring_func_int,
+            renormalize,
+        )
+    else:
+        torch.ops._moe_C.moe_monokernel_topk_BS64_E128_Qwen3Coder(
+            activations_in,
+            router_logits,
+            expert_weights_up,
+            expert_scales_up,
+            expert_weights_down,
+            expert_scales_down,
+            activations_out,
+            scratchpad,
+            top_k,
+            scoring_func_int,
+            renormalize,
+        )
+
+    return activations_out
 
 
-def moe_monokernel_fake(
+def moe_monokernel_topk_fake(
     activations_in: torch.Tensor,
     router_logits: torch.Tensor,
     expert_weights_up: torch.Tensor,
     expert_scales_up: torch.Tensor,
     expert_weights_down: torch.Tensor,
     expert_scales_down: torch.Tensor,
-    gemmspec: torch.Tensor,
+    scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
 ) -> torch.Tensor:
-    return activations_in
+    return torch.empty_like(activations_in)
 
 
 direct_register_custom_op(
-    op_name="moe_monokernel",
-    op_func=moe_monokernel,
+    op_name="moe_monokernel_topk",
+    op_func=moe_monokernel_topk,
     mutates_args=[],
-    fake_impl=moe_monokernel_fake,
+    fake_impl=moe_monokernel_topk_fake,
 )
 
 
