@@ -186,7 +186,7 @@ __device__ inline void moe_request_down_expert_tiny(
       // no-op on H200)
       if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
           col < Dims::N) {
-        copy128(shm->w_down[row][col],
+        copy128(shm->w[w_index].down[row][col],
                 weights[(row * Dims::N + col) / sizeof(OpaqueElement)], pipe);
       }
     }
@@ -196,7 +196,7 @@ __device__ inline void moe_request_down_expert_tiny(
   if (d_warp == 0) {
     const unsigned chunk_size = 16 / sizeof(*expert_scales_down);
     if (d_thread < CoreDims::W_DOWN_TILE / chunk_size) {
-      copy128(shm->scale_down[chunk_size * d_thread],
+      copy128(shm->scale[w_index][chunk_size * d_thread],
               expert_scales_down[id * Dims::HIDDEN_STATES + base_row +
                                  chunk_size * d_thread],
               pipe);
@@ -436,13 +436,400 @@ __device__ inline void moe_down_reduction(
  * activation weights and will be uses as local scratch pad store for faster
  * operation.
  */
+template <typename Dims>
+__device__ inline void moe_down_projection_normal(
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ result, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem) {
+  using CoreDims = MoECoreDims<Dims>;
+  using MoE_SHM = MoE_SHM<Dims>;
+
+  // position within the block
+  const unsigned thread = get_thread<Dims>();
+
+  // required for async copies
+  cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
+  const auto shape4 = cuda::aligned_size_t<alignof(float4)>(sizeof(float4));
+
+  // commonly used values
+  typename MoE_SHM::U::Gemm2Data* shm = &shmem->u.gemm2;
+  const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
+  std::uint32_t expert_count = shmem->expert_count;
+
+  const ExpertRef& expert = shmem->experts[0];
+  std::uint32_t id = expert.id;
+
+  assert(expert_count > 0);
+
+  // request first W tile
+  if (is_prefetch_warp<Dims>()) {
+    pipe.producer_acquire();
+    moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down, id,
+                                  shm, 0, pipe);
+
+    // request first T tile
+    moe_request_temp_token<Dims>(spec->temp, expert, 0, shm->t[0], pipe);
+    pipe.producer_commit();
+  }
+
+  // current tile indexes
+  // will be toggled to 0 at the start of the first loop iterations
+  std::uint32_t t_index = 1;
+  std::uint32_t w_index = 1;
+
+  // loop over all experts
+  for (std::uint32_t e = 0; e < expert_count; ++e) {
+    const ExpertRef& expert = shmem->experts[e];
+    unsigned int a_rows = expert.last_token - expert.first_token;
+    w_index ^= 1;
+
+    // process all activations for this set of weights
+    for (unsigned a_row = 0; a_row < a_rows; a_row += CoreDims::T_TILE) {
+      t_index ^= 1;
+
+      // wait for currently needed data to come in
+      cuda::pipeline_consumer_wait_prior<0>(pipe);
+      __syncthreads();
+
+      // request next T, S and W tiles as needed
+      if (is_prefetch_warp<Dims>()) {
+        pipe.producer_acquire();
+        if (e + 1 < expert_count && a_row == 0) {
+          // request first W tile
+          moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
+                                        shmem->experts[e + 1].id, shm,
+                                        w_index ^ 1, pipe);
+        }
+        if (a_row + CoreDims::T_TILE < a_rows) {
+          // request the next T tile for same expert
+          moe_request_temp_token<Dims>(spec->temp, expert,
+                                       a_row + CoreDims::T_TILE,
+                                       shm->t[t_index ^ 1], pipe);
+        } else if (e + 1 < expert_count) {
+          // request the first T tile for next expert
+          moe_request_temp_token<Dims>(spec->temp, shmem->experts[e + 1], 0,
+                                       shm->t[t_index ^ 1], pipe);
+        }
+        pipe.producer_commit();
+      } else {
+        // matrix multiplication step
+        static_assert(CoreDims::W_DOWN_TILE % 8 == 0);
+        moe_down_mult<Dims>(shm->w[w_index], shm->scale[w_index],
+                            shm->t[t_index][thread / 4], true, true,
+                            shm->partial_result);
+      }
+
+      __syncthreads();
+
+      // reduction and output
+      moe_down_reduction<Dims>(
+          shm->partial_result, a_row + (thread % 4) * 2 < a_rows,
+          a_row + (thread % 4) * 2 + 1 < a_rows,
+          shmem->token_indexes[expert.first_token + a_row + (thread % 4) * 2],
+          shmem->token_indexes[expert.first_token + a_row + (thread % 4) * 2 +
+                               1],
+          result);
+    }
+
+    __syncthreads();
+  }
+}
+
+/**
+ * @brief 'Tiny' kernel for the second GEMM ("down projection").
+ *
+ * This device function processes up to 8 tokens, store in @a spec.
+ * The experts to use with each token is given by @a shm, the function will
+ * apply them to all and only filter the output accordingly. The weights and
+ * scales for the first expert have already been prefetched into @a shmem as
+ * well.
+ *
+ * All non-expert data is taken from our temporary storage in @a shmem
+ * and results will be written to @a result. Output order is the input token
+ * order.
+ *
+ * @param token_count Number of input tokens.
+ * @param expert_weights_up Pointer token weights array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES, N] in expert, row-major order. Individual elements are in
+ * __nv_fp8_e4m3 format. Stored in Global Memory.
+ * @param expert_scales_up Pointer weights scales array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES] in row-major order. Individual elements are in FP32 format.
+ *                         Stored in Global Memory.
+ * @param w_index Index of the tile in @a shmem that contains the prefetched
+ * weight data for the first expert.
+ * @param result Global Memory array of shape [BS, HIDDEN_STATES] in row-major
+ * order, receiving the output.  Individual elements are in __nv_bfloat16
+ * format.
+ * @param spec Global Memory struct containing the token activations.
+ * @param shmem Shared Memory struct containing the expert<=>token mapping,
+ * activation weights and will be uses as local scratch pad store for faster
+ * operation.
+ * @param pipe Asynchronous completion pipe to use with prefetching.
+ */
+template <typename Dims>
+__device__ inline void moe_down_projection_tiny(
+    std::uint32_t token_count,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down, std::uint32_t w_index,
+    R_element* __restrict__ result, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem,
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+  using CoreDims = MoECoreDims<Dims>;
+  using MoE_SHM = MoE_SHM<Dims>;
+
+  assert(w_index == 0 || w_index == 1);
+
+  // position within the block
+  const unsigned thread = get_thread<Dims>();
+  const unsigned warp = get_any_warp<Dims>();
+
+  // commonly used values
+  typename MoE_SHM::U::TinyData* shm = &shmem->u.tiny;
+  const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
+  std::uint32_t expert_count = shmem->expert_count;
+  std::uint64_t expert_mask = shmem->expert_mask;
+  std::uint64_t expert_ids = shmem->expert_ids;
+
+  assert(expert_count > 0);
+  std::uint32_t id = expert_ids & 0xff;
+
+  // request data for the first expert
+  pipe.producer_acquire();
+
+  // request T (W has already been requested by up-projection)
+  if (warp < token_count) {
+    for (unsigned col = thread * 4, i = 0;
+         i < Dims::N / (CoreDims::THREADS_PER_WARP * 4);
+         i++, col += CoreDims::THREADS_PER_WARP * 4) {
+      copy128(shm->a.down[warp][col], spec->temp[warp * Dims::N + col], pipe);
+    }
+  }
+
+  pipe.producer_commit();
+
+  // loop over all experts
+  for (std::uint32_t e = 0; e < expert_count; ++e) {
+    id = expert_ids & 0xff;
+    expert_ids >>= 8;
+
+    // wait for currently needed data to come in
+    cuda::pipeline_consumer_wait_prior<0>(pipe);
+    __syncthreads();
+
+    // request next S and W tiles as needed
+    if (is_prefetch_warp<Dims>()) {
+      pipe.producer_acquire();
+      if (e + 1 < expert_count) {
+        moe_request_down_expert_tiny<Dims>(
+            expert_weights_down, expert_scales_down, expert_ids & 0xff, shm,
+            w_index ^ 1, pipe);
+      }
+      pipe.producer_commit();
+    } else {
+      // matrix multiplication step
+      static_assert(CoreDims::W_DOWN_TILE % 8 == 0);
+      std::uint32_t row0 = (thread % 4) * 2 + 0;
+      std::uint32_t row1 = (thread % 4) * 2 + 1;
+      bool store_row0 = (expert_mask >> (row0 * 8) & 0xff) == id;
+      bool store_row1 = (expert_mask >> (row1 * 8) & 0xff) == id;
+
+      moe_down_mult<Dims>(shm->w[w_index].down, shm->scale[w_index],
+                          shm->a.down[thread / 4], store_row0, store_row1,
+                          shm->partial_result.down);
+    }
+
+    __syncthreads();
+    w_index ^= 1;
+  }
+
+  // reduction and output
+  std::uint32_t row0 = (thread % 4) * 2 + 0;
+  std::uint32_t row1 = (thread % 4) * 2 + 1;
+  moe_down_reduction<Dims>(shm->partial_result.down, row0 < token_count,
+                           row1 < token_count, row0, row1, result);
+}
+
+/**
+ * @brief Top-K variant of moe_down_projection_tiny.
+ *
+ * Identical to moe_down_projection_tiny except:
+ *  - Uses topk_ids_flat to filter which tokens belong to each expert
+ *    (instead of expert_mask which is 0 in the topK path).
+ *  - Accumulates output with += (weighted by topk_weights_flat) instead of =.
+ *  - The output buffer must be zeroed before calling this function.
+ */
+template <typename Dims>
+__device__ inline void moe_down_projection_tiny_topk(
+    std::uint32_t token_count,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down, std::uint32_t w_index,
+    R_element* __restrict__ result, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem,
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+  using CoreDims = MoECoreDims<Dims>;
+  using MoE_SHM_t = MoE_SHM<Dims>;
+  constexpr uint32_t MAX_TOPK = MoE_SHM_t::MAX_TOPK;
+
+  assert(w_index == 0 || w_index == 1);
+
+  const unsigned thread = get_thread<Dims>();
+  const unsigned warp = get_any_warp<Dims>();
+
+  typename MoE_SHM_t::U::TinyData* shm = &shmem->u.tiny;
+  const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
+  std::uint32_t expert_count = shmem->expert_count;
+  std::uint64_t expert_ids = shmem->expert_ids;
+
+  assert(expert_count > 0);
+
+  // Prefetch T activations (same as top-1 tiny path)
+  pipe.producer_acquire();
+  if (warp < token_count) {
+    for (unsigned col = thread * 4, i = 0;
+         i < Dims::N / (CoreDims::THREADS_PER_WARP * 4);
+         i++, col += CoreDims::THREADS_PER_WARP * 4) {
+      copy128(shm->a.down[warp][col], spec->temp[warp * Dims::N + col], pipe);
+    }
+  }
+  pipe.producer_commit();
+
+  // Accumulator for this block's partial results — cleared per expert
+  // (moe_down_mult writes to shm->partial_result.down, then we accumulate)
+  for (std::uint32_t e = 0; e < expert_count; ++e) {
+    std::uint32_t id = expert_ids & 0xff;
+    expert_ids >>= 8;
+
+    cuda::pipeline_consumer_wait_prior<0>(pipe);
+    __syncthreads();
+
+    if (is_prefetch_warp<Dims>()) {
+      pipe.producer_acquire();
+      if (e + 1 < expert_count) {
+        moe_request_down_expert_tiny<Dims>(
+            expert_weights_down, expert_scales_down, expert_ids & 0xff, shm,
+            w_index ^ 1, pipe);
+      }
+      pipe.producer_commit();
+    } else {
+      // Determine which tokens are assigned to this expert (K-slot scan)
+      std::uint32_t row0 = (thread % 4) * 2 + 0;
+      std::uint32_t row1 = (thread % 4) * 2 + 1;
+
+      bool store_row0 = false, store_row1 = false;
+      if (row0 < token_count) {
+        for (uint32_t k = 0; k < MAX_TOPK; k++) {
+          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
+            store_row0 = true;
+            break;
+          }
+        }
+      }
+      if (row1 < token_count) {
+        for (uint32_t k = 0; k < MAX_TOPK; k++) {
+          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
+            store_row1 = true;
+            break;
+          }
+        }
+      }
+
+      moe_down_mult<Dims>(shm->w[w_index].down, shm->scale[w_index],
+                          shm->a.down[thread / 4], store_row0, store_row1,
+                          shm->partial_result.down);
+    }
+
+    // All threads sync before reduction reads partial_result
+    __syncthreads();
+
+    if (!is_prefetch_warp<Dims>()) {
+      // Reduce and accumulate into output (+=)
+      const unsigned base_out = blockIdx.x * CoreDims::W_DOWN_TILE;
+      std::uint32_t row0 = (thread % 4) * 2 + 0;
+      std::uint32_t row1 = (thread % 4) * 2 + 1;
+
+      // Re-compute store flags (weight not needed — already in spec->temp)
+      bool store_row0 = false, store_row1 = false;
+      if (row0 < token_count) {
+        for (uint32_t k = 0; k < MAX_TOPK; k++) {
+          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
+            store_row0 = true;
+            break;
+          }
+        }
+      }
+      if (row1 < token_count) {
+        for (uint32_t k = 0; k < MAX_TOPK; k++) {
+          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
+            store_row1 = true;
+            break;
+          }
+        }
+      }
+
+      for (unsigned w_row = warp * CoreDims::W_DOWN_MMA_TILE;
+           w_row < CoreDims::W_DOWN_TILE;
+           w_row += CoreDims::W_DOWN_MMA_TILE * CoreDims::TOTAL_WARP_COUNT) {
+        float d0 = shm->partial_result.down[w_row / 2][thread + 0];
+        float d1 = shm->partial_result.down[w_row / 2][thread + 32];
+        float d2 = shm->partial_result.down[w_row / 2][thread + 64];
+        float d3 = shm->partial_result.down[w_row / 2][thread + 96];
+        for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
+          d0 += shm->partial_result.down[w_row / 2 + i][thread + 0];
+          d1 += shm->partial_result.down[w_row / 2 + i][thread + 32];
+          d2 += shm->partial_result.down[w_row / 2 + i][thread + 64];
+          d3 += shm->partial_result.down[w_row / 2 + i][thread + 96];
+        }
+        if (store_row0) {
+          unsigned col0 =
+              row0 * Dims::HIDDEN_STATES + (thread / 4) + base_out + w_row;
+          result[col0 + 0] = (R_element)((float)result[col0 + 0] + d0);
+          if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+              w_row + 8 < CoreDims::W_DOWN_TILE)
+            result[col0 + 8] = (R_element)((float)result[col0 + 8] + d2);
+        }
+        if (store_row1) {
+          unsigned col1 =
+              row1 * Dims::HIDDEN_STATES + (thread / 4) + base_out + w_row;
+          result[col1 + 0] = (R_element)((float)result[col1 + 0] + d1);
+          if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+              w_row + 8 < CoreDims::W_DOWN_TILE)
+            result[col1 + 8] = (R_element)((float)result[col1 + 8] + d3);
+        }
+      }
+    }
+
+    __syncthreads();
+    w_index ^= 1;
+  }
+}
+
+/**
+ * @brief Forwards to @c moe_down_projection_normal.
+ *
+ * @see moe_down_projection_normal
+ */
+template <typename Dims>
+__device__ void moe_down_projection(
+    std::uint32_t token_count,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ result, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem) {
+  static_assert(Dims::BS > 8,
+                "Tiny is handled by its own kernel. Do not use "
+                "moe_down_projection for BS<=8");
+  moe_down_projection_normal<Dims>(expert_weights_down, expert_scales_down,
+                                   result, spec, shmem);
+}
+
 /**
  * @brief Top-K single-pass down-projection reduction with weighted
  * accumulation.
  *
  * Identical to @c moe_down_reduction except:
  *  - @p row0 / @p row1 are sorted positions; the original token index is
- *    looked up via @c shmem->path.bs64.token_indexes_topk[sorted_pos].
+ *    looked up via @c shmem->token_indexes_topk[sorted_pos].
  *  - The output is accumulated with @c += (not @c =) because each original
  *    token may receive contributions from multiple experts.
  */
@@ -457,10 +844,8 @@ __device__ inline void moe_down_reduction_topk(
   const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
 
   // Map sorted positions to original token indexes
-  unsigned orig_row0 =
-      store_row0 ? shmem->path.bs64.token_indexes_topk[sorted_row0] : 0;
-  unsigned orig_row1 =
-      store_row1 ? shmem->path.bs64.token_indexes_topk[sorted_row1] : 0;
+  unsigned orig_row0 = store_row0 ? shmem->token_indexes_topk[sorted_row0] : 0;
+  unsigned orig_row1 = store_row1 ? shmem->token_indexes_topk[sorted_row1] : 0;
 
   for (unsigned w_row = warp * CoreDims::W_DOWN_MMA_TILE;
        w_row < CoreDims::W_DOWN_TILE;
@@ -477,23 +862,20 @@ __device__ inline void moe_down_reduction_topk(
       d3 += partial_result[w_row / 2 + i][thread + 96];
     }
 
-    // Accumulate into original token positions (+=) weighted by routing_weight
-    // topk_weights_flat[sorted_pos] = routing_weight (stored in step 3b)
+    // Accumulate into original token positions (+=)
     if (store_row0) {
-      float rw0 = shmem->topk_weights_flat[sorted_row0];
       unsigned col0 =
           orig_row0 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
-      result[col0 + 0] = (R_element)((float)result[col0 + 0] + rw0 * d0);
+      result[col0 + 0] = (R_element)((float)result[col0 + 0] + d0);
       if (CoreDims::W_DOWN_TILE % 16 == 0 || w_row + 8 < CoreDims::W_DOWN_TILE)
-        result[col0 + 8] = (R_element)((float)result[col0 + 8] + rw0 * d2);
+        result[col0 + 8] = (R_element)((float)result[col0 + 8] + d2);
     }
     if (store_row1) {
-      float rw1 = shmem->topk_weights_flat[sorted_row1];
       unsigned col1 =
           orig_row1 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row;
-      result[col1 + 0] = (R_element)((float)result[col1 + 0] + rw1 * d1);
+      result[col1 + 0] = (R_element)((float)result[col1 + 0] + d1);
       if (CoreDims::W_DOWN_TILE % 16 == 0 || w_row + 8 < CoreDims::W_DOWN_TILE)
-        result[col1 + 8] = (R_element)((float)result[col1 + 8] + rw1 * d3);
+        result[col1 + 8] = (R_element)((float)result[col1 + 8] + d3);
     }
   }
 }
@@ -585,323 +967,6 @@ __device__ inline void moe_down_projection_topk(
                                     sorted_row0, sorted_row1, shmem, result);
     }
 
-    __syncthreads();
-  }
-}
-
-}  // namespace moe_monokernel
-
-namespace moe_monokernel {
-
-/**
- * @brief Down-projection MMA for BS8 split-phase with fp8 activations.
- *
- * Uses mma_fp8_fp8 (m16n8k32) — both weights and activations are fp8.
- * The activation row is read from SHM (a_down[row][N], fp8) and the
- * per-row activation scale is applied during reduction.
- */
-template <typename Dims, std::size_t Rows, std::size_t Cols,
-          std::size_t OutRows, std::size_t OutCols>
-__device__ inline void moe_down_mult_fp8(
-    const W_element __restrict__ (&weights)[Rows][Cols],
-    const float* __restrict__ scale, const AQ_element* __restrict__ act_row,
-    float act_scale, bool store_row0, bool store_row1,
-    float (&partial_result)[OutRows][OutCols]) {
-  using CoreDims = MoECoreDims<Dims>;
-  const unsigned thread = get_thread<Dims>();
-  const unsigned warp = get_calc_warp<Dims>();
-
-  for (unsigned w_row = 0; w_row < CoreDims::W_DOWN_TILE;
-       w_row += CoreDims::W_DOWN_MMA_TILE) {
-    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-
-    // mma_fp8_fp8 is m16n8k32 — processes 32 columns per iteration
-    for (unsigned base_col = warp * CoreDims::K_TILE, i = 0;
-         i < Dims::N / CoreDims::BLOCK_STRIDE;
-         base_col += CoreDims::BLOCK_STRIDE, i++) {
-      unsigned far_row =
-          (Rows % 16 == 8 && w_row + 8 == Rows) ? w_row : w_row + 8;
-
-      // A-matrix (weights): fp8
-      __nv_fp8x4_e4m3 w0 =
-          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 0];
-      __nv_fp8x4_e4m3 w1 =
-          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 0];
-      __nv_fp8x4_e4m3 w2 =
-          *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 16];
-      __nv_fp8x4_e4m3 w3 =
-          *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4]
-                                     [base_col + 4 * (thread % 4) + 16];
-
-      // B-matrix (activations): fp8
-      __nv_fp8x4_e4m3 b0 =
-          *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 0];
-      __nv_fp8x4_e4m3 b1 =
-          *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 16];
-
-      mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, b0, b1, d0, d1, d2, d3);
-    }
-
-    // Apply weight scale and activation scale
-    float ws0 = scale[(thread / 4) + w_row + 0];
-    float ws1 = scale[(thread / 4) + w_row + 8];
-
-    d0 *= ws0 * act_scale;
-    d1 *= ws0 * act_scale;
-    d2 *= ws1 * act_scale;
-    d3 *= ws1 * act_scale;
-
-    if (store_row0) {
-      partial_result[w_row / 2 + warp][thread + 0] = d0;
-      partial_result[w_row / 2 + warp][thread + 64] = d2;
-    }
-    if (store_row1) {
-      partial_result[w_row / 2 + warp][thread + 32] = d1;
-      partial_result[w_row / 2 + warp][thread + 96] = d3;
-    }
-  }
-}
-
-/**
- * @brief Split-phase down-projection for BS8: iterates over ALL experts.
- *
- * Uses double-buffered w[].down for pipelining.  For each expert, loads
- * the relevant tokens' fp32 SiLU output from spec->temp, quantizes to fp8
- * into a.down in SHM, then runs MMA fp8×fp8.
- *
- * @param expert_weights_down  [E, K, N] fp8 weights in global memory.
- * @param expert_scales_down   [E, K] fp32 scales in global memory.
- * @param top_k                Number of experts per token.
- * @param batch_size           Number of active tokens.
- * @param spec                 Global scratchpad (reads spec->temp).
- * @param shmem                Shared memory.
- */
-template <typename Dims>
-__device__ inline void moe_down_projection_BS8_allexperts(
-    const W_element* __restrict__ expert_weights_down,
-    const S_element* __restrict__ expert_scales_down, std::uint32_t top_k,
-    std::uint32_t batch_size, const MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem) {
-  static_assert(Dims::BS <= 8);
-  using CoreDims = MoECoreDims<Dims>;
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-
-  const unsigned thread = get_thread<Dims>();
-  const unsigned warp = get_any_warp<Dims>();
-  const unsigned base_row_dn = blockIdx.x * CoreDims::W_DOWN_TILE;
-
-  auto* shm = &shmem->u.tiny;
-  const std::uint32_t expert_count = shmem->expert_count;
-
-  constexpr float FP8_MAX = 448.f;
-  constexpr float FP8_MAX_INV = 1.0f / 448.f;
-  constexpr std::uint32_t FLOATS_PER_LOAD = 4;
-  constexpr std::uint32_t COLS_PER_WARP_ITER =
-      CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD;
-
-  cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-
-  // Prefetch first expert's down-weights into w[0].down
-  if (is_prefetch_warp<Dims>()) {
-    pipe.producer_acquire();
-    {
-      const unsigned d_thread_l =
-          threadIdx.x % (2 * CoreDims::THREADS_PER_WARP);
-      const unsigned d_warp_l = get_prefetch_warp<Dims>() / 2;
-      const std::uint32_t id = shmem->experts[0].id;
-      const unsigned chunk_size = 16;
-      const OpaqueElement* weights =
-          (const OpaqueElement*)(expert_weights_down +
-                                 id * Dims::N * Dims::HIDDEN_STATES +
-                                 base_row_dn * Dims::N);
-      for (unsigned row = d_warp_l, i = 0;
-           i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
-           row += CoreDims::PREFETCH_WARP_COUNT / 2, i++) {
-        unsigned col = d_thread_l * chunk_size;
-        if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
-            col < Dims::N) {
-          copy128(shm->w[0].down[row][col],
-                  weights[(row * Dims::N + col) / sizeof(OpaqueElement)], pipe);
-        }
-      }
-      if (d_warp_l == 0) {
-        const unsigned sc_chunk = 16 / sizeof(S_element);
-        if (d_thread_l < CoreDims::W_DOWN_TILE / sc_chunk) {
-          copy128(shm->scale[0][sc_chunk * d_thread_l],
-                  expert_scales_down[id * Dims::HIDDEN_STATES + base_row_dn +
-                                     sc_chunk * d_thread_l],
-                  pipe);
-        }
-      }
-    }
-    pipe.producer_commit();
-  }
-  __syncthreads();
-
-  std::uint32_t w_cur = 0;
-
-  for (std::uint32_t e = 0; e < expert_count; ++e) {
-    const std::uint32_t id = shmem->experts[e].id;
-
-    // ── Quantize this expert's tokens from spec->temp → a.down (fp8) ──────
-    // All warps cooperate.  For each token routed to this expert, load its
-    // fp32 SiLU row from spec->temp, find row max, quantize to fp8.
-    // With BS=8 and top_k=8, at most 8 tokens per expert.
-    {
-      // Build a small list of virtual rows for this expert (max T_TILE=8)
-      // Each warp handles one row.
-      for (std::uint32_t tok = warp; tok < batch_size;
-           tok += CoreDims::TOTAL_WARP_COUNT) {
-        // Find if this token is routed to expert id
-        for (uint32_t k = 0; k < top_k; k++) {
-          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id) {
-            std::uint32_t vrow = tok * top_k + k;
-            const T_element* src = &spec->temp[vrow * Dims::N];
-
-            // Pass 1: find per-row max |x|
-            float local_max = 0.f;
-            for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-                 col += COLS_PER_WARP_ITER) {
-              float4 v = *reinterpret_cast<const float4*>(&src[col]);
-              local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
-              local_max = fmaxf(local_max, fmaxf(fabsf(v.z), fabsf(v.w)));
-            }
-            float row_max = warp_reduce_max_float(local_max);
-            if (row_max < __FLT_MIN__) row_max = 1.f;
-
-            float scale_val = row_max * FP8_MAX_INV;
-            float inv_scale = FP8_MAX / row_max;
-
-            // Pass 2: quantize fp32 → fp8 and write to a.down[tok]
-            for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-                 col += COLS_PER_WARP_ITER) {
-              float4 v = *reinterpret_cast<const float4*>(&src[col]);
-              __nv_fp8x4_e4m3 q{float4{v.x * inv_scale, v.y * inv_scale,
-                                       v.z * inv_scale, v.w * inv_scale}};
-              *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->a.down[tok][col]) = q;
-            }
-            if (thread == 0) shm->a_down_scale[tok] = scale_val;
-            break;
-          }
-        }
-      }
-    }
-
-    // Wait for current expert's weights
-    cuda::pipeline_consumer_wait_prior<0>(pipe);
-    __syncthreads();
-
-    if (is_prefetch_warp<Dims>()) {
-      // Prefetch NEXT expert's down-weights
-      if (e + 1 < expert_count) {
-        pipe.producer_acquire();
-        const std::uint32_t nid = shmem->experts[e + 1].id;
-        const unsigned d_thread_l =
-            threadIdx.x % (2 * CoreDims::THREADS_PER_WARP);
-        const unsigned d_warp_l = get_prefetch_warp<Dims>() / 2;
-        const unsigned chunk_size = 16;
-        const OpaqueElement* weights =
-            (const OpaqueElement*)(expert_weights_down +
-                                   nid * Dims::N * Dims::HIDDEN_STATES +
-                                   base_row_dn * Dims::N);
-        for (unsigned row = d_warp_l, i = 0;
-             i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
-             row += CoreDims::PREFETCH_WARP_COUNT / 2, i++) {
-          unsigned col = d_thread_l * chunk_size;
-          if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
-              col < Dims::N) {
-            copy128(shm->w[w_cur ^ 1].down[row][col],
-                    weights[(row * Dims::N + col) / sizeof(OpaqueElement)],
-                    pipe);
-          }
-        }
-        if (d_warp_l == 0) {
-          const unsigned sc_chunk = 16 / sizeof(S_element);
-          if (d_thread_l < CoreDims::W_DOWN_TILE / sc_chunk) {
-            copy128(shm->scale[w_cur ^ 1][sc_chunk * d_thread_l],
-                    expert_scales_down[nid * Dims::HIDDEN_STATES + base_row_dn +
-                                       sc_chunk * d_thread_l],
-                    pipe);
-          }
-        }
-        pipe.producer_commit();
-      }
-    } else {
-      // ── MMA: w[w_cur].down × a.down[token] for each token routed here ──
-      // Zero partial results
-      for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
-           wr < CoreDims::W_DOWN_TILE;
-           wr += CoreDims::W_DOWN_MMA_TILE * CoreDims::CALC_WARP_COUNT) {
-        shm->partial_result.down[wr / 2 + warp][thread + 0] = 0.f;
-        shm->partial_result.down[wr / 2 + warp][thread + 32] = 0.f;
-        shm->partial_result.down[wr / 2 + warp][thread + 64] = 0.f;
-        shm->partial_result.down[wr / 2 + warp][thread + 96] = 0.f;
-      }
-
-      const std::uint32_t row0 = (thread % 4) * 2 + 0;
-      bool s0 = false;
-      if (row0 < batch_size)
-        for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
-            s0 = true;
-            break;
-          }
-
-      float as0 = s0 ? shm->a_down_scale[row0] : 0.f;
-      moe_down_mult_fp8<Dims>(shm->w[w_cur].down, shm->scale[w_cur],
-                              shm->a.down[thread / 4], as0, s0, false,
-                              shm->partial_result.down);
-    }
-    __syncthreads();
-
-    // Reduce and accumulate into out_accum
-    if (!is_prefetch_warp<Dims>()) {
-      const std::uint32_t row0 = (thread % 4) * 2 + 0;
-      const std::uint32_t row1 = (thread % 4) * 2 + 1;
-      bool s0 = false, s1 = false;
-      if (row0 < batch_size)
-        for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
-            s0 = true;
-            break;
-          }
-      if (row1 < batch_size)
-        for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
-            s1 = true;
-            break;
-          }
-
-      for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
-           wr < CoreDims::W_DOWN_TILE;
-           wr += CoreDims::W_DOWN_MMA_TILE * CoreDims::CALC_WARP_COUNT) {
-        float d0 = shm->partial_result.down[wr / 2][thread + 0];
-        float d1 = shm->partial_result.down[wr / 2][thread + 32];
-        float d2 = shm->partial_result.down[wr / 2][thread + 64];
-        float d3 = shm->partial_result.down[wr / 2][thread + 96];
-        for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
-          d0 += shm->partial_result.down[wr / 2 + i][thread + 0];
-          d1 += shm->partial_result.down[wr / 2 + i][thread + 32];
-          d2 += shm->partial_result.down[wr / 2 + i][thread + 64];
-          d3 += shm->partial_result.down[wr / 2 + i][thread + 96];
-        }
-        if (s0) {
-          shm->out_accum[row0][(thread / 4) + wr + 0] += d0;
-          if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[row0][(thread / 4) + wr + 8] += d2;
-        }
-        if (s1) {
-          shm->out_accum[row1][(thread / 4) + wr + 0] += d1;
-          if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[row1][(thread / 4) + wr + 8] += d3;
-        }
-      }
-    }
-
-    w_cur ^= 1;
     __syncthreads();
   }
 }

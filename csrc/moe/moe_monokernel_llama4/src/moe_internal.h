@@ -41,10 +41,11 @@ template <typename Dims>
 struct MoEGemmSpec {
   static constexpr uint32_t SPEC_MAX_TOPK = 8;
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
-  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
-  // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
-  // writes one row per (token, expert) pair into spec->temp.
-  static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
+  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows (BS64
+  // path). For BS <= 8 the tiny path indexes temp by original token, so BS + 8
+  // suffices, but we size for the worst case to keep a single definition.
+  static constexpr uint32_t TEMP_ROWS =
+      (Dims::BS <= 8) ? (Dims::BS + 8) : (Dims::BS * SPEC_MAX_TOPK + 8);
 
   #ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
@@ -55,8 +56,8 @@ struct MoEGemmSpec {
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
   T_element temp[TEMP_ROWS * Dims::N];          //< Up projection result
-  float act_scale[Dims::BS];  //< per-token activation quantization scale
-                              //(max/448)
+  float topk_weights_scaled[Dims::BS];  //< topk_weights multiplied with the
+                                        // activation quantization
 };
 
   // Maximum supported dimensions for shared memory and scratchpad allocation
@@ -126,36 +127,31 @@ struct MoE_SHM {
       T_element partial_result[CoreDims::CALC_WARP_COUNT]
                               [CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
-    // BS8 split-phase path: up-projection and down-projection run as
-    // separate all-experts loops with a single grid.sync() in between.
-    //
-    // Compact union layout:
-    //   a: fp8 up-activations / fp8 down-activations
-    //   w[2]: double-buffers orig(bf16) / w_up(fp8) / w_down(fp8)
-    //   partial_result: up / down scratch
+    // GEMM2 uses the same data structure as Tiny
     struct TinyData {
-      // Input activations for up- and down-projection (mutually exclusive).
+      // input activations for up- and down-projection
       union {
-        AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[CoreDims::T_TILE][Dims::N];                 // fp8
+        AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
+        T_element down[CoreDims::T_TILE][Dims::N];
       } a;
 
-      // Per-row quantization scale for a.down (down-projection activations).
-      S_element a_down_scale[CoreDims::T_TILE];
-
-      // Double-buffered weight tiles.  During init, w[0].orig holds the raw
-      // bf16 activations fetched from global memory (before quantization).
+      // prefetch & process tile in 2 halves
       union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-        W_element down[CoreDims::W_DOWN_TILE]
-                      [Dims::N + CoreDims::PADDING / sizeof(W_element)];
+        A_element
+            orig[CoreDims::T_TILE]
+                [CoreDims::K_DIM_PADDED_A];  // input activations to be scaled
+        W_element up[CoreDims::W_UP_TILE]
+                    [CoreDims::K_DIM_PADDED_W];  // up-projection weights
+        W_element
+            down[CoreDims::W_DOWN_TILE]
+                [Dims::N + CoreDims::PADDING /
+                               sizeof(W_element)];  // down-projection weights
       } w[2];
 
-      // Down-projection weight scales (double-buffered).
+      // down-projection scales
       S_element scale[2][CoreDims::W_DOWN_TILE + CoreDims::PADDING];
 
-      // Scratch pad for MMA partial results (up and down share the same space).
+      // scratch pad
       union {
         T_element up[CoreDims::CALC_WARP_COUNT]
                     [CoreDims::W_UP_TILE * CoreDims::T_TILE];
@@ -163,12 +159,7 @@ struct MoE_SHM {
             down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
                 [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
       } partial_result;
-
-      // Per-block fp32 accumulator for down-projection output.
-      T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE];
     } tiny;
-    // BS64 path: holds weight tiles and partial results for down-projection
-    // only (up-projection uses Gemm1Data; activations come from spec->temp)
     struct Gemm2Data {
       // prefetch 1 tile ahead
       T_element t[2][CoreDims::T_TILE][Dims::N];
@@ -184,45 +175,37 @@ struct MoE_SHM {
   static_assert(Dims::NUM_EXPERTS < 255,
                 "Number of experts too high, cannot store as uint8 anymore.");
 
-  // ── Common fields (both BS8 and BS64) ────────────────────────────────────
-
-  // act_scale[tok] = max(|x_tok|)/448 — computed once per token during
-  // quantization, used inside silu for every expert this token is routed to.
-  S_element act_scale[Dims::BS];
-
-  // Unique experts active in this batch, with their sorted token ranges.
-  // Filled by prepare_moe_topk_BS8 (BS8) or prepare_moe_topk_BSx_Ey (BS64).
+  // ---- top-1 fields (used by the original moe_kernel) ----
+  alignas(uint64_t) uint8_t topk_ids[Dims::BS < 8 ? 8 : Dims::BS];
+  std::uint16_t token_indexes[Dims::BS + CoreDims::PADDING];
+  S_element topk_weights[Dims::BS];
   ExpertRef experts[Dims::NUM_EXPERTS];
+
+  // 8 packed 8-bit expert id values.
+  // 0xff for "unused"
+  // only value if token count <= 8
+  std::uint64_t expert_mask;
+  std::uint64_t expert_ids;
   std::uint32_t expert_count;
 
-  // Flat routing results: [token * MAX_TOPK + k] = expert id / routing weight
-  // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
-  // MAX_TOPK = 8 covers top_k up to 8.
+  // ---- top-K fields (used by moe_kernel_topk) ----
+  // Flat layout: topk_ids_flat[token * MAX_TOPK + k] = expert id for k-th
+  // selection of that token.  topk_weights_flat[token * MAX_TOPK + k] = the
+  // corresponding routing weight.
+  // MAX_TOPK = 8 covers Qwen3 Coder (top_k=8) and all smaller values.
   static constexpr uint32_t MAX_TOPK = 8;
   alignas(uint64_t) uint8_t
       topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
 
-  // ── Path-specific fields (union: BS8 and BS64 never run simultaneously) ──
-  // BS8 uses only 8 bytes (expert_ids); BS64 uses ~2KB (token arrays).
-  // The union saves ~2KB of shared memory for the BS8 instantiation.
-  union PathData {
-    // BS8: packed unique expert ids, one per byte (up to 8 experts).
-    // Used by prepare_moe_topk_BS8 to store iteration order.
-    struct {
-      std::uint64_t expert_ids;
-    } bs8;
-
-    // BS64: sorted virtual-batch index arrays.
-    // token_indexes_topk[sorted_pos] = original token index.
-    // token_weights[sorted_pos]      = act_scale (after step 3b) or
-    //                                  routing_weight (before step 3b).
-    struct {
-      std::uint16_t
-          token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
-      S_element token_weights[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
-    } bs64;
-  } path;
+  // ---- top-K BS64 single-pass fields ----
+  // token_indexes_topk[sorted_pos] = original token index for the (token, k)
+  // pair at sorted position `sorted_pos`.  Size: BS * MAX_TOPK + PADDING.
+  // token_weights[sorted_pos] = routing weight for that sorted slot.
+  // These are filled by prepare_moe_topk_BSx_Ey and consumed by the topK
+  // up/down projection variants.
+  std::uint16_t token_indexes_topk[Dims::BS * MAX_TOPK + CoreDims::PADDING];
+  S_element token_weights[Dims::BS * MAX_TOPK + CoreDims::PADDING];
 };
 
 /**

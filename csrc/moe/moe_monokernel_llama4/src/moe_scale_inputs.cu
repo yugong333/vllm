@@ -159,32 +159,44 @@ __device__ void moe_fetch_activation_async(
 }
 
 /**
- * @brief Quantizes activation values for a single token (BS8 path).
+ * @brief Scales activation values in shared memory.
  *
- * Reads bf16 activations from shared memory, computes act_scale = max(|x|)/448,
- * writes fp8 quantized activations to @p activation_out, and returns act_scale.
+ * It is used only for BS8. The function expects that the activations have been
+ * transferred to shared memory already. Fetch them with @c
+ * moe_scale_activation_BS8 well before this call (sychronization required).
  *
- * @param [in]  activation_in  bf16 activations in shared memory (16-byte
- * aligned)
- * @param [out] activation_out fp8 quantized activations (8-byte aligned)
- * @returns act_scale = max(|x|) / 448  (only valid on thread 0 of the warp)
+ * Each warp scales one token, i.e. do not call this function on more warps than
+ * tokens. For the details of the conversion, @see BF16x8::to_fp8x8 All the
+ * activations for one token are scaled to [-FP8_MAX, FP8_MAX] range. The
+ * inverse of this scaling factor is multiplied to @p topk_weight .
+ *
+ *
+ * @param [in] activation_in Pointer to the first activation of the token in
+ * shared memory. Must be aligned to 16 Byte.
+ * @param [out] activation_out Pointer to the first quantized activation of the
+ * token in shared memory. Must be aligned to 8 Byte.
+ * @param [inout] topk_weight Adjusted by the inverse scaling that is used to
+ * scale the activations.
  */
 template <typename Dims>
-__device__ float moe_scale_activation_BS8(
+__device__ void moe_scale_activation_BS8(
     const A_element* __restrict__ activation_in,
-    AQ_element* __restrict__ activation_out) {
-  static_assert(Dims::BS <= 8, "This function is only for use with BS up to 8");
+    AQ_element* __restrict__ activation_out, float& __restrict__ topk_weight) {
+  static_assert(Dims::BS <= 8,
+                "This function is only for use with BS tup to 8");
   assert((uintptr_t)activation_in != (uintptr_t)activation_out);
-  static_assert(Dims::HIDDEN_STATES * sizeof(A_element) % 16 == 0);
-  // suppose that act dtype is bf16
-  // one row can fit into bfloat16x8
-  static_assert(Dims::HIDDEN_STATES % 8 == 0);
-  // make sure the input address is 16 byte aligned for 128 bit loading
-  // make sure the output address is 8 byte aligned for 64 bit saving
+
+  static_assert(Dims::HIDDEN_STATES * sizeof(A_element) % 16 == 0,
+                "Next token activation will not be properly aligned.");
+  static_assert(
+      Dims::HIDDEN_STATES % 8 == 0,
+      "Next quantized token activation will not be properly aligned.");
+
   assert((uintptr_t)activation_in % 16 == 0);
   assert((uintptr_t)activation_out % 8 == 0);
 
   using CoreDims = MoECoreDims<Dims>;
+
   const std::uint32_t thread = get_thread<Dims>();
   const std::uint32_t thread_chunk_size =
       sizeof(BF16x8) / sizeof(*activation_in);
@@ -194,50 +206,75 @@ __device__ float moe_scale_activation_BS8(
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
 
-  // find max absolute value across all elements
-  // potential back conflcts for 4 SHM read,
-  // overhead is small because this is one pass and 4-seriel only
-  __nv_bfloat162 m0{0.f, 0.f}, m1{0.f, 0.f}, m2{0.f, 0.f}, m3{0.f, 0.f};
+  // find max
+  __nv_bfloat162 m0{0.0f, 0.0f}, m1{0.0f, 0.0f}, m2{0.0f, 0.0f}, m3{0.0f, 0.0f};
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
     BF16x8 chunk = BF16x8::load(activation_in + k);
+
     m0 = __hmax2(m0, __habs2(chunk.first_pair()));
     m1 = __hmax2(m1, __habs2(chunk.second_pair()));
     m2 = __hmax2(m2, __habs2(chunk.third_pair()));
     m3 = __hmax2(m3, __habs2(chunk.fourth_pair()));
   }
+
   m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
   float m = (float)__hmax(m0.x, m0.y);
   m = warp_reduce_max_float(m);
-  if (m < __FLT_MIN__) m = 1.f;
 
-  float act_scale = m * FP8_MAX_INV;  // = max/448
-  float inv_scale = FP8_MAX / m;      // = 448/max
+  // avoid 0/0 (or inf)
+  if (m < __FLT_MIN__) {
+    m = 1.f;
+  }
+  float scale = m * FP8_MAX_INV;
+  float inv_scale = FP8_MAX / m;
 
-  // quantize: x_fp8 = clamp(x_bf16 * inv_scale)
-  uint64_t* out8 = reinterpret_cast<uint64_t*>(activation_out);
+  assert((uintptr_t)activation_out % 8 == 0);
+  uint64_t* activation_out8 = reinterpret_cast<uint64_t*>(activation_out);
+
+  // scale, clamp (incl. NaN replacement), round and convert to FP8 range
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
-    out8[k / 8] = BF16x8::load(activation_in + k).to_fp8x8(inv_scale);
+    BF16x8 chunk = BF16x8::load(activation_in + k);
+    activation_out8[k / 8] = chunk.to_fp8x8(inv_scale);
   }
 
-  return act_scale;  // valid on all threads (warp_reduce_max broadcasts)
+  // fold scaling factors
+  if (thread == 0) {
+    topk_weight = topk_weight * scale;
+  }
 }
 
 namespace detail {
 
 /**
- * @brief Scales activation values for a single token (BS > 8 path).
+ * @brief Scales activation values.
  *
- * Quantizes one token's activations from global memory to fp8, computing
- * act_scale = max(|x|) / 448 and writing it to @p act_scale_out.
- * No routing weight folding — act_scale is stored separately.
+ * The function expects that the activations in global memory.
+ *
+ * Each warp scales one token, i.e. do not call this function on more warps than
+ * tokens. For the details of the conversion, @see BF16x8::to_fp8x8 All the
+ * activations for one token are scaled to [-FP8_MAX, FP8_MAX] range. The
+ * inverse of this scaling factor is multiplied to @p topk_weight .
+ *
+ * The resulting @p topk_weight_scaled and @p temp out are assumed to be in
+ * shared memory.
+ *
+ * @param [in] activation_in Pointer to the first activation of the token in
+ * globale memory. Must be aligned to 16 Byte.
+ * @param [out] temp Temorary scratchpad shared memory storage. Must be aligned
+ * to 16 Byte.
+ * @param [out] activation_out Pointer to the first quantized activation of the
+ * token in global memory. Must be aligned to 8 Byte.
+ * @param [in] topk_weight Original token weight
+ * @param [out] topk_weight_scaled Adjusted token weight. Multiplied with the
+ * inverse scaling that is used to scale the activations.
  */
 template <typename Dims>
 __device__ static void moe_scale_activation_BSx_chunk(
     const A_element* __restrict__ activation_in, A_element* __restrict__ temp,
-    AQ_element* __restrict__ activation_out,
-    float& __restrict__ act_scale_out) {
+    AQ_element* __restrict__ activation_out, const float topk_weight,
+    float& __restrict__ topk_weight_scaled) {
   assert((uintptr_t)activation_in != (uintptr_t)temp);
   assert((uintptr_t)activation_out != (uintptr_t)temp);
   assert((uintptr_t)activation_in != (uintptr_t)activation_out);
@@ -252,11 +289,13 @@ __device__ static void moe_scale_activation_BSx_chunk(
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
 
+  // copy to SHM and find max
   __nv_bfloat162 m0{0.0f, 0.0f}, m1{0.0f, 0.0f}, m2{0.0f, 0.0f}, m3{0.0f, 0.0f};
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
     BF16x8 chunk = BF16x8::load(activation_in + k);
     chunk.store_to(&temp[k]);
+
     m0 = __hmax2(m0, __habs2(chunk.first_pair()));
     m1 = __hmax2(m1, __habs2(chunk.second_pair()));
     m2 = __hmax2(m2, __habs2(chunk.third_pair()));
@@ -266,29 +305,50 @@ __device__ static void moe_scale_activation_BSx_chunk(
   m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
   float m = (float)__hmax(m0.x, m0.y);
   m = warp_reduce_max_float(m);
-  if (m < __FLT_MIN__) m = 1.f;
 
-  float scale = m * FP8_MAX_INV;  // act_scale = max/448
+  // avoid 0/0 (or inf)
+  if (m < __FLT_MIN__) {
+    m = 1.f;
+  }
+  float scale = m * FP8_MAX_INV;
   float inv_scale = FP8_MAX / m;
 
+  assert((uintptr_t)activation_out % 8 == 0);
   uint64_t* activation_out8 = reinterpret_cast<uint64_t*>(activation_out);
+
+  // scale, clamp (incl. NaN replacement), round and convert to FP8 range
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
     BF16x8 chunk = BF16x8::load(activation_in + k);
     activation_out8[k / 8] = chunk.to_fp8x8(inv_scale);
   }
 
-  if (thread == 0) act_scale_out = scale;
+  // fold scaling factors
+  if (thread == 0) {
+    topk_weight_scaled = topk_weight * scale;
+  }
 }
 
 }  // namespace detail
 
 /**
- * @brief Quantizes activations for all tokens (BS > 8 path).
+ * @brief Scales the activations of all tokens.
  *
- * Writes fp8 quantized activations to spec->activations[i] and
- * act_scale per token to shmem->act_scale[i].
- * This function is collective across all CUDA blocks.
+ * The function expects that the activations in global memory.
+ * This function is collective and needs to be called by all threads in all CUDA
+ * blocks.
+ *
+ * For the details of the conversion, @see BF16x8::to_fp8x8
+ * All the activations for one token are scaled to [-FP8_MAX, FP8_MAX] range.
+ * The inverse of this scaling factor is multiplied to the @c topk_weight in @p
+ * shmem . The resulting scaled activations are placed in @c spec->activations .
+ *
+ *
+ * @param [in] activation_in Pointer to the first activation of the first token
+ * in globale memory. Must be aligned to 16 Byte.
+ * @param [out] token_count Number of active tokens
+ * @param [out] spec Provides storage for the result.
+ * @param [out] shmem Provides storage for the result topk_weight.
  */
 template <typename Dims>
 __device__ void moe_scale_activation_BSx(
@@ -319,88 +379,20 @@ __device__ void moe_scale_activation_BSx(
          i += global_warp_count) {
       detail::moe_scale_activation_BSx_chunk<Dims>(
           activations_in + i * Dims::HIDDEN_STATES, shmem->u.rescale.a[warp],
-          spec->activations[i], spec->act_scale[i]);
+          spec->activations[i], shmem->topk_weights[i],
+          spec->topk_weights_scaled[i]);
     }
   }
 
-  // spec->act_scale is written by different blocks — make visible to all
+  // spec->topk_weights_scaled is written to by different blocks, make them
+  // available to all blocks
   cooperative_groups::this_grid().sync();
 
-  // copy act_scale into shmem for fast per-token access during up-projection
-  for (uint32_t i = threadIdx.x; i < token_count; i += blockDim.x)
-    shmem->act_scale[i] = spec->act_scale[i];
+  for (uint32_t i = threadIdx.x; i < token_count; i += blockDim.x) {
+    shmem->topk_weights[i] = spec->topk_weights_scaled[i];
+  }
 
   __syncthreads();
-}
-
-/**
- * @brief Quantizes the intermediate SiLU output (fp32) from spec->temp into
- *        fp8 directly in shared memory for the BS8 split-phase down-projection.
- *
- * After grid.sync(), spec->temp contains BS*topK rows × N fp32 values (the
- * SiLU output from the up-projection phase).  Every block independently reads
- * all rows from global memory, quantizes them to fp8 (per-row absmax / 448),
- * and writes the result into shmem->u.tiny.phase.down.a_down (resident for
- * the entire down-projection phase).
- *
- * All 384 threads cooperate.  Each warp handles one row at a time; with 12
- * warps we process 12 rows per iteration, covering 64 rows in ~6 iterations.
- *
- * @param spec       Global scratchpad containing spec->temp (fp32 SiLU output).
- * @param num_rows   Number of valid rows in spec->temp (= batch_size * top_k).
- * @param shmem      Shared memory — writes to shmem->u.tiny.phase.down.
- */
-template <typename Dims>
-__device__ void moe_quantize_intermediate_BS8(
-    const MoEGemmSpec<Dims>* __restrict__ spec, std::uint32_t num_rows,
-    MoE_SHM<Dims>* __restrict__ shmem) {
-  static_assert(Dims::BS <= 8);
-  using CoreDims = MoECoreDims<Dims>;
-
-  constexpr float FP8_MAX = 448.f;
-  constexpr float FP8_MAX_INV = 1.0f / 448.f;
-
-  const std::uint32_t thread = get_thread<Dims>();
-  const std::uint32_t warp = get_any_warp<Dims>();
-
-  // N values per row, 4 fp32 per 16-byte load
-  constexpr std::uint32_t FLOATS_PER_LOAD = 4;
-  constexpr std::uint32_t COLS_PER_WARP_ITER =
-      CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD;  // 32 * 4 = 128
-
-  auto& down = shmem->u.tiny.phase.down;
-
-  for (std::uint32_t row = warp; row < num_rows;
-       row += CoreDims::TOTAL_WARP_COUNT) {
-    const T_element* src = &spec->temp[row * Dims::N];
-
-    // ── Pass 1: find per-row max |x| ──────────────────────────────────────
-    float local_max = 0.f;
-    for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-         col += COLS_PER_WARP_ITER) {
-      float4 v = *reinterpret_cast<const float4*>(&src[col]);
-      local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
-      local_max = fmaxf(local_max, fmaxf(fabsf(v.z), fabsf(v.w)));
-    }
-    float row_max = warp_reduce_max_float(local_max);
-    if (row_max < __FLT_MIN__) row_max = 1.f;
-
-    float scale = row_max * FP8_MAX_INV;  // max/448
-    float inv_scale = FP8_MAX / row_max;  // 448/max
-
-    // ── Pass 2: quantize fp32 → fp8 and write to SHM ─────────────────────
-    // Each thread processes 4 fp32 values → 4 fp8 bytes at a time.
-    for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-         col += COLS_PER_WARP_ITER) {
-      float4 v = *reinterpret_cast<const float4*>(&src[col]);
-      __nv_fp8x4_e4m3 q{float4{v.x * inv_scale, v.y * inv_scale,
-                               v.z * inv_scale, v.w * inv_scale}};
-      *reinterpret_cast<__nv_fp8x4_e4m3*>(&down.a_down[row][col]) = q;
-    }
-
-    // Store per-row scale (one thread per row)
-    if (thread == 0) down.a_down_scale[row] = scale;
-  }
 }
 
 }  // namespace moe_monokernel
