@@ -41,10 +41,11 @@ template <typename Dims>
 struct MoEGemmSpec {
   static constexpr uint32_t SPEC_MAX_TOPK = 8;
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
-  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
-  // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
-  // writes one row per (token, expert) pair into spec->temp.
-  static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
+  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows (BS64
+  // path). For BS <= 8 the tiny path indexes temp by original token, so BS + 8
+  // suffices, but we size for the worst case to keep a single definition.
+  static constexpr uint32_t TEMP_ROWS =
+      (Dims::BS <= 8) ? (Dims::BS + 8) : (Dims::BS * SPEC_MAX_TOPK + 8);
 
   #ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
@@ -126,36 +127,40 @@ struct MoE_SHM {
       T_element partial_result[CoreDims::CALC_WARP_COUNT]
                               [CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
-    // BS8 split-phase path: up-projection and down-projection run as
-    // separate all-experts loops with a single grid.sync() in between.
+    // BS8 path: holds activations, weight tiles, and partial results
+    // for both up- and down-projection (entire pipeline fits in one struct).
     //
-    // Compact union layout:
-    //   a: fp8 up-activations / fp8 down-activations
-    //   w[2]: double-buffers orig(bf16) / w_up(fp8) / w_down(fp8)
-    //   partial_result: up / down scratch
+    // Separate w_up and w_down buffers (no union/aliasing between them) so
+    // that down-weights can be prefetched while up-projection is computing,
+    // and the next expert's up-weights can be prefetched while down-projection
+    // is computing.  This saves one full up-weight buffer (~80 KB) compared to
+    // the previous w[2] double-buffer design while also enabling full overlap.
     struct TinyData {
-      // Input activations for up- and down-projection (mutually exclusive).
-      union {
-        AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[CoreDims::T_TILE][Dims::N];                 // fp8
-      } a;
+      // Quantized fp8 activations — persistent across all expert iterations.
+      // Kept separate from a_down so that the down-projection's fp32 temps
+      // never clobber the quantized inputs, eliminating the per-expert
+      // global-memory round-trip through spec->activations.
+      AQ_element a_up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
 
-      // Per-row quantization scale for a.down (down-projection activations).
-      S_element a_down_scale[CoreDims::T_TILE];
+      // Down-projection input (fp32 SiLU output from up-projection).
+      T_element a_down[CoreDims::T_TILE][Dims::N];
 
-      // Double-buffered weight tiles.  During init, w[0].orig holds the raw
-      // bf16 activations fetched from global memory (before quantization).
-      union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-        W_element down[CoreDims::W_DOWN_TILE]
+      // Raw (unquantized) activations fetched from global memory.
+      // Reused as staging area before quantization; not live at the same
+      // time as w_up / w_down.
+      A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
+
+      // Up-projection weight tile — one buffer, prefetched during down-compute.
+      W_element w_up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
+
+      // Down-projection weight tile — one buffer, prefetched during up-compute.
+      W_element w_down[CoreDims::W_DOWN_TILE]
                       [Dims::N + CoreDims::PADDING / sizeof(W_element)];
-      } w[2];
 
-      // Down-projection weight scales (double-buffered).
-      S_element scale[2][CoreDims::W_DOWN_TILE + CoreDims::PADDING];
+      // Down-projection scales (single buffer, loaded together with w_down).
+      S_element scale_down[CoreDims::W_DOWN_TILE + CoreDims::PADDING];
 
-      // Scratch pad for MMA partial results (up and down share the same space).
+      // scratch pad
       union {
         T_element up[CoreDims::CALC_WARP_COUNT]
                     [CoreDims::W_UP_TILE * CoreDims::T_TILE];
@@ -165,6 +170,11 @@ struct MoE_SHM {
       } partial_result;
 
       // Per-block fp32 accumulator for down-projection output.
+      // Each block owns W_DOWN_TILE columns of the output; accumulating in
+      // SHM avoids repeated global read-modify-write (bf16→fp32→bf16) per
+      // expert and eliminates the associated precision loss.
+      // Written once to global memory (as bf16) after the expert loop.
+      // Size: BS × W_DOWN_TILE × 4B = 8 × 16 × 4 = 512 bytes.
       T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE];
     } tiny;
     // BS64 path: holds weight tiles and partial results for down-projection

@@ -32,32 +32,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
 #ifndef USE_ROCM
-  // Moe Monokernel for Llama4 Scout - TP8
-  m.def("moe_monokernel_BS8_E16_TP8(Tensor activations_in,"
-  "Tensor router_logits,"
-  "Tensor expert_weights_up, Tensor expert_scales_up,"
-  "Tensor expert_weights_down, Tensor expert_scales_down,"
-  "Tensor! activations_out, Tensor! scratchpad) -> ()");
-  m.impl("moe_monokernel_BS8_E16_TP8", torch::kCUDA, &moe_monokernel_BS8_E16_TP8_impl);
-  m.def("moe_monokernel_BS64_E16_TP8(Tensor activations_in,"
-  "Tensor router_logits,"
-  "Tensor expert_weights_up, Tensor expert_scales_up,"
-  "Tensor expert_weights_down, Tensor expert_scales_down,"
-  "Tensor! activations_out, Tensor! scratchpad) -> ()");
-  m.impl("moe_monokernel_BS64_E16_TP8", torch::kCUDA, &moe_monokernel_BS64_E16_TP8_impl);
-  // Moe Monokernel for Llama4 Maverick - TP8
-  m.def("moe_monokernel_BS8_E128_TP8(Tensor activations_in,"
-  "Tensor router_logits,"
-  "Tensor expert_weights_up, Tensor expert_scales_up,"
-  "Tensor expert_weights_down, Tensor expert_scales_down,"
-  "Tensor! activations_out, Tensor! scratchpad) -> ()");
-  m.impl("moe_monokernel_BS8_E128_TP8", torch::kCUDA, &moe_monokernel_BS8_E128_TP8_impl);
-  m.def("moe_monokernel_BS64_E128_TP8(Tensor activations_in,"
-  "Tensor router_logits,"
-  "Tensor expert_weights_up, Tensor expert_scales_up,"
-  "Tensor expert_weights_down, Tensor expert_scales_down,"
-  "Tensor! activations_out, Tensor! scratchpad) -> ()");
-  m.impl("moe_monokernel_BS64_E128_TP8", torch::kCUDA, &moe_monokernel_BS64_E128_TP8_impl);
+  // Top-K Monokernel for Qwen3-Coder-30B-A3B (E=128, K=2048, N=768, TP=1)
+  m.def(
+      "moe_monokernel_topk_BS8_E128_Qwen3Coder(Tensor activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl("moe_monokernel_topk_BS8_E128_Qwen3Coder", torch::kCUDA,
+         &moe_monokernel_topk_BS8_E128_Qwen3Coder_impl);
+
+  m.def(
+      "moe_monokernel_topk_BS64_E128_Qwen3Coder(Tensor activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl("moe_monokernel_topk_BS64_E128_Qwen3Coder", torch::kCUDA,
+         &moe_monokernel_topk_BS64_E128_Qwen3Coder_impl);
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

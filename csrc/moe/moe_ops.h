@@ -58,60 +58,23 @@ void shuffle_rows(const torch::Tensor& input_tensor,
                   torch::Tensor& output_tensor);
 
 #ifndef USE_ROCM
-void moe_monokernel_BS8_E16_TP8_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
+// Top-K monokernel for Qwen3-Coder-30B-A3B (E=128, K=2048, N=768, TP=1)
+void moe_monokernel_topk_BS8_E128_Qwen3Coder_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
     const torch::Tensor& expert_weights_up,
     const torch::Tensor& expert_scales_up,
     const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
-void moe_monokernel_BS8_E16_TP4_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
+void moe_monokernel_topk_BS64_E128_Qwen3Coder_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
     const torch::Tensor& expert_weights_up,
     const torch::Tensor& expert_scales_up,
     const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
-void moe_monokernel_BS64_E16_TP8_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
-void moe_monokernel_BS64_E16_TP4_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
-void moe_monokernel_BS8_E128_TP8_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
-void moe_monokernel_BS64_E128_TP8_impl(
-    const torch::Tensor& activations_in,
-    const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down,
-    torch::Tensor& activations_out,
-    torch::Tensor& gemmspec);
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
 #endif
 
 #ifndef USE_ROCM
