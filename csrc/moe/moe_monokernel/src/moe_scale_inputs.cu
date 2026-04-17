@@ -143,9 +143,7 @@ __device__ void moe_fetch_activation_async(
   using CoreDims = MoECoreDims<Dims>;
 
   const std::uint32_t thread = get_thread<Dims>();
-  const std::uint32_t warp =
-      get_any_warp<Dims>();  // we run this at the beginning of our kernel with
-                             // 1 warp per input token
+  const std::uint32_t warp = get_any_warp<Dims>();
   const std::uint32_t thread_chunk_size = 16 / sizeof(*source);
   const std::uint32_t chunk_size =
       CoreDims::THREADS_PER_WARP * thread_chunk_size;
@@ -153,7 +151,7 @@ __device__ void moe_fetch_activation_async(
   pipe.producer_acquire();
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
-    copy128(dest[rotate_col_32(k, warp)], source[k], pipe);
+    copy128(dest[k], source[k], pipe);
   }
   pipe.producer_commit();
 }
@@ -162,17 +160,20 @@ __device__ void moe_fetch_activation_async(
  * @brief Quantizes activation values for a single token (BS8 path).
  *
  * Reads bf16 activations from shared memory, computes act_scale = max(|x|)/448,
- * writes fp8 quantized activations to @p activation_out, and returns act_scale.
+ * writes fp8 quantized activations to @p activation_out with a 32-byte swizzle
+ * (rotate_col_32) so that MMA loads can use the same rotation pattern as
+ * weights, eliminating shared-memory bank conflicts.
  *
  * @param [in]  activation_in  bf16 activations in shared memory (16-byte
  * aligned)
  * @param [out] activation_out fp8 quantized activations (8-byte aligned)
+ * @param [in]  row            Row index within the tile (used for swizzle)
  * @returns act_scale = max(|x|) / 448  (only valid on thread 0 of the warp)
  */
 template <typename Dims>
 __device__ float moe_scale_activation_BS8(
     const A_element* __restrict__ activation_in,
-    AQ_element* __restrict__ activation_out) {
+    AQ_element* __restrict__ activation_out, std::uint32_t row) {
   static_assert(Dims::BS <= 8, "This function is only for use with BS up to 8");
   assert((uintptr_t)activation_in != (uintptr_t)activation_out);
   static_assert(Dims::HIDDEN_STATES * sizeof(A_element) % 16 == 0);
@@ -196,7 +197,7 @@ __device__ float moe_scale_activation_BS8(
 
   // find max absolute value across all elements
   // potential back conflcts for 4 SHM read,
-  // overhead is small because this is one pass and 4-seriel only
+  // overhead is small because this is one pass and 4-serial only
   __nv_bfloat162 m0{0.f, 0.f}, m1{0.f, 0.f}, m2{0.f, 0.f}, m3{0.f, 0.f};
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
@@ -215,10 +216,20 @@ __device__ float moe_scale_activation_BS8(
   float inv_scale = FP8_MAX / m;      // = 448/max
 
   // quantize: x_fp8 = clamp(x_bf16 * inv_scale)
-  uint64_t* out8 = reinterpret_cast<uint64_t*>(activation_out);
+  // Apply rotate_col_32 swizzle so MMA loads use the same rotation as weights.
+  // Each thread processes 8 fp8 elements (= 2 × 4-element groups).
+  // rotate_col_32 operates at 4-byte (4-element) granularity, so we split
+  // each 8-element chunk into two halves and write them to rotated positions.
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
-    out8[k / 8] = BF16x8::load(activation_in + k).to_fp8x8(inv_scale);
+    uint64_t packed = BF16x8::load(activation_in + k).to_fp8x8(inv_scale);
+    uint32_t lo = (uint32_t)(packed);
+    uint32_t hi = (uint32_t)(packed >> 32);
+    // First 4 elements at column k, second 4 at column k+4
+    uint32_t col0 = rotate_col_32(k, row);
+    uint32_t col1 = rotate_col_32(k + 4, row);
+    *reinterpret_cast<uint32_t*>(&activation_out[col0]) = lo;
+    *reinterpret_cast<uint32_t*>(&activation_out[col1]) = hi;
   }
 
   return act_scale;  // valid on all threads (warp_reduce_max broadcasts)
@@ -331,76 +342,6 @@ __device__ void moe_scale_activation_BSx(
     shmem->act_scale[i] = spec->act_scale[i];
 
   __syncthreads();
-}
-
-/**
- * @brief Quantizes the intermediate SiLU output (fp32) from spec->temp into
- *        fp8 directly in shared memory for the BS8 split-phase down-projection.
- *
- * After grid.sync(), spec->temp contains BS*topK rows × N fp32 values (the
- * SiLU output from the up-projection phase).  Every block independently reads
- * all rows from global memory, quantizes them to fp8 (per-row absmax / 448),
- * and writes the result into shmem->u.tiny.phase.down.a_down (resident for
- * the entire down-projection phase).
- *
- * All 384 threads cooperate.  Each warp handles one row at a time; with 12
- * warps we process 12 rows per iteration, covering 64 rows in ~6 iterations.
- *
- * @param spec       Global scratchpad containing spec->temp (fp32 SiLU output).
- * @param num_rows   Number of valid rows in spec->temp (= batch_size * top_k).
- * @param shmem      Shared memory — writes to shmem->u.tiny.phase.down.
- */
-template <typename Dims>
-__device__ void moe_quantize_intermediate_BS8(
-    const MoEGemmSpec<Dims>* __restrict__ spec, std::uint32_t num_rows,
-    MoE_SHM<Dims>* __restrict__ shmem) {
-  static_assert(Dims::BS <= 8);
-  using CoreDims = MoECoreDims<Dims>;
-
-  constexpr float FP8_MAX = 448.f;
-  constexpr float FP8_MAX_INV = 1.0f / 448.f;
-
-  const std::uint32_t thread = get_thread<Dims>();
-  const std::uint32_t warp = get_any_warp<Dims>();
-
-  // N values per row, 4 fp32 per 16-byte load
-  constexpr std::uint32_t FLOATS_PER_LOAD = 4;
-  constexpr std::uint32_t COLS_PER_WARP_ITER =
-      CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD;  // 32 * 4 = 128
-
-  auto& down = shmem->u.tiny.phase.down;
-
-  for (std::uint32_t row = warp; row < num_rows;
-       row += CoreDims::TOTAL_WARP_COUNT) {
-    const T_element* src = &spec->temp[row * Dims::N];
-
-    // ── Pass 1: find per-row max |x| ──────────────────────────────────────
-    float local_max = 0.f;
-    for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-         col += COLS_PER_WARP_ITER) {
-      float4 v = *reinterpret_cast<const float4*>(&src[col]);
-      local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
-      local_max = fmaxf(local_max, fmaxf(fabsf(v.z), fabsf(v.w)));
-    }
-    float row_max = warp_reduce_max_float(local_max);
-    if (row_max < __FLT_MIN__) row_max = 1.f;
-
-    float scale = row_max * FP8_MAX_INV;  // max/448
-    float inv_scale = FP8_MAX / row_max;  // 448/max
-
-    // ── Pass 2: quantize fp32 → fp8 and write to SHM ─────────────────────
-    // Each thread processes 4 fp32 values → 4 fp8 bytes at a time.
-    for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-         col += COLS_PER_WARP_ITER) {
-      float4 v = *reinterpret_cast<const float4*>(&src[col]);
-      __nv_fp8x4_e4m3 q{float4{v.x * inv_scale, v.y * inv_scale,
-                               v.z * inv_scale, v.w * inv_scale}};
-      *reinterpret_cast<__nv_fp8x4_e4m3*>(&down.a_down[row][col]) = q;
-    }
-
-    // Store per-row scale (one thread per row)
-    if (thread == 0) down.a_down_scale[row] = scale;
-  }
 }
 
 }  // namespace moe_monokernel

@@ -10,7 +10,6 @@
   #include <cuda.h>
   #include <cuda/pipeline>
   #include <cuda_fp8.h>
-  #include <stdio.h>
 
   #include "moe_interface.h"
   #include "moe_internal.h"
@@ -533,7 +532,8 @@ __device__ inline void moe_down_projection_topk(
     pipe.producer_acquire();
     moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
                                   first_expert.id, shm, 0, pipe);
-    moe_request_temp_token<Dims>(spec->temp, first_expert, 0, shm->t[0], pipe);
+    moe_request_temp_token<Dims>(spec->temp_fp32, first_expert, 0, shm->t[0],
+                                 pipe);
     pipe.producer_commit();
   }
 
@@ -559,12 +559,12 @@ __device__ inline void moe_down_projection_topk(
                                         w_index ^ 1, pipe);
         }
         if (a_row + CoreDims::T_TILE < a_rows) {
-          moe_request_temp_token<Dims>(spec->temp, expert,
+          moe_request_temp_token<Dims>(spec->temp_fp32, expert,
                                        a_row + CoreDims::T_TILE,
                                        shm->t[t_index ^ 1], pipe);
         } else if (e + 1 < expert_count) {
-          moe_request_temp_token<Dims>(spec->temp, shmem->experts[e + 1], 0,
-                                       shm->t[t_index ^ 1], pipe);
+          moe_request_temp_token<Dims>(spec->temp_fp32, shmem->experts[e + 1],
+                                       0, shm->t[t_index ^ 1], pipe);
         }
         pipe.producer_commit();
       } else {
@@ -642,7 +642,7 @@ __device__ inline void moe_down_mult_fp8(
       __nv_fp8x4_e4m3 b1 =
           *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 16];
 
-      mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, b0, b1, d0, d1, d2, d3);
+      mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, b0, b1, d0, d1, d2, d3);
     }
 
     // Apply weight scale and activation scale
@@ -666,17 +666,31 @@ __device__ inline void moe_down_mult_fp8(
 }
 
 /**
- * @brief Split-phase down-projection for BS8: iterates over ALL experts.
+ * @brief Split-phase down-projection for BS8: pipelined 4-stage design.
  *
- * Uses double-buffered w[].down for pipelining.  For each expert, loads
- * the relevant tokens' fp32 SiLU output from spec->temp, quantizes to fp8
- * into a.down in SHM, then runs MMA fp8×fp8.
+ * After grid.sync(), all blocks have written their SiLU output to
+ * spec->temp_bf16.  This function uses a pipelined design with ping-pong
+ * w[2] buffers to overlap bf16 fetch, quantization, weight fetch, and MMA:
+ *
+ *   w[2] union slots have fixed roles (no flipping):
+ *     w[0].bf16_buf — holds bf16 intermediate results
+ *     w[1].down     — holds fp8 down-projection weights
+ *
+ *   Stage 0 (prime): All warps fetch expert 0's bf16 intermediate →
+ * w[0].bf16_buf Steady-state loop for expert e: Stage A: prefetch warps fetch
+ * e's w_down → w[1].down calc warps quantize w[0].bf16_buf → a.down[buf_fp8]
+ *     Stage B: prefetch warps fetch (e+1)'s bf16 → w[0].bf16_buf
+ *              calc warps MMA a.down[buf_fp8] × w[1].down, reduce, accumulate
+ *     Flip: buf_fp8 ^= 1 (only the fp8 activation double-buffer flips)
+ *
+ * This eliminates the separate bf16_buf[2] array — it now lives inside
+ * the w[2] union, saving T_TILE × N × sizeof(bf16) × 2 bytes of SHM.
  *
  * @param expert_weights_down  [E, K, N] fp8 weights in global memory.
  * @param expert_scales_down   [E, K] fp32 scales in global memory.
  * @param top_k                Number of experts per token.
  * @param batch_size           Number of active tokens.
- * @param spec                 Global scratchpad (reads spec->temp).
+ * @param spec                 Global scratchpad (reads spec->temp_bf16).
  * @param shmem                Shared memory.
  */
 template <typename Dims>
@@ -698,114 +712,66 @@ __device__ inline void moe_down_projection_BS8_allexperts(
 
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
-  constexpr std::uint32_t FLOATS_PER_LOAD = 4;
+  constexpr std::uint32_t FLOATS_PER_LOAD = 4;  // 4 bf16 = 8 bytes
   constexpr std::uint32_t COLS_PER_WARP_ITER =
       CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD;
 
   cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-  // Prefetch first expert's down-weights into w[0].down
-  if (is_prefetch_warp<Dims>()) {
+  // Fixed slot assignment — no flipping needed:
+  //   w[0]: bf16_buf (intermediate results from global memory)
+  //   w[1]: down weights (fp8 expert weights)
+  // They never alias within the same slot.
+  constexpr std::uint32_t BUF_BF16 = 0;  // w[] slot for bf16 intermediates
+  constexpr std::uint32_t BUF_W = 1;     // w[] slot for down weights
+  std::uint32_t buf_fp8 = 0;             // current a.down[] double-buffer index
+
+  // ── Stage 0: Prime — all warps fetch expert 0's bf16 intermediate ───────
+  {
+    const std::uint32_t id0 = shmem->experts[0].id;
     pipe.producer_acquire();
-    {
-      const unsigned d_thread_l =
-          threadIdx.x % (2 * CoreDims::THREADS_PER_WARP);
-      const unsigned d_warp_l = get_prefetch_warp<Dims>() / 2;
-      const std::uint32_t id = shmem->experts[0].id;
-      const unsigned chunk_size = 16;
-      const OpaqueElement* weights =
-          (const OpaqueElement*)(expert_weights_down +
-                                 id * Dims::N * Dims::HIDDEN_STATES +
-                                 base_row_dn * Dims::N);
-      for (unsigned row = d_warp_l, i = 0;
-           i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
-           row += CoreDims::PREFETCH_WARP_COUNT / 2, i++) {
-        unsigned col = d_thread_l * chunk_size;
-        if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
-            col < Dims::N) {
-          copy128(shm->w[0].down[row][col],
-                  weights[(row * Dims::N + col) / sizeof(OpaqueElement)], pipe);
-        }
-      }
-      if (d_warp_l == 0) {
-        const unsigned sc_chunk = 16 / sizeof(S_element);
-        if (d_thread_l < CoreDims::W_DOWN_TILE / sc_chunk) {
-          copy128(shm->scale[0][sc_chunk * d_thread_l],
-                  expert_scales_down[id * Dims::HIDDEN_STATES + base_row_dn +
-                                     sc_chunk * d_thread_l],
-                  pipe);
+    for (std::uint32_t tok = 0; tok < batch_size; ++tok) {
+      for (uint32_t k = 0; k < top_k; k++) {
+        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id0) {
+          std::uint32_t vrow = tok * top_k + k;
+          const A_element* src = &spec->temp_bf16[vrow * Dims::N];
+          // All warps cooperate: global thread index across all warps
+          for (std::uint32_t col =
+                   (warp * CoreDims::THREADS_PER_WARP + thread) *
+                   FLOATS_PER_LOAD;
+               col < Dims::N;
+               col += CoreDims::TOTAL_WARP_COUNT * CoreDims::THREADS_PER_WARP *
+                      FLOATS_PER_LOAD) {
+            const auto shape8 = cuda::aligned_size_t<8>(8);
+            cuda::memcpy_async(&shm->w[BUF_BF16].bf16_buf[tok][col], &src[col],
+                               shape8, pipe);
+          }
+          break;
         }
       }
     }
     pipe.producer_commit();
   }
+  cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
 
-  std::uint32_t w_cur = 0;
-
+  // ── Main expert loop ────────────────────────────────────────────────────
   for (std::uint32_t e = 0; e < expert_count; ++e) {
     const std::uint32_t id = shmem->experts[e].id;
 
-    // ── Quantize this expert's tokens from spec->temp → a.down (fp8) ──────
-    // All warps cooperate.  For each token routed to this expert, load its
-    // fp32 SiLU row from spec->temp, find row max, quantize to fp8.
-    // With BS=8 and top_k=8, at most 8 tokens per expert.
-    {
-      // Build a small list of virtual rows for this expert (max T_TILE=8)
-      // Each warp handles one row.
-      for (std::uint32_t tok = warp; tok < batch_size;
-           tok += CoreDims::TOTAL_WARP_COUNT) {
-        // Find if this token is routed to expert id
-        for (uint32_t k = 0; k < top_k; k++) {
-          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id) {
-            std::uint32_t vrow = tok * top_k + k;
-            const T_element* src = &spec->temp[vrow * Dims::N];
-
-            // Pass 1: find per-row max |x|
-            float local_max = 0.f;
-            for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-                 col += COLS_PER_WARP_ITER) {
-              float4 v = *reinterpret_cast<const float4*>(&src[col]);
-              local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
-              local_max = fmaxf(local_max, fmaxf(fabsf(v.z), fabsf(v.w)));
-            }
-            float row_max = warp_reduce_max_float(local_max);
-            if (row_max < __FLT_MIN__) row_max = 1.f;
-
-            float scale_val = row_max * FP8_MAX_INV;
-            float inv_scale = FP8_MAX / row_max;
-
-            // Pass 2: quantize fp32 → fp8 and write to a.down[tok]
-            for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-                 col += COLS_PER_WARP_ITER) {
-              float4 v = *reinterpret_cast<const float4*>(&src[col]);
-              __nv_fp8x4_e4m3 q{float4{v.x * inv_scale, v.y * inv_scale,
-                                       v.z * inv_scale, v.w * inv_scale}};
-              *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->a.down[tok][col]) = q;
-            }
-            if (thread == 0) shm->a_down_scale[tok] = scale_val;
-            break;
-          }
-        }
-      }
-    }
-
-    // Wait for current expert's weights
-    cuda::pipeline_consumer_wait_prior<0>(pipe);
-    __syncthreads();
-
+    // ── Stage A: prefetch w_down → w[BUF_W] || quantize w[BUF_BF16].bf16_buf →
+    // a.down[buf_fp8]
     if (is_prefetch_warp<Dims>()) {
-      // Prefetch NEXT expert's down-weights
-      if (e + 1 < expert_count) {
-        pipe.producer_acquire();
-        const std::uint32_t nid = shmem->experts[e + 1].id;
+      // Fetch this expert's w_down + scales into w[BUF_W].down
+      pipe.producer_acquire();
+      {
         const unsigned d_thread_l =
             threadIdx.x % (2 * CoreDims::THREADS_PER_WARP);
         const unsigned d_warp_l = get_prefetch_warp<Dims>() / 2;
         const unsigned chunk_size = 16;
         const OpaqueElement* weights =
             (const OpaqueElement*)(expert_weights_down +
-                                   nid * Dims::N * Dims::HIDDEN_STATES +
+                                   id * Dims::N * Dims::HIDDEN_STATES +
                                    base_row_dn * Dims::N);
         for (unsigned row = d_warp_l, i = 0;
              i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
@@ -813,7 +779,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
           unsigned col = d_thread_l * chunk_size;
           if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
               col < Dims::N) {
-            copy128(shm->w[w_cur ^ 1].down[row][col],
+            copy128(shm->w[BUF_W].down[row][col],
                     weights[(row * Dims::N + col) / sizeof(OpaqueElement)],
                     pipe);
           }
@@ -821,16 +787,100 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         if (d_warp_l == 0) {
           const unsigned sc_chunk = 16 / sizeof(S_element);
           if (d_thread_l < CoreDims::W_DOWN_TILE / sc_chunk) {
-            copy128(shm->scale[w_cur ^ 1][sc_chunk * d_thread_l],
-                    expert_scales_down[nid * Dims::HIDDEN_STATES + base_row_dn +
+            copy128(shm->scale[BUF_W][sc_chunk * d_thread_l],
+                    expert_scales_down[id * Dims::HIDDEN_STATES + base_row_dn +
                                        sc_chunk * d_thread_l],
                     pipe);
+          }
+        }
+      }
+      pipe.producer_commit();
+    } else {
+      // Calc warps: quantize w[BUF_BF16].bf16_buf → a.down[buf_fp8]
+      const std::uint32_t cw = get_calc_warp<Dims>();
+      for (std::uint32_t tok = cw; tok < batch_size;
+           tok += CoreDims::CALC_WARP_COUNT) {
+        bool assigned = false;
+        for (uint32_t k = 0; k < top_k; k++) {
+          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id) {
+            assigned = true;
+            break;
+          }
+        }
+        if (!assigned) continue;
+
+        // Pass 1: find per-row max |x| from bf16 in SHM
+        float local_max = 0.f;
+        for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
+             col += COLS_PER_WARP_ITER) {
+          __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
+              &shm->w[BUF_BF16].bf16_buf[tok][col + 0]);
+          __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
+              &shm->w[BUF_BF16].bf16_buf[tok][col + 2]);
+          float2 f01 = __bfloat1622float2(bf_01);
+          float2 f23 = __bfloat1622float2(bf_23);
+          local_max = fmaxf(local_max, fmaxf(fabsf(f01.x), fabsf(f01.y)));
+          local_max = fmaxf(local_max, fmaxf(fabsf(f23.x), fabsf(f23.y)));
+        }
+        float row_max = warp_reduce_max_float(local_max);
+        if (row_max < __FLT_MIN__) row_max = 1.f;
+
+        float scale_val = row_max * FP8_MAX_INV;
+        float inv_scale = FP8_MAX / row_max;
+
+        // Pass 2: quantize bf16 → fp8
+        for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
+             col += COLS_PER_WARP_ITER) {
+          __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
+              &shm->w[BUF_BF16].bf16_buf[tok][col + 0]);
+          __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
+              &shm->w[BUF_BF16].bf16_buf[tok][col + 2]);
+          float2 f01 = __bfloat1622float2(bf_01);
+          float2 f23 = __bfloat1622float2(bf_23);
+          __nv_fp8x4_e4m3 q{float4{f01.x * inv_scale, f01.y * inv_scale,
+                                   f23.x * inv_scale, f23.y * inv_scale}};
+          *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->a.down[buf_fp8][tok][col]) =
+              q;
+        }
+        if (thread == 0) shm->a_down_scale[buf_fp8][tok] = scale_val;
+      }
+    }
+
+    // Wait for w_down fetch to complete
+    cuda::pipeline_consumer_wait_prior<0>(pipe);
+    __syncthreads();
+
+    // ── Stage B: prefetch next bf16 → w[BUF_BF16] || MMA + reduce ────────
+    // No conflict: bf16 goes to w[0], MMA reads weights from w[1].
+    if (is_prefetch_warp<Dims>()) {
+      // Fetch next expert's bf16 intermediate into w[BUF_BF16].bf16_buf
+      if (e + 1 < expert_count) {
+        const std::uint32_t next_id = shmem->experts[e + 1].id;
+        const unsigned pw = get_prefetch_warp<Dims>();
+        pipe.producer_acquire();
+        for (std::uint32_t tok = 0; tok < batch_size; ++tok) {
+          for (uint32_t k = 0; k < top_k; k++) {
+            if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)next_id) {
+              std::uint32_t vrow = tok * top_k + k;
+              const A_element* src = &spec->temp_bf16[vrow * Dims::N];
+              for (std::uint32_t col =
+                       (pw * CoreDims::THREADS_PER_WARP + thread) *
+                       FLOATS_PER_LOAD;
+                   col < Dims::N;
+                   col += CoreDims::PREFETCH_WARP_COUNT *
+                          CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD) {
+                const auto shape8 = cuda::aligned_size_t<8>(8);
+                cuda::memcpy_async(&shm->w[BUF_BF16].bf16_buf[tok][col],
+                                   &src[col], shape8, pipe);
+              }
+              break;
+            }
           }
         }
         pipe.producer_commit();
       }
     } else {
-      // ── MMA: w[w_cur].down × a.down[token] for each token routed here ──
+      // Calc warps: MMA a.down[buf_fp8] × w[BUF_W].down
       // Zero partial results
       for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
            wr < CoreDims::W_DOWN_TILE;
@@ -842,17 +892,24 @@ __device__ inline void moe_down_projection_BS8_allexperts(
       }
 
       const std::uint32_t row0 = (thread % 4) * 2 + 0;
-      bool s0 = false;
+      const std::uint32_t row1 = (thread % 4) * 2 + 1;
+      bool s0 = false, s1 = false;
       if (row0 < batch_size)
         for (uint32_t k = 0; k < top_k; k++)
           if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
             s0 = true;
             break;
           }
+      if (row1 < batch_size)
+        for (uint32_t k = 0; k < top_k; k++)
+          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
+            s1 = true;
+            break;
+          }
 
-      float as0 = s0 ? shm->a_down_scale[row0] : 0.f;
-      moe_down_mult_fp8<Dims>(shm->w[w_cur].down, shm->scale[w_cur],
-                              shm->a.down[thread / 4], as0, s0, false,
+      // MMA with act_scale=1 (deferred to reduction)
+      moe_down_mult_fp8<Dims>(shm->w[BUF_W].down, shm->scale[BUF_W],
+                              shm->a.down[buf_fp8][thread / 4], 1.f, s0, s1,
                               shm->partial_result.down);
     }
     __syncthreads();
@@ -875,6 +932,10 @@ __device__ inline void moe_down_projection_BS8_allexperts(
             break;
           }
 
+      // Per-token activation scales (deferred from MMA which used act_scale=1)
+      float as0 = s0 ? shm->a_down_scale[buf_fp8][row0] : 0.f;
+      float as1 = s1 ? shm->a_down_scale[buf_fp8][row1] : 0.f;
+
       for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
            wr < CoreDims::W_DOWN_TILE;
            wr += CoreDims::W_DOWN_MMA_TILE * CoreDims::CALC_WARP_COUNT) {
@@ -888,20 +949,25 @@ __device__ inline void moe_down_projection_BS8_allexperts(
           d2 += shm->partial_result.down[wr / 2 + i][thread + 64];
           d3 += shm->partial_result.down[wr / 2 + i][thread + 96];
         }
+
         if (s0) {
-          shm->out_accum[row0][(thread / 4) + wr + 0] += d0;
+          shm->out_accum[row0][(thread / 4) + wr + 0] += d0 * as0;
           if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[row0][(thread / 4) + wr + 8] += d2;
+            shm->out_accum[row0][(thread / 4) + wr + 8] += d2 * as0;
         }
         if (s1) {
-          shm->out_accum[row1][(thread / 4) + wr + 0] += d1;
+          shm->out_accum[row1][(thread / 4) + wr + 0] += d1 * as1;
           if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[row1][(thread / 4) + wr + 8] += d3;
+            shm->out_accum[row1][(thread / 4) + wr + 8] += d3 * as1;
         }
       }
     }
 
-    w_cur ^= 1;
+    // Flip a.down double-buffer index only (w[] slots are fixed)
+    buf_fp8 ^= 1;
+
+    // Wait for next expert's bf16 fetch before next iteration's quantize
+    cuda::pipeline_consumer_wait_prior<0>(pipe);
     __syncthreads();
   }
 }

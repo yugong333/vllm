@@ -17,7 +17,7 @@ using OpaqueElement = std::uint32_t;  //< Auxiliary 32-bit type used to generate
                                       // better assembly code in loads
 
 /**
- * @brief Offets into the @c token_indexes field
+ * @brief Offsets into the @c token_indexes field
  *
  * This is an offset array. To find all the tokens that belong to expert @c id :
  * <tt>
@@ -43,8 +43,15 @@ struct MoEGemmSpec {
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
   // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
   // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
-  // writes one row per (token, expert) pair into spec->temp.
+  // writes one row per (token, expert) pair into spec->temp_bf16/temp_fp32.
   static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
+
+  // Number of blocks that contribute columns to the N-wide up-projection
+  // output.  Each block writes W_UP_COLS_PER_BLOCK columns; blocks beyond N
+  // are idle.  W_UP_TILE is always 16, so each block covers 8 columns.
+  static constexpr uint32_t W_UP_COLS_PER_BLOCK = 8;  // = W_UP_TILE / 2
+  static constexpr uint32_t UP_PROJ_BLOCK_COUNT =
+      (Dims::N + W_UP_COLS_PER_BLOCK - 1) / W_UP_COLS_PER_BLOCK;
 
   #ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
@@ -54,7 +61,23 @@ struct MoEGemmSpec {
   #endif
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
-  T_element temp[TEMP_ROWS * Dims::N];          //< Up projection result
+
+  // Up-projection SiLU output.  BS8 and BS64 never run simultaneously, so
+  // they share the same storage via a union.
+  //   BS64: fp32 (T_element) — consumed by the BS64 down-projection which
+  //         loads tiles into shared memory via async copy.
+  //   BS8:  bf16 (A_element) — the down-projection reads block-local maxes
+  //         from temp_block_max and does a single-pass bf16→fp8 quantization.
+  union {
+    T_element temp_fp32[TEMP_ROWS * Dims::N];  //< BS64 path (fp32)
+    A_element temp_bf16[TEMP_ROWS * Dims::N];  //< BS8 path (bf16)
+  };
+
+  // Per-block absmax of each row in temp_bf16 (BS8 path only).
+  // Written by the up-projection epilogue, read by the down-projection
+  // to compute the true row max without a separate global-memory pass.
+  float temp_block_max[TEMP_ROWS * UP_PROJ_BLOCK_COUNT];
+
   float act_scale[Dims::BS];  //< per-token activation quantization scale
                               //(max/448)
 };
@@ -130,23 +153,45 @@ struct MoE_SHM {
     // separate all-experts loops with a single grid.sync() in between.
     //
     // Compact union layout:
-    //   a: fp8 up-activations / fp8 down-activations
-    //   w[2]: double-buffers orig(bf16) / w_up(fp8) / w_down(fp8)
+    //   a: fp8 up-activations / double-buffered fp8 down-activations
+    //   w[2]: ping-pong orig(bf16) / w_up(fp8) / bf16_buf(bf16) / w_down(fp8)
     //   partial_result: up / down scratch
+    //
+    // Down-projection uses a pipelined design with fixed w[2] slot roles:
+    //   w[0].bf16_buf:  bf16 intermediate results from global memory
+    //   w[1].down:      fp8 down-projection weights
+    //   a.down[2]:      double-buffered fp8 quantized activations for MMA
+    //                   (reuses the same union as a.up — safe because all
+    //                   up-projections finish before any down-projection
+    //                   starts)
     struct TinyData {
       // Input activations for up- and down-projection (mutually exclusive).
+      // Up-projection is fully complete (with grid.sync) before
+      // down-projection begins, so a.up and a.down[2] safely share storage.
+      // a.down[2] is double-buffered for the down-projection pipeline:
+      // one buffer is consumed by MMA while the other is written by
+      // quantization.
       union {
         AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[CoreDims::T_TILE][Dims::N];                 // fp8
+        AQ_element down[2][CoreDims::T_TILE][Dims::N];              // fp8
       } a;
 
-      // Per-row quantization scale for a.down (down-projection activations).
-      S_element a_down_scale[CoreDims::T_TILE];
+      // Per-row quantization scale for a.down (double-buffered).
+      S_element a_down_scale[2][CoreDims::T_TILE];
 
-      // Double-buffered weight tiles.  During init, w[0].orig holds the raw
-      // bf16 activations fetched from global memory (before quantization).
+      // Double-buffered weight / activation tiles.
+      //
+      // During init (Phase 1–2), w[0].orig holds the raw bf16 activations
+      // fetched from global memory (before quantization), and w[1].up holds
+      // the first expert's up-projection weights.
+      //
+      // During the down-projection (Phase 4), w[2] has fixed roles:
+      // w[0] holds bf16 intermediate results (w[0].bf16_buf) and
+      // w[1] holds fp8 down-projection weights (w[1].down).
+      // They use separate slots so bf16_buf and w_down never conflict.
       union {
         A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
+        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
         W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
         W_element down[CoreDims::W_DOWN_TILE]
                       [Dims::N + CoreDims::PADDING / sizeof(W_element)];
@@ -168,7 +213,8 @@ struct MoE_SHM {
       T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE];
     } tiny;
     // BS64 path: holds weight tiles and partial results for down-projection
-    // only (up-projection uses Gemm1Data; activations come from spec->temp)
+    // only (up-projection uses Gemm1Data; activations come from
+    // spec->temp_fp32)
     struct Gemm2Data {
       // prefetch 1 tile ahead
       T_element t[2][CoreDims::T_TILE][Dims::N];

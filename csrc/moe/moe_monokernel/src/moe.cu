@@ -25,7 +25,7 @@ namespace moe_monokernel {
  * @brief Top-K MoE kernel — split-phase path for BS <= 8.
  *
  * Compact SHM layout with unions:
- *   a: fp8 up-activations / fp8 down-activations
+ *   a: fp8 up-activations / double-buffered fp8 down-activations
  *   w[2]: double-buffered orig(bf16) / w_up(fp8) / w_down(fp8)
  *   partial_result: up / down scratch
  *
@@ -33,11 +33,14 @@ namespace moe_monokernel {
  *   Phase 1: fetch orig into w[0].orig || routing + topK
  *   Phase 2: quantize w[0].orig → a.up || prefetch w_up into w[1].up
  *   Phase 3: up-proj loop (double-buffered w[].up)
- *            → SiLU → write fp32 to spec->temp
+ *            → SiLU → write bf16 to spec->temp_bf16
  *   grid.sync()
- *   Phase 4: down-proj loop (double-buffered w[].down)
- *            → per expert: load fp32 from spec->temp, quantize → a.down fp8
- *            → MMA fp8×fp8 → accumulate out_accum
+ *   Phase 4: down-proj pipelined design with fixed w[2] slot roles:
+ *            w[0] = bf16 intermediates, w[1] = fp8 weights
+ *            Stage 0: all warps fetch expert 0's bf16 → w[0].bf16_buf
+ *            Per expert:
+ *              Stage A: prefetch w_down → w[1] || quantize w[0].bf16_buf →
+ * a.down Stage B: prefetch next bf16 → w[0] || MMA a.down × w[1].down → accum
  *   Phase 5: writeback out_accum → global bf16
  *
  * 1 grid sync total.
@@ -86,17 +89,21 @@ __device__ void moe_kernel_topk_BS8(
     const std::uint32_t cw = get_calc_warp<Dims>();
     if (cw < batch_size) {
       float act_scale =
-          moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw]);
-      if (get_thread<Dims>() == 0) shmem->act_scale[cw] = act_scale;
+          moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw);
+      if (get_thread<Dims>() == 0) {
+        shmem->act_scale[cw] = act_scale;
+      }
     }
   }
+  // // Wait for Phase 2 weight prefetch to complete before Phase 3 reads
+  // w[1].up cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
 
   // ── Phase 3: Up-projection — all experts, double-buffered w[].up ────────
   moe_up_projection_BS8_allexperts<Dims>(expert_weights_up, expert_scales_up,
                                          top_k, batch_size, spec, shmem);
 
-  // ── Single grid.sync — all blocks finish writing spec->temp ─────────────
+  // ── Single grid.sync — all blocks finish writing spec->temp_bf16 ──────
   cooperative_groups::this_grid().sync();
 
   // Zero the per-block fp32 output accumulator in SHM.
@@ -106,9 +113,9 @@ __device__ void moe_kernel_topk_BS8(
     ((T_element*)shm->out_accum)[idx] = 0.f;
   __syncthreads();
 
-  // ── Phase 4: Down-projection — all experts, double-buffered w[].down ────
-  // For each expert: load fp32 from spec->temp, quantize to fp8 → a.down,
-  // then MMA fp8×fp8 with w[].down.
+  // ── Phase 4: Down-projection — pipelined 4-stage design ──────────────
+  // For each expert: fetch bf16 intermediate → SHM, quantize bf16→fp8,
+  // MMA fp8×fp8 with w_down, all pipelined with double-buffering.
   moe_down_projection_BS8_allexperts<Dims>(
       expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem);
 
@@ -232,6 +239,7 @@ __global__ void moe_kernel_topk(
        i < token_count * Dims::HIDDEN_STATES; i += blockDim.x * gridDim.x) {
     activations_out[i] = (__nv_bfloat16)0.0f;
   }
+
   cooperative_groups::this_grid().sync();
 
   if constexpr (Dims::BS <= 8) {
