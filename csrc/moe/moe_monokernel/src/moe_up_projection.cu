@@ -10,7 +10,6 @@
   #include <cuda.h>
   #include <cuda/pipeline>
   #include <cuda_fp8.h>
-  #include <stdio.h>
 
   #include "ptx_utils.h"
   #include "moe_interface.h"
@@ -423,7 +422,7 @@ __device__ inline void moe_up_projection_topk(
     const S_element* scales = expert_scales_up + id * 2 * Dims::N;
     unsigned int a_rows = expert.last_token - expert.first_token;
     // temp is indexed by sorted position (first_token..last_token)
-    T_element* temp = &spec->temp[expert.first_token * Dims::N];
+    T_element* temp = &spec->temp_fp32[expert.first_token * Dims::N];
 
     float ws0 = scales[base_row + thread / 4];
     float ws1 = scales[base_row + thread / 4 + Dims::N];
@@ -482,7 +481,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
       }
 
@@ -539,7 +538,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
         shm->partial_result[warp][thread + 0] = d0;
         shm->partial_result[warp][thread + 32] = d1;
@@ -582,7 +581,8 @@ __device__ inline void moe_up_projection_topk(
 
 /**
  * @brief Split-phase up-projection for BS8: iterates over ALL experts,
- *        writing fp32 SiLU output to spec->temp.
+ *        writing bf16 SiLU output to spec->temp_bf16 and block-local absmax
+ *        to spec->temp_block_max.
  *
  * Uses double-buffered w_up[2] for pipelining: while computing expert e
  * with w_up[cur], prefetch warps load expert e+1 into w_up[next].
@@ -591,14 +591,15 @@ __device__ inline void moe_up_projection_topk(
  *
  * For each expert, each block computes W_UP_TILE/2 = 8 columns of the
  * N-wide SiLU output for all tokens routed to that expert.  The result
- * is written to spec->temp[row * N + col] where row is a virtual-batch
+ * is written to spec->temp_bf16[row * N + col] where row is a virtual-batch
  * index assigned per (token, expert) pair.
  *
  * @param expert_weights_up  [E, 2*N, K] fp8 weights in global memory.
  * @param expert_scales_up   [E, 2*N] fp32 scales in global memory.
  * @param top_k              Number of experts per token.
  * @param batch_size         Number of active tokens.
- * @param spec               Global scratchpad (receives output in spec->temp).
+ * @param spec               Global scratchpad (receives output in
+ * spec->temp_bf16).
  * @param shmem              Shared memory with routing info and a_up.
  */
 namespace moe_monokernel {
@@ -653,6 +654,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
       }
     } else {
       // ── MMA: a.up × w[w_cur].up ──────────────────────────────────────
+
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
       for (unsigned bc = warp * CoreDims::K_TILE, i = 0;
            i < Dims::HIDDEN_STATES / CoreDims::BLOCK_STRIDE;
@@ -666,12 +668,15 @@ __device__ inline void moe_up_projection_BS8_allexperts(
                                   .up[r + 0][rotate_col_32(bc + c + 16, r)];
         __nv_fp8x4_e4m3 w3 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
                                   .up[r + 8][rotate_col_32(bc + c + 16, r)];
+        // Activations stored with rotate_col_32 swizzle (same as weights)
         __nv_fp8x4_e4m3 a02 =
             *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 0, r)];
         __nv_fp8x4_e4m3 a13 =
             *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 16, r)];
-        mma_fp8_fp8(d0, d1, d2, d3, w0, w2, w1, w3, a02, a13, d0, d1, d2, d3);
+
+        mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
       }
+
       // Swap d1↔d2 for gate/up layout
       {
         float tmp = d1;
@@ -685,7 +690,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
     }
     __syncthreads();
 
-    // ── Reduction → SiLU → write to spec->temp ───────────────────────────
+    // ── Reduction → SiLU → write bf16 to spec->temp + block-local max ────
     if (warp < 2) {
       const std::uint32_t row = (thread % 4) * 2 + warp;
       bool store = false;
@@ -717,8 +722,9 @@ __device__ inline void moe_up_projection_BS8_allexperts(
         }
         float x0 = d0 * as * ws0, w0v = d2 * as * ws1;
         if ((thread / 4) + base_row_up < Dims::N) {
-          spec->temp[virtual_row * Dims::N + (thread / 4) + base_row_up] =
-              rw * (w0v * x0) / (1.f + expf(-x0));
+          float val = rw * (w0v * x0) / (1.f + expf(-x0));
+          spec->temp_bf16[virtual_row * Dims::N + (thread / 4) + base_row_up] =
+              (__nv_bfloat16)val;
         }
       }
     }
