@@ -29,9 +29,14 @@ namespace moe_monokernel {
 // Callers that previously loaded:
 //   w0 = weight[row+0][col+ 0]  w1 = weight[row+8][col+ 0]
 //   w2 = weight[row+0][col+16]  w3 = weight[row+8][col+16]
-// should call:  mma_fp8_fp8(d, w0, w2, w1, w3, a02, a13, c)
+// should call:  mma_fp8_fp8(d, w0, w1, w2, w3, a02, a13, c)
 //                              ^^  ^^  ^^  ^^
-//                              a0  a1  a2  a3  (interleaved for k=32 layout)
+//                              a0  a1  a2  a3
+// PTX m16n8k32 A-matrix register layout:
+//   reg0 (a0..a3):   row=groupID,   K=low   (rows 0-7,  K[0:15])
+//   reg1 (a4..a7):   row=groupID+8, K=low   (rows 8-15, K[0:15])
+//   reg2 (a8..a11):  row=groupID,   K=high  (rows 0-7,  K[16:31])
+//   reg3 (a12..a15): row=groupID+8, K=high  (rows 8-15, K[16:31])
 __device__ static inline void mma_fp8_fp8(
     float& d0, float& d1, float& d2, float& d3, __nv_fp8x4_e4m3 const& a0,
     __nv_fp8x4_e4m3 const& a1, __nv_fp8x4_e4m3 const& a2,
