@@ -797,6 +797,8 @@ __device__ inline void moe_down_projection_BS8_allexperts(
       pipe.producer_commit();
     } else {
       // Calc warps: quantize w[BUF_BF16].bf16_buf → a.down[buf_fp8]
+      // Single-pass: read bf16 into registers, compute row_max, then quantize
+      // from registers — avoids re-reading SHM a second time.
       const std::uint32_t cw = get_calc_warp<Dims>();
       for (std::uint32_t tok = cw; tok < batch_size;
            tok += CoreDims::CALC_WARP_COUNT) {
@@ -809,36 +811,43 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         }
         if (!assigned) continue;
 
-        // Pass 1: find per-row max |x| from bf16 in SHM
+        // Number of 4-element groups this thread processes
+        constexpr std::uint32_t ITERS = Dims::N / COLS_PER_WARP_ITER;
+
+        // Single pass: read bf16 from SHM into registers and find max
+        float regs[ITERS * 4];  // hold all converted floats
         float local_max = 0.f;
-        for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-             col += COLS_PER_WARP_ITER) {
+
+  #pragma unroll
+        for (std::uint32_t i = 0; i < ITERS; ++i) {
+          std::uint32_t col = thread * FLOATS_PER_LOAD + i * COLS_PER_WARP_ITER;
           __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
               &shm->w[BUF_BF16].bf16_buf[tok][col + 0]);
           __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
               &shm->w[BUF_BF16].bf16_buf[tok][col + 2]);
           float2 f01 = __bfloat1622float2(bf_01);
           float2 f23 = __bfloat1622float2(bf_23);
+          regs[i * 4 + 0] = f01.x;
+          regs[i * 4 + 1] = f01.y;
+          regs[i * 4 + 2] = f23.x;
+          regs[i * 4 + 3] = f23.y;
           local_max = fmaxf(local_max, fmaxf(fabsf(f01.x), fabsf(f01.y)));
           local_max = fmaxf(local_max, fmaxf(fabsf(f23.x), fabsf(f23.y)));
         }
+
         float row_max = warp_reduce_max_float(local_max);
         if (row_max < __FLT_MIN__) row_max = 1.f;
 
         float scale_val = row_max * FP8_MAX_INV;
         float inv_scale = FP8_MAX / row_max;
 
-        // Pass 2: quantize bf16 → fp8
-        for (std::uint32_t col = thread * FLOATS_PER_LOAD; col < Dims::N;
-             col += COLS_PER_WARP_ITER) {
-          __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
-              &shm->w[BUF_BF16].bf16_buf[tok][col + 0]);
-          __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
-              &shm->w[BUF_BF16].bf16_buf[tok][col + 2]);
-          float2 f01 = __bfloat1622float2(bf_01);
-          float2 f23 = __bfloat1622float2(bf_23);
-          __nv_fp8x4_e4m3 q{float4{f01.x * inv_scale, f01.y * inv_scale,
-                                   f23.x * inv_scale, f23.y * inv_scale}};
+  // Quantize from registers → write fp8 to SHM (no second SHM read)
+  #pragma unroll
+        for (std::uint32_t i = 0; i < ITERS; ++i) {
+          std::uint32_t col = thread * FLOATS_PER_LOAD + i * COLS_PER_WARP_ITER;
+          __nv_fp8x4_e4m3 q{
+              float4{regs[i * 4 + 0] * inv_scale, regs[i * 4 + 1] * inv_scale,
+                     regs[i * 4 + 2] * inv_scale, regs[i * 4 + 3] * inv_scale}};
           *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->a.down[buf_fp8][tok][col]) =
               q;
         }
