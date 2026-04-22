@@ -706,18 +706,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             allow_vllm_cutlass=True,
         )
 
-        # Scratchpad for MoE monokernel.
-        # (more than) enough space for
-        # BS+8 x N             fp32
-        # BS                   fp32
-        # BS   x HIDDEN_STATES fp16
-        # with BS = 1024:  4MB + <1MB + 10MB < 4M x 4byte
-        self.moe_monokernel_scratchpad = torch.empty(
-            (1024, 4096),
-            dtype=torch.float32,
-            device=f"cuda:{torch.distributed.get_rank()}",
-        )
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -727,8 +715,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
@@ -972,91 +958,26 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             block_shape=self.weight_block_size,
         )
 
-    @property
-    def is_monolithic(self) -> bool:
-        return True
-
     def apply_monolithic(
         self,
         layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # MoE monokernel fast path for Llama4 Scout/Maverick with TP=8
-        E, M, N, K = (
-            layer.global_num_experts,
-            x.size(0),
-            layer.w13_weight.size(1),
-            x.size(1),
-        )
-        # logger.info("apply_monolithic dims: E=%d, M=%d, N=%d, K=%d", E, M, N, K)
-        # if (E == 16 or E == 128) and M <= 64 and K == 5120 and N == 2048:
-        if (E == 16 or E == 128) and M <= 64 and K == 2048 and N == 1536:
-            if self.moe_monokernel_scratchpad.device != x.device:
-                self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(
-                    x.device
-                )
-
-            # Check if this model uses top-K > 1 routing (e.g. Qwen3 Coder FP8)
-            top_k = getattr(layer, "top_k", 1)
-            scoring_func = getattr(layer, "scoring_func", "sigmoid")
-            renormalize = getattr(layer, "renormalize", False)
-            # logger.info("top_k=%d", top_k)
-
-            if top_k > 1:
-                # Use the top-K monokernel variant
-                # logger.info("using topK variant monokernel")
-                return torch.ops.vllm.moe_monokernel_topk(
-                    x,
-                    router_logits,
-                    layer.w13_weight,
-                    layer.w13_weight_scale,
-                    layer.w2_weight,
-                    layer.w2_weight_scale,
-                    self.moe_monokernel_scratchpad,
-                    top_k,
-                    scoring_func,
-                    renormalize,
-                )
-
-            # Original top-1 sigmoid path (Llama4 Scout/Maverick)
-            # logger.info("moe_monokernel active: M=%d, E=%d, N=%d, K=%d", M, E, N, K)
-            return torch.ops.vllm.moe_monokernel(
-                x,
-                router_logits,
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                self.moe_monokernel_scratchpad,
-            )
-
-        # Fallback: do routing here and call the standard kernel
         assert self.moe_kernel is not None
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=layer.top_k,
-            use_grouped_topk=layer.use_grouped_topk,
-            renormalize=layer.renormalize,
-            topk_group=layer.topk_group,
-            num_expert_group=layer.num_expert_group,
-            custom_routing_function=layer.custom_routing_function,
-            scoring_func=layer.scoring_func,
-            e_score_correction_bias=layer.e_score_correction_bias,
-            routed_scaling_factor=layer.routed_scaling_factor,
-        )
-        return self.moe_kernel.apply(
+        return self.moe_kernel.apply_monolithic(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights,
-            topk_ids,
+            router_logits,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            shared_experts_input=None,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
         )
 
     def apply(
@@ -1067,7 +988,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # apply() may still be called directly in some code paths
+        assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,
@@ -2351,8 +2272,6 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
-        layer.hidden_size = hidden_size
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None

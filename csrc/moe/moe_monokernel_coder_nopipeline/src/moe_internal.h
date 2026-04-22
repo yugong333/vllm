@@ -41,17 +41,11 @@ template <typename Dims>
 struct MoEGemmSpec {
   static constexpr uint32_t SPEC_MAX_TOPK = 8;
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
-  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
-  // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
-  // writes one row per (token, expert) pair into spec->temp_bf16/temp_fp32.
-  static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
-
-  // Number of blocks that contribute columns to the N-wide up-projection
-  // output.  Each block writes W_UP_COLS_PER_BLOCK columns; blocks beyond N
-  // are idle.  W_UP_TILE is always 16, so each block covers 8 columns.
-  static constexpr uint32_t W_UP_COLS_PER_BLOCK = 8;  // = W_UP_TILE / 2
-  static constexpr uint32_t UP_PROJ_BLOCK_COUNT =
-      (Dims::N + W_UP_COLS_PER_BLOCK - 1) / W_UP_COLS_PER_BLOCK;
+  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows (BS64
+  // path). For BS <= 8 the tiny path indexes temp by original token, so BS + 8
+  // suffices, but we size for the worst case to keep a single definition.
+  static constexpr uint32_t TEMP_ROWS =
+      (Dims::BS <= 8) ? (Dims::BS + 8) : (Dims::BS * SPEC_MAX_TOPK + 8);
 
   #ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
@@ -61,23 +55,7 @@ struct MoEGemmSpec {
   #endif
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
-
-  // Up-projection SiLU output.  BS8 and BS64 never run simultaneously, so
-  // they share the same storage via a union.
-  //   BS64: fp32 (T_element) — consumed by the BS64 down-projection which
-  //         loads tiles into shared memory via async copy.
-  //   BS8:  bf16 (A_element) — the down-projection reads block-local maxes
-  //         from temp_block_max and does a single-pass bf16→fp8 quantization.
-  union {
-    T_element temp_fp32[TEMP_ROWS * Dims::N];  //< BS64 path (fp32)
-    A_element temp_bf16[TEMP_ROWS * Dims::N];  //< BS8 path (bf16)
-  };
-
-  // Per-block absmax of each row in temp_bf16 (BS8 path only).
-  // Written by the up-projection epilogue, read by the down-projection
-  // to compute the true row max without a separate global-memory pass.
-  float temp_block_max[TEMP_ROWS * UP_PROJ_BLOCK_COUNT];
-
+  T_element temp[TEMP_ROWS * Dims::N];          //< Up projection result
   float act_scale[Dims::BS];  //< per-token activation quantization scale
                               //(max/448)
 };
@@ -86,9 +64,9 @@ struct MoEGemmSpec {
   // sizes
   #if USE_SMALL_SETUP
 // SHM limits batch size to ~2k
-using Dims_Max = MoEDimensions<1024, 256, 1024, 256>;
+using Dims_Max = MoEDimensions<1024, 256, 1024, 128>;
   #else
-using Dims_Max = MoEDimensions<1024, 1024, 5120, 256>;
+using Dims_Max = MoEDimensions<1024, 1024, 5120, 128>;
   #endif
 
 /**
@@ -149,63 +127,40 @@ struct MoE_SHM {
       T_element partial_result[CoreDims::CALC_WARP_COUNT]
                               [CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
-    // BS8 split-phase path: up-projection and down-projection run as
-    // separate all-experts loops with a single grid.sync() in between.
+    // BS8 path: holds activations, weight tiles, and partial results
+    // for both up- and down-projection (entire pipeline fits in one struct).
     //
-    // Compact union layout:
-    //   a: fp8 up-activations / double-buffered fp8 down-activations
-    //   w[2]: ping-pong orig(bf16) / w_up(fp8) / bf16_buf(bf16) / w_down(fp8)
-    //   partial_result: up / down scratch
-    //
-    // Down-projection uses a pipelined design with fixed w[2] slot roles:
-    //   w[0].bf16_buf:  bf16 intermediate results from global memory
-    //   w[1].down:      fp8 down-projection weights
-    //   a.down[2]:      double-buffered fp8 quantized activations for MMA
-    //                   (reuses the same union as a.up — safe because all
-    //                   up-projections finish before any down-projection
-    //                   starts)
+    // Separate w_up and w_down buffers (no union/aliasing between them) so
+    // that down-weights can be prefetched while up-projection is computing,
+    // and the next expert's up-weights can be prefetched while down-projection
+    // is computing.  This saves one full up-weight buffer (~80 KB) compared to
+    // the previous w[2] double-buffer design while also enabling full overlap.
     struct TinyData {
-      // Input activations for up- and down-projection (mutually exclusive).
-      // Up-projection is fully complete (with grid.sync) before
-      // down-projection begins, so a.up and a.down[2] safely share storage.
-      // a.down[2] is double-buffered for the down-projection pipeline:
-      // one buffer is consumed by MMA while the other is written by
-      // quantization.
-      union {
-        AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[2][CoreDims::T_TILE][Dims::N];              // fp8
-      } a;
+      // Quantized fp8 activations — persistent across all expert iterations.
+      // Kept separate from a_down so that the down-projection's fp32 temps
+      // never clobber the quantized inputs, eliminating the per-expert
+      // global-memory round-trip through spec->activations.
+      AQ_element a_up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
 
-      // Per-row quantization scale for a.down (double-buffered).
-      S_element a_down_scale[2][CoreDims::T_TILE];
+      // Down-projection input (fp32 SiLU output from up-projection).
+      T_element a_down[CoreDims::T_TILE][Dims::N];
 
-      // Double-buffered weight / activation tiles.
-      //
-      // During init (Phase 1–2), w[0].orig holds the raw bf16 activations
-      // fetched from global memory (before quantization), and w[1].up holds
-      // the first expert's up-projection weights.
-      //
-      // During the down-projection (Phase 4), w[2] has fixed roles:
-      // w[0] holds bf16 intermediate results (w[0].bf16_buf) and
-      // w[1] holds fp8 down-projection weights (w[1].down).
-      // They use separate slots so bf16_buf and w_down never conflict.
-      union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
-        W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-        W_element down[CoreDims::W_DOWN_TILE]
+      // Raw (unquantized) activations fetched from global memory.
+      // Reused as staging area before quantization; not live at the same
+      // time as w_up / w_down.
+      A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
+
+      // Up-projection weight tile — one buffer, prefetched during down-compute.
+      W_element w_up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
+
+      // Down-projection weight tile — one buffer, prefetched during up-compute.
+      W_element w_down[CoreDims::W_DOWN_TILE]
                       [Dims::N + CoreDims::PADDING / sizeof(W_element)];
-      } w[2];
 
-      // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      //   For K=2048, GRID=64: W_DOWN_TILE=32, so ceil(32/128)=1
-      //   For N=512: ceil(512/128)=4, so 1*4=4 scales per expert per block
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+      // Down-projection scales (single buffer, loaded together with w_down).
+      S_element scale_down[CoreDims::W_DOWN_TILE + CoreDims::PADDING];
 
-      // Scratch pad for MMA partial results (up and down share the same space).
+      // scratch pad
       union {
         T_element up[CoreDims::CALC_WARP_COUNT]
                     [CoreDims::W_UP_TILE * CoreDims::T_TILE];
@@ -215,29 +170,29 @@ struct MoE_SHM {
       } partial_result;
 
       // Per-block fp32 accumulator for down-projection output.
+      // Each block owns W_DOWN_TILE columns of the output; accumulating in
+      // SHM avoids repeated global read-modify-write (bf16→fp32→bf16) per
+      // expert and eliminates the associated precision loss.
+      // Written once to global memory (as bf16) after the expert loop.
+      // Size: BS × W_DOWN_TILE × 4B = 8 × 16 × 4 = 512 bytes.
       T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE];
     } tiny;
     // BS64 path: holds weight tiles and partial results for down-projection
-    // only (up-projection uses Gemm1Data; activations come from
-    // spec->temp_fp32)
+    // only (up-projection uses Gemm1Data; activations come from spec->temp)
     struct Gemm2Data {
       // prefetch 1 tile ahead
       T_element t[2][CoreDims::T_TILE][Dims::N];
       W_element w[2][CoreDims::W_DOWN_TILE]
                  [Dims::N + CoreDims::PADDING / sizeof(W_element)];
-      // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+      S_element scale[2][CoreDims::W_DOWN_TILE + CoreDims::PADDING];
       T_element partial_result[CoreDims::W_DOWN_TILE / 2 +
                                CoreDims::CALC_WARP_COUNT / 2]
                               [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
     } gemm2;
   } u;
 
-  static_assert(Dims::NUM_EXPERTS <= 65535,
-                "Number of experts too high, cannot store as uint16 anymore.");
+  static_assert(Dims::NUM_EXPERTS < 255,
+                "Number of experts too high, cannot store as uint8 anymore.");
 
   // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
@@ -254,7 +209,7 @@ struct MoE_SHM {
   // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
   // MAX_TOPK = 8 covers top_k up to 8.
   static constexpr uint32_t MAX_TOPK = 8;
-  alignas(uint64_t) uint16_t
+  alignas(uint64_t) uint8_t
       topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
 
@@ -398,78 +353,6 @@ __device__ static __forceinline__ To type_pun(From x) {
   // This memcpy is optimized out by NVCC
   memcpy(&y, &x, sizeof(From));
   return y;
-}
-
-}  // namespace moe_monokernel
-
-// ── Block-wise scale helpers ──────────────────────────────────────────────
-namespace moe_monokernel {
-
-/**
- * @brief Check at compile time whether Dims uses block-wise quantization.
- */
-template <typename Dims>
-struct is_block_wise {
-  // SFINAE: check if QUANT_GRAN exists and equals BLOCK_WISE
-  template <typename D>
-  static constexpr auto test(int) -> decltype(D::QUANT_GRAN, bool()) {
-    return D::QUANT_GRAN == QuantGranularity::BLOCK_WISE;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
-
-/**
- * @brief Fetch the block-wise up-projection scale for a given row and K-column.
- *
- * @param expert_scales_up  Pointer to the full scale tensor (global memory).
- * @param expert_id         Expert index.
- * @param row               Row index within the [2*N, K] weight matrix.
- * @param k_col             Column index along the K dimension (full K, not
- * half).
- */
-template <typename Dims>
-__device__ __forceinline__ float get_up_block_scale(
-    const S_element* __restrict__ expert_scales_up, uint32_t expert_id,
-    uint32_t row, uint32_t k_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_up[expert_id * 2 * Dims::N + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t kb = k_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_up[expert_id * Dims::UP_SCALE_ROWS *
-                                Dims::UP_SCALE_COLS +
-                            rb * Dims::UP_SCALE_COLS + kb];
-  }
-}
-
-/**
- * @brief Fetch the block-wise down-projection scale for a given row and
- * N-column.
- *
- * @param expert_scales_down  Pointer to the full scale tensor (global memory).
- * @param expert_id           Expert index.
- * @param row                 Row index within the [K, N] weight matrix.
- * @param n_col               Column index along the N dimension.
- */
-template <typename Dims>
-__device__ __forceinline__ float get_down_block_scale(
-    const S_element* __restrict__ expert_scales_down, uint32_t expert_id,
-    uint32_t row, uint32_t n_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_down[expert_id * Dims::HIDDEN_STATES + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t nb = n_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_down[expert_id * Dims::DOWN_SCALE_ROWS *
-                                  Dims::DOWN_SCALE_COLS +
-                              rb * Dims::DOWN_SCALE_COLS + nb];
-  }
 }
 
 }  // namespace moe_monokernel

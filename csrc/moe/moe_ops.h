@@ -67,8 +67,9 @@ void shuffle_rows(const torch::Tensor& input_tensor,
                   torch::Tensor& output_tensor);
 
 #ifndef USE_ROCM
-// Top-K monokernel for Qwen3-Coder-30B-A3B (E=128, K=2048, N=768, TP=1)
-void moe_monokernel_topk_BS8_E128_Qwen3Coder_impl(
+// Top-K monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
+// (E=256, K=2048, N=512, TP=1)
+void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_impl(
     const torch::Tensor& activations_in, const torch::Tensor& router_logits,
     const torch::Tensor& expert_weights_up,
     const torch::Tensor& expert_scales_up,
@@ -76,7 +77,7 @@ void moe_monokernel_topk_BS8_E128_Qwen3Coder_impl(
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
     bool renormalize);
-void moe_monokernel_topk_BS64_E128_Qwen3Coder_impl(
+void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
     const torch::Tensor& activations_in, const torch::Tensor& router_logits,
     const torch::Tensor& expert_weights_up,
     const torch::Tensor& expert_scales_up,

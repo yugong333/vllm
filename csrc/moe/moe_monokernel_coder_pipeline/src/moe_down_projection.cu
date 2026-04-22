@@ -113,19 +113,92 @@ __device__ inline void moe_request_down_expert(
     }
   }
 
-  // request Scale tile — block-wise 2D scale
+  // request Scale tile
   if (d_warp == 0) {
-    constexpr uint32_t SCALE_TILE_SIZE =
-        MoE_SHM<Dims>::U::Gemm2Data::DOWN_SCALE_TILE_SIZE;
-    constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
-    if (d_thread < SCALE_TILE_SIZE) {
-      uint32_t rb = d_thread / COL_BLOCKS;
-      uint32_t cb = d_thread % COL_BLOCKS;
-      uint32_t global_rb = (base_row / 128) + rb;
-      shm->scale[w_index][d_thread] =
-          expert_scales_down[id * Dims::DOWN_SCALE_ROWS *
-                                 Dims::DOWN_SCALE_COLS +
-                             global_rb * Dims::DOWN_SCALE_COLS + cb];
+    const unsigned chunk_size = 16 / sizeof(*expert_scales_down);
+    if (d_thread < CoreDims::W_DOWN_TILE / chunk_size) {
+      copy128(shm->scale[w_index][chunk_size * d_thread],
+              expert_scales_down[id * Dims::HIDDEN_STATES + base_row +
+                                 chunk_size * d_thread],
+              pipe);
+    }
+  }
+}
+
+/**
+ * @brief Initiate the copy of expert weights and scales from Global to Shared
+ * Memory for 'Tiny' kernel.
+ *
+ * This device function issues the asynchronous data copy requests for a tile of
+ * expert weights and corresponding weights. The copy operations will be queued
+ * in the given @a pipe, which the caller must use to wait for their completion.
+ *
+ * While the expert is selected by @a id, the tile to copy is implicitly
+ * selected by the @c blockIdx. The result is stored in the tile @a w_index
+ * within @a shm.
+ *
+ * @note Like all prefetching functions, this function must only be called by
+ *       threads in prefetch warps.
+ *
+ * @param expert_weights_down Pointer weights array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES, N] in expert, row-major order. Individual elements are in
+ * __nv_fp8_e4m3 format. Stored in Global Memory.
+ * @param expert_scales_down Pointer scales array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES] in row-major order. Individual elements are in __nv_fp8_e4m3
+ * format. Stored in Global Memory.
+ * @param id Expert index within @a expert_weights_down and @a
+ * expert_scales_down.
+ * @param shm Shared Memory struct to store the result to.
+ * @param w_index Index of tile to use within @a shm.
+ * @param pipe Asynchronous completion pipe to use.
+ */
+template <typename Dims>
+__device__ inline void moe_request_down_expert_tiny(
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down, std::uint32_t id,
+    typename MoE_SHM<Dims>::U::TinyData* shm, std::uint32_t w_index,
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+  const unsigned base_row = blockIdx.x * MoECoreDims<Dims>::W_DOWN_TILE;
+
+  // position within the block
+  using CoreDims = MoECoreDims<Dims>;
+  const unsigned d_thread = threadIdx.x % (2 * CoreDims::THREADS_PER_WARP);
+  const unsigned d_warp = get_prefetch_warp<Dims>() / 2;
+
+  // request W tile
+  {
+    const unsigned chunk_size = 16;
+    static_assert(Dims::N <= 2 * CoreDims::THREADS_PER_WARP * chunk_size);
+
+    // Compiler on H200 barfs out on plain FP8 transfers as it fails to
+    // propagate alignment guarantees: just case to a 32-bit value; we know all
+    // data to be 16-byte aligned.
+    const OpaqueElement* weights =
+        (const OpaqueElement*)(expert_weights_down +
+                               id * Dims::N * Dims::HIDDEN_STATES +
+                               base_row * Dims::N);
+    for (unsigned row = d_warp, i = 0;
+         i < CoreDims::W_DOWN_TILE / (CoreDims::PREFETCH_WARP_COUNT / 2);
+         row += CoreDims::PREFETCH_WARP_COUNT / 2, i++) {
+      unsigned col = d_thread * chunk_size;
+      // "clever" condition to allow for compile-time optimization (becomes
+      // no-op on H200)
+      if (Dims::N == 2 * CoreDims::THREADS_PER_WARP * chunk_size ||
+          col < Dims::N) {
+        copy128(shm->w_down[row][col],
+                weights[(row * Dims::N + col) / sizeof(OpaqueElement)], pipe);
+      }
+    }
+  }
+
+  // request Scale tile
+  if (d_warp == 0) {
+    const unsigned chunk_size = 16 / sizeof(*expert_scales_down);
+    if (d_thread < CoreDims::W_DOWN_TILE / chunk_size) {
+      copy128(shm->scale_down[chunk_size * d_thread],
+              expert_scales_down[id * Dims::HIDDEN_STATES + base_row +
+                                 chunk_size * d_thread],
+              pipe);
     }
   }
 }
@@ -216,18 +289,13 @@ __device__ inline void moe_down_mult(
 
   for (unsigned w_row = 0; w_row < CoreDims::W_DOWN_TILE;
        w_row += CoreDims::W_DOWN_MMA_TILE) {
-    // Block-wise: per-iteration scale application.
-    // The scale tile in SHM is linearized as [row_blocks][col_blocks].
-    // W_DOWN_TILE=32 < 128, so there's only 1 row-block in the tile.
-    // We index by N-column block only.
-    constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
-
+    // init accumulators
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
+    // run partial scalar products
     for (unsigned base_col = warp * CoreDims::K_TILE, i = 0;
          i < Dims::N / CoreDims::BLOCK_STRIDE;
          base_col += CoreDims::BLOCK_STRIDE, i++) {
-      float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
       unsigned far_row =
           (Rows % 16 == 8 && w_row + 8 == Rows) ? w_row : w_row + 8;
       __nv_fp8x4_e4m3 w0 =
@@ -246,17 +314,17 @@ __device__ inline void moe_down_mult(
       float4 b0 = *(float4*)&temps[base_col + 4 * (thread % 4) + 0];
       float4 b1 = *(float4*)&temps[base_col + 4 * (thread % 4) + 16];
 
-      mma_fp8_tf32(md0, md1, md2, md3, w0, w1, w2, w3, b0, b1, 0.f, 0.f, 0.f,
-                   0.f);
-
-      unsigned n_block = base_col / 128;
-      float ws = scale[0 * COL_BLOCKS + n_block];
-
-      d0 += md0 * ws;
-      d1 += md1 * ws;
-      d2 += md2 * ws;
-      d3 += md3 * ws;
+      mma_fp8_tf32(d0, d1, d2, d3, w0, w1, w2, w3, b0, b1, d0, d1, d2, d3);
     }
+
+    // load scales (quick-ish as they are stored in SHM)
+    float ws0 = scale[(thread / 4) + w_row + 0];
+    float ws1 = scale[(thread / 4) + w_row + 8];
+
+    d0 *= ws0;
+    d1 *= ws0;
+    d2 *= ws1;
+    d3 *= ws1;
 
     if (store_row0) {
       partial_result[w_row / 2 + warp][thread + 0] = d0;
@@ -270,9 +338,108 @@ __device__ inline void moe_down_mult(
 }
 
 /**
+ * @brief Performs the MMA result reduction.
+ *
+ * This device function sums up the partial scalar products created by all warps
+ * and stores the results in Global Memory.  The tile to be written is
+ * implicitly determined by the @c blockIdx.
+ *
+ * The output can be filtered, i.e. @a store_row0 and @a store_row1 control
+ * whether the results for the respective rows @a row0 and @a row1 shall be
+ * written.  This allows the called to always process data at the full tile size
+ * and simply suppress superfluous results in the output.
+ *
+ * @param partial_result Array of MMA results from all warps of shape [20, 4,
+ * THREADS] in row-major order. Individual elements are in FP32 format.
+ * @param store_row0 Specifies if result in @a row0 shall be stored.
+ * @param store_row1 Specifies if result in @a row1 shall be stored.
+ * @param row0 Row to store the scalar products for the first token.
+ * @param row1 Row to store the scalar products for the second token.
+ * @param result Pointer to the output array of shape [BS, N] in row-major
+ * order. Individual elements are in FP32 format.
+ */
+template <typename Dims, std::size_t Rows, std::size_t Cols>
+__device__ inline void moe_down_reduction(
+    const float (&partial_result)[Rows][Cols], bool store_row0, bool store_row1,
+    unsigned row0, unsigned row1, R_element* __restrict__ result) {
+  // position within the block
+  using CoreDims = MoECoreDims<Dims>;
+  const unsigned thread = get_thread<Dims>();
+  const unsigned warp = get_any_warp<Dims>();
+
+  // starting row to process
+  const unsigned base_row = blockIdx.x * CoreDims::W_DOWN_TILE;
+
+  // reduction and output
+  for (unsigned w_row = warp * CoreDims::W_DOWN_MMA_TILE;
+       w_row < CoreDims::W_DOWN_TILE;
+       w_row += CoreDims::W_DOWN_MMA_TILE * CoreDims::TOTAL_WARP_COUNT) {
+    float d0 = partial_result[w_row / 2][thread + 0];
+    float d1 = partial_result[w_row / 2][thread + 32];
+    float d2 = partial_result[w_row / 2][thread + 64];
+    float d3 = partial_result[w_row / 2][thread + 96];
+
+    // combine results
+    for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
+      d0 += partial_result[w_row / 2 + i][thread + 0];
+      d1 += partial_result[w_row / 2 + i][thread + 32];
+      d2 += partial_result[w_row / 2 + i][thread + 64];
+      d3 += partial_result[w_row / 2 + i][thread + 96];
+    }
+
+    // write final result. Only write valid lines
+    if (store_row0) {
+      result[row0 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row + 0] =
+          d0;
+      if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+          w_row + 8 < CoreDims::W_DOWN_TILE) {
+        result[row0 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row +
+               8] = d2;
+      }
+    }
+    if (store_row1) {
+      result[row1 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row + 0] =
+          d1;
+      if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+          w_row + 8 < CoreDims::W_DOWN_TILE) {
+        result[row1 * Dims::HIDDEN_STATES + (thread / 4) + base_row + w_row +
+               8] = d3;
+      }
+    }
+  }
+}
+
+/**
+ * @brief Standard kernel for the second GEMM ("down projection").
+ *
+ * This device function processes @c BS tokens, grouped by expert in internal
+ * batches of 8 tokens. The experts to use and the respective list of tokes for
+ * each of them is given by @a spec.
+ *
+ * Activations are taken from temporary storage in @a spec and all non-expert
+ * data is taken from
+ * @a shmem. Outputs are in the same order as the input to "up projection".
+ *
+ * @param expert_weights_up Pointer token weights array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES, N] in expert, row-major order. Individual elements are in
+ * __nv_fp8_e4m3 format. Stored in Global Memory.
+ * @param expert_scales_up Pointer weights scales array of shape [NUM_EXPERTS,
+ * HIDDEN_STATES] in row-major order. Individual elements are in FP32 format.
+ *                         Stored in Global Memory.
+ * @param result Global Memory array of shape [BS, HIDDEN_STATES] in row-major
+ * order, receiving the output.  Individual elements are in __nv_bfloat16
+ * format.
+ * @param spec Global Memory struct containing the scaled input token
+ * activations.
+ * @param shmem Shared Memory struct containing the expert<=>token mapping,
+ * activation weights and will be uses as local scratch pad store for faster
+ * operation.
+ */
+/**
  * @brief Top-K single-pass down-projection reduction with weighted
  * accumulation.
  *
+ * Identical to @c moe_down_reduction except:
  *  - @p row0 / @p row1 are sorted positions; the original token index is
  *    looked up via @c shmem->path.bs64.token_indexes_topk[sorted_pos].
  *  - The output is accumulated with @c += (not @c =) because each original
@@ -446,17 +613,16 @@ __device__ inline void moe_down_mult_fp8(
 
   for (unsigned w_row = 0; w_row < CoreDims::W_DOWN_TILE;
        w_row += CoreDims::W_DOWN_MMA_TILE) {
-    // Block-wise: per-iteration scale application
-    constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
     float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
+    // mma_fp8_fp8 is m16n8k32 — processes 32 columns per iteration
     for (unsigned base_col = warp * CoreDims::K_TILE, i = 0;
          i < Dims::N / CoreDims::BLOCK_STRIDE;
          base_col += CoreDims::BLOCK_STRIDE, i++) {
-      float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
       unsigned far_row =
           (Rows % 16 == 8 && w_row + 8 == Rows) ? w_row : w_row + 8;
 
+      // A-matrix (weights): fp8
       __nv_fp8x4_e4m3 w0 =
           *(__nv_fp8x4_e4m3*)&weights[w_row + thread / 4]
                                      [base_col + 4 * (thread % 4) + 0];
@@ -470,28 +636,23 @@ __device__ inline void moe_down_mult_fp8(
           *(__nv_fp8x4_e4m3*)&weights[far_row + thread / 4]
                                      [base_col + 4 * (thread % 4) + 16];
 
+      // B-matrix (activations): fp8
       __nv_fp8x4_e4m3 b0 =
           *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 0];
       __nv_fp8x4_e4m3 b1 =
           *(__nv_fp8x4_e4m3*)&act_row[base_col + 4 * (thread % 4) + 16];
 
-      mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, b0, b1, 0.f, 0.f, 0.f,
-                  0.f);
-
-      unsigned n_block = base_col / 128;
-      float ws = scale[0 * COL_BLOCKS + n_block];
-
-      d0 += md0 * ws;
-      d1 += md1 * ws;
-      d2 += md2 * ws;
-      d3 += md3 * ws;
+      mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, b0, b1, d0, d1, d2, d3);
     }
 
-    // Apply activation scale (weight scale already applied per-block)
-    d0 *= act_scale;
-    d1 *= act_scale;
-    d2 *= act_scale;
-    d3 *= act_scale;
+    // Apply weight scale and activation scale
+    float ws0 = scale[(thread / 4) + w_row + 0];
+    float ws1 = scale[(thread / 4) + w_row + 8];
+
+    d0 *= ws0 * act_scale;
+    d1 *= ws0 * act_scale;
+    d2 *= ws1 * act_scale;
+    d3 *= ws1 * act_scale;
 
     if (store_row0) {
       partial_result[w_row / 2 + warp][thread + 0] = d0;
@@ -571,7 +732,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
     pipe.producer_acquire();
     for (std::uint32_t tok = 0; tok < batch_size; ++tok) {
       for (uint32_t k = 0; k < top_k; k++) {
-        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id0) {
+        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id0) {
           std::uint32_t vrow = tok * top_k + k;
           const A_element* src = &spec->temp_bf16[vrow * Dims::N];
           // All warps cooperate: global thread index across all warps
@@ -624,18 +785,12 @@ __device__ inline void moe_down_projection_BS8_allexperts(
           }
         }
         if (d_warp_l == 0) {
-          // Block-wise: fetch 2D scale tile
-          constexpr uint32_t SCALE_TILE_SIZE =
-              MoE_SHM<Dims>::U::TinyData::DOWN_SCALE_TILE_SIZE;
-          constexpr uint32_t COL_BLOCKS = (Dims::N + 127) / 128;
-          if (d_thread_l < SCALE_TILE_SIZE) {
-            uint32_t rb = d_thread_l / COL_BLOCKS;
-            uint32_t cb = d_thread_l % COL_BLOCKS;
-            uint32_t global_rb = (base_row_dn / 128) + rb;
-            shm->scale[BUF_W][d_thread_l] =
-                expert_scales_down[id * Dims::DOWN_SCALE_ROWS *
-                                       Dims::DOWN_SCALE_COLS +
-                                   global_rb * Dims::DOWN_SCALE_COLS + cb];
+          const unsigned sc_chunk = 16 / sizeof(S_element);
+          if (d_thread_l < CoreDims::W_DOWN_TILE / sc_chunk) {
+            copy128(shm->scale[BUF_W][sc_chunk * d_thread_l],
+                    expert_scales_down[id * Dims::HIDDEN_STATES + base_row_dn +
+                                       sc_chunk * d_thread_l],
+                    pipe);
           }
         }
       }
@@ -649,7 +804,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
            tok += CoreDims::CALC_WARP_COUNT) {
         bool assigned = false;
         for (uint32_t k = 0; k < top_k; k++) {
-          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)id) {
             assigned = true;
             break;
           }
@@ -714,7 +869,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         pipe.producer_acquire();
         for (std::uint32_t tok = 0; tok < batch_size; ++tok) {
           for (uint32_t k = 0; k < top_k; k++) {
-            if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)next_id) {
+            if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint8_t)next_id) {
               std::uint32_t vrow = tok * top_k + k;
               const A_element* src = &spec->temp_bf16[vrow * Dims::N];
               for (std::uint32_t col =
@@ -750,13 +905,13 @@ __device__ inline void moe_down_projection_BS8_allexperts(
       bool s0 = false, s1 = false;
       if (row0 < batch_size)
         for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
             s0 = true;
             break;
           }
       if (row1 < batch_size)
         for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
             s1 = true;
             break;
           }
@@ -775,13 +930,13 @@ __device__ inline void moe_down_projection_BS8_allexperts(
       bool s0 = false, s1 = false;
       if (row0 < batch_size)
         for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[row0 * MAX_TOPK + k] == (uint8_t)id) {
             s0 = true;
             break;
           }
       if (row1 < batch_size)
         for (uint32_t k = 0; k < top_k; k++)
-          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[row1 * MAX_TOPK + k] == (uint8_t)id) {
             s1 = true;
             break;
           }

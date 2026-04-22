@@ -86,9 +86,9 @@ struct MoEGemmSpec {
   // sizes
   #if USE_SMALL_SETUP
 // SHM limits batch size to ~2k
-using Dims_Max = MoEDimensions<1024, 256, 1024, 256>;
+using Dims_Max = MoEDimensions<1024, 256, 1024, 128>;
   #else
-using Dims_Max = MoEDimensions<1024, 1024, 5120, 256>;
+using Dims_Max = MoEDimensions<1024, 1024, 5120, 128>;
   #endif
 
 /**
@@ -198,12 +198,7 @@ struct MoE_SHM {
       } w[2];
 
       // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      //   For K=2048, GRID=64: W_DOWN_TILE=32, so ceil(32/128)=1
-      //   For N=512: ceil(512/128)=4, so 1*4=4 scales per expert per block
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+      S_element scale[2][CoreDims::W_DOWN_TILE + CoreDims::PADDING];
 
       // Scratch pad for MMA partial results (up and down share the same space).
       union {
@@ -225,19 +220,15 @@ struct MoE_SHM {
       T_element t[2][CoreDims::T_TILE][Dims::N];
       W_element w[2][CoreDims::W_DOWN_TILE]
                  [Dims::N + CoreDims::PADDING / sizeof(W_element)];
-      // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+      S_element scale[2][CoreDims::W_DOWN_TILE + CoreDims::PADDING];
       T_element partial_result[CoreDims::W_DOWN_TILE / 2 +
                                CoreDims::CALC_WARP_COUNT / 2]
                               [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
     } gemm2;
   } u;
 
-  static_assert(Dims::NUM_EXPERTS <= 65535,
-                "Number of experts too high, cannot store as uint16 anymore.");
+  static_assert(Dims::NUM_EXPERTS < 255,
+                "Number of experts too high, cannot store as uint8 anymore.");
 
   // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
@@ -254,7 +245,7 @@ struct MoE_SHM {
   // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
   // MAX_TOPK = 8 covers top_k up to 8.
   static constexpr uint32_t MAX_TOPK = 8;
-  alignas(uint64_t) uint16_t
+  alignas(uint64_t) uint8_t
       topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
 
@@ -398,78 +389,6 @@ __device__ static __forceinline__ To type_pun(From x) {
   // This memcpy is optimized out by NVCC
   memcpy(&y, &x, sizeof(From));
   return y;
-}
-
-}  // namespace moe_monokernel
-
-// ── Block-wise scale helpers ──────────────────────────────────────────────
-namespace moe_monokernel {
-
-/**
- * @brief Check at compile time whether Dims uses block-wise quantization.
- */
-template <typename Dims>
-struct is_block_wise {
-  // SFINAE: check if QUANT_GRAN exists and equals BLOCK_WISE
-  template <typename D>
-  static constexpr auto test(int) -> decltype(D::QUANT_GRAN, bool()) {
-    return D::QUANT_GRAN == QuantGranularity::BLOCK_WISE;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
-
-/**
- * @brief Fetch the block-wise up-projection scale for a given row and K-column.
- *
- * @param expert_scales_up  Pointer to the full scale tensor (global memory).
- * @param expert_id         Expert index.
- * @param row               Row index within the [2*N, K] weight matrix.
- * @param k_col             Column index along the K dimension (full K, not
- * half).
- */
-template <typename Dims>
-__device__ __forceinline__ float get_up_block_scale(
-    const S_element* __restrict__ expert_scales_up, uint32_t expert_id,
-    uint32_t row, uint32_t k_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_up[expert_id * 2 * Dims::N + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t kb = k_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_up[expert_id * Dims::UP_SCALE_ROWS *
-                                Dims::UP_SCALE_COLS +
-                            rb * Dims::UP_SCALE_COLS + kb];
-  }
-}
-
-/**
- * @brief Fetch the block-wise down-projection scale for a given row and
- * N-column.
- *
- * @param expert_scales_down  Pointer to the full scale tensor (global memory).
- * @param expert_id           Expert index.
- * @param row                 Row index within the [K, N] weight matrix.
- * @param n_col               Column index along the N dimension.
- */
-template <typename Dims>
-__device__ __forceinline__ float get_down_block_scale(
-    const S_element* __restrict__ expert_scales_down, uint32_t expert_id,
-    uint32_t row, uint32_t n_col) {
-  if constexpr (!is_block_wise<Dims>::value) {
-    // Per-channel: one scale per row
-    return expert_scales_down[expert_id * Dims::HIDDEN_STATES + row];
-  } else {
-    uint32_t rb = row / Dims::BLOCK_SCALE_ROW;
-    uint32_t nb = n_col / Dims::BLOCK_SCALE_COL;
-    return expert_scales_down[expert_id * Dims::DOWN_SCALE_ROWS *
-                                  Dims::DOWN_SCALE_COLS +
-                              rb * Dims::DOWN_SCALE_COLS + nb];
-  }
 }
 
 }  // namespace moe_monokernel

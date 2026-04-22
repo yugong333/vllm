@@ -577,6 +577,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )
 
+        # Scratchpad for MoE monokernel fast path (Qwen3.5-35B FP8 block-wise)
+        # Layout: BS x E x N fp8 + BS x E x N/2 fp8 + BS x HIDDEN fp16
+        # with BS=1024: 4MB + <1MB + 10MB < 4M x 4byte
+        self.moe_monokernel_scratchpad = torch.empty(
+            (1024, 4096),
+            dtype=torch.float32,
+            device="cpu",
+        )
+
         # Set weight key and activation key for kernel compatibility
         if self.block_quant:
             weight_key = kFp8Static128BlockSym

@@ -9,6 +9,12 @@
 
 namespace moe_monokernel {
 
+// Weight quantization granularity
+enum class QuantGranularity : uint32_t {
+  PER_CHANNEL = 0,  // one scale per row (original)
+  BLOCK_WISE = 1,   // one scale per (block_row, block_col) tile
+};
+
 template <uint32_t m, uint32_t n, uint32_t k, uint32_t num_experts>
 struct MoEDimensions {
   static constexpr uint32_t HIDDEN_STATES = k;
@@ -18,41 +24,111 @@ struct MoEDimensions {
   static constexpr uint32_t M = m;
   static constexpr uint32_t NUM_EXPERTS = num_experts;
 
+  // Default: per-channel quantization (backward compatible)
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::PER_CHANNEL;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 0;
+  static constexpr uint32_t BLOCK_SCALE_COL = 0;
+
   struct KernelConfig {
     static constexpr std::uint32_t GRID_SIZE = (2 * N) / 16;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
   };
 };
 
-// Pre-defined dimensions for Qwen3-Coder-30B-A3B (TP=1)
-// w13: [128, 1536, 2048] → N=768 (half of fused gate+up), K=2048
-// w2:  [128, 2048, 768]
+// Pre-defined dimensions for Qwen3.5-30B-A3B FP8 (TP=1)
+// Reference: Qwen/Qwen3.5-30B-A3B-FP8 config
+//   num_experts = 256, num_experts_per_tok = 8
+//   hidden_size (K) = 2048, moe_intermediate_size (N) = 512
+// w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
+// w2:  [256, 2048, 512]
 //
-// Note: the default GRID_SIZE formula (2*N/16 = 96) does not evenly divide
-// HIDDEN_STATES=2048, so we override KernelConfig with GRID_SIZE=128 which
-// gives W_DOWN_TILE = 2048/128 = 16 (satisfies the % 8 == 0 constraint).
-struct Dims_BS8_E128_Qwen3Coder {
+// GRID_SIZE must satisfy both projection stages simultaneously:
+//   Up-proj:   GRID_SIZE = 2*N / W_UP_TILE = 1024 / 16 = 64
+//   Down-proj: W_DOWN_TILE = K / GRID_SIZE = 2048 / 64 = 32  (% 8 == 0 ✓)
+// Using GRID_SIZE > 64 would cause blocks beyond 63 to index past the
+// 2*N weight rows in the up-projection, producing OOB reads.
+struct Dims_BS8_E256_Qwen3_5_30B_A3B {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 768;
+  static constexpr uint32_t N = 512;
   static constexpr uint32_t BS = 8;
   static constexpr uint32_t M = 8;
-  static constexpr uint32_t NUM_EXPERTS = 128;
+  static constexpr uint32_t NUM_EXPERTS = 256;
   struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t GRID_SIZE = 64;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
   };
 };
 
-struct Dims_BS64_E128_Qwen3Coder {
+struct Dims_BS64_E256_Qwen3_5_30B_A3B {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 768;
+  static constexpr uint32_t N = 512;
   static constexpr uint32_t BS = 64;
   static constexpr uint32_t M = 64;
-  static constexpr uint32_t NUM_EXPERTS = 128;
+  static constexpr uint32_t NUM_EXPERTS = 256;
   struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t GRID_SIZE = 64;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+  };
+};
+
+// Pre-defined dimensions for Qwen3.5-35B FP8 block-wise (128×128) quantization
+// Reference: Qwen/Qwen3.5-35B config (hypothetical)
+//   num_experts = 256, num_experts_per_tok = 8
+//   hidden_size (K) = 2048, moe_intermediate_size (N) = 512
+// w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
+// w2:  [256, 2048, 512]
+//
+// Block-wise quantization: each (128, 128) block of the weight matrix
+// has its own FP8 scale.
+//   Up-proj scales:   [E, ceil(2*N/128), ceil(K/128)] = [E, 8, 16]
+//   Down-proj scales: [E, ceil(K/128), ceil(N/128)]   = [E, 16, 4]
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8 {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  // Derived scale dimensions
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 64;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+  };
+};
+
+struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 64;
+  static constexpr uint32_t M = 64;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 64;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
   };
 };
@@ -85,15 +161,20 @@ constexpr size_t get_moe_max_scratchpad_size();
  * @brief W8A8 MoE kernel with configurable top-K routing, scoring function,
  *        and renormalization.
  *
- * Designed for Qwen3-Coder FP8 (softmax scoring, top_k=8, 128 experts).
+ * Designed for Qwen3.5-30B-A3B FP8 (softmax scoring, top_k=8, 256 experts).
+ * Also supports block-wise (128×128) FP8 quantization for Qwen3.5-35B.
  *
  * @param [in] activations_in Input activations. Shape: [M, K]
  * @param [in] token_count Number of active tokens
  * @param [in] router_logits Router logits. Shape: [M, E]
  * @param [in] expert_weights_up Up-projection weights. Shape: [E, 2*N, K]
- * @param [in] expert_scales_up Up-projection scales. Shape: [E, 2*N]
+ * @param [in] expert_scales_up Up-projection scales.
+ *             Per-channel: Shape [E, 2*N]
+ *             Block-wise:  Shape [E, ceil(2*N/128), ceil(K/128)]
  * @param [in] expert_weights_down Down-projection weights. Shape: [E, K, N]
- * @param [in] expert_scales_down Down-projection scales. Shape: [E, K]
+ * @param [in] expert_scales_down Down-projection scales.
+ *             Per-channel: Shape [E, K]
+ *             Block-wise:  Shape [E, ceil(K/128), ceil(N/128)]
  * @param [out] activations_out Output buffer. Shape: [M, K]
  * @param [out] scratchpad Global memory for temporary data
  * @param [in] scratchpad_size Size of the scratchpad
