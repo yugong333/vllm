@@ -87,43 +87,15 @@
     CUDA_CHECK(cudaFuncSetAttribute(                                           \
         moe_kernel_topk<dims>, cudaFuncAttributeMaxDynamicSharedMemorySize,    \
         shmem_size));                                                          \
-    /* One-time diagnostic: compute and print occupancy + shmem so that a      \
-       cooperative-launch failure is easy to diagnose. */                      \
-    {                                                                          \
-      static bool _diag_printed = false;                                       \
-      if (!_diag_printed) {                                                    \
-        int max_blocks_per_sm = 0;                                             \
-        cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(                \
-            &max_blocks_per_sm, moe_kernel_topk<dims>,                         \
-            dims::KernelConfig::BLOCK_SIZE, shmem_size, cudaOccupancyDefault); \
-        cudaFuncAttributes fa;                                                 \
-        cudaFuncGetAttributes(&fa, moe_kernel_topk<dims>);                     \
-        int sm_count = 0;                                                      \
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);  \
-        int smem_opt_in = 0;                                                   \
-        cudaDeviceGetAttribute(&smem_opt_in,                                   \
-                               cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);    \
-        fprintf(stderr,                                                        \
-                "[monokernel] %s: grid=%u block=%u shmem=%zu bytes "           \
-                "regs/thread=%d static_shmem=%zu max_blocks_per_sm=%d "        \
-                "sms=%d coop_max=%d opt-in_shmem=%d\n",                        \
-                #name, dims::KernelConfig::GRID_SIZE,                          \
-                dims::KernelConfig::BLOCK_SIZE, shmem_size, fa.numRegs,        \
-                fa.sharedSizeBytes, max_blocks_per_sm, sm_count,               \
-                max_blocks_per_sm * sm_count, smem_opt_in);                    \
-        _diag_printed = true;                                                  \
-      }                                                                        \
-    }                                                                          \
     CUDA_CHECK(cudaLaunchCooperativeKernel(                                    \
         moe_kernel_topk<dims>, dims::KernelConfig::GRID_SIZE,                  \
         dims::KernelConfig::BLOCK_SIZE, kernel_args, shmem_size, stream));     \
   }
 
-// Qwen3.5-35B FP8 block-wise (128×128) quantization (E=256, K=2048, N=512,
-// TP=1)
+// Qwen3-Coder-30B-A3B (E=128, K=2048, N=768, TP=1)
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
-    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_impl,
-    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8)
+    moe_monokernel_topk_BS8_E128_Qwen3Coder_impl,
+    moe_monokernel::Dims_BS8_E128_Qwen3Coder)
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
-    moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
-    moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
+    moe_monokernel_topk_BS64_E128_Qwen3Coder_impl,
+    moe_monokernel::Dims_BS64_E128_Qwen3Coder)

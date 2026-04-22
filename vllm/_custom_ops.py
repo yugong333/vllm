@@ -278,12 +278,23 @@ def moe_monokernel_topk(
 
     assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
     assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
-    assert expert_scales_up.size() == (E, N, 1), f"size is: {expert_scales_up.size()}"
     assert expert_weights_down.size() == (E, K, N // 2), (
         f"size is: {expert_weights_down.size()}"
     )
-    assert expert_scales_down.size() == (E, K, 1), (
-        f"size is: {expert_scales_down.size()}"
+
+    # Scale shapes: block-wise (128×128) → [E, ceil(rows/128), ceil(cols/128)]
+    N_half = N // 2
+    up_scale_rows = (N + 127) // 128  # ceil(2*N_half / 128)
+    up_scale_cols = (K + 127) // 128  # ceil(K / 128)
+    down_scale_rows = (K + 127) // 128  # ceil(K / 128)
+    down_scale_cols = (N_half + 127) // 128  # ceil(N_half / 128)
+    assert expert_scales_up.size() == (E, up_scale_rows, up_scale_cols), (
+        f"expert_scales_up size is: {expert_scales_up.size()}, "
+        f"expected: ({E}, {up_scale_rows}, {up_scale_cols})"
+    )
+    assert expert_scales_down.size() == (E, down_scale_rows, down_scale_cols), (
+        f"expert_scales_down size is: {expert_scales_down.size()}, "
+        f"expected: ({E}, {down_scale_rows}, {down_scale_cols})"
     )
 
     assert activations_in.dtype is torch.bfloat16
@@ -298,13 +309,14 @@ def moe_monokernel_topk(
     # Allocate output tensor (separate from input for top-K accumulation)
     activations_out = torch.zeros_like(activations_in)
 
-    # Dispatch to Qwen3-Coder-30B-A3B kernel (E=128, N=1536, K=2048, TP=1)
-    assert E == 128 and N == 1536 and K == 2048, (
+    # Dispatch to Qwen3.5-35B FP8 block-wise kernel (E=256, N=1024, K=2048, TP=1)
+    # N here is the fused gate+up dim = 2 * moe_intermediate_size (2*512=1024).
+    assert E == 256 and N == 1024 and K == 2048, (
         f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
-        "Supported: E=128 N=1536 K=2048 (Qwen3-Coder)."
+        "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
     if M <= 8:
-        torch.ops._moe_C.moe_monokernel_topk_BS8_E128_Qwen3Coder(
+        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8(
             activations_in,
             router_logits,
             expert_weights_up,
@@ -318,7 +330,7 @@ def moe_monokernel_topk(
             renormalize,
         )
     else:
-        torch.ops._moe_C.moe_monokernel_topk_BS64_E128_Qwen3Coder(
+        torch.ops._moe_C.moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(
             activations_in,
             router_logits,
             expert_weights_up,

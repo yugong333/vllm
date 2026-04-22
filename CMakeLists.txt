@@ -1152,6 +1152,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       CUDA_ARCHS "9.0a")
     list(APPEND VLLM_MOE_EXT_SRC "${SRCS}")
     message(STATUS "Building optimized MoE kernel for archs: 9.0a")
+
+    # moe_wrapper.cu #includes src/moe.cu which in turn #includes all other
+    # .cu/.h files in src/.  CMake's dependency scanner doesn't always detect
+    # #included .cu files, so we list them explicitly here.
+    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu" APPEND PROPERTY
+      OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_up_projection.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_down_projection.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_scale_inputs.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_routing.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_prepare.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_internal.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_interface.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
+    )
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "

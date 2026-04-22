@@ -989,9 +989,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight.size(1),
             x.size(1),
         )
-        # logger.info("apply_monolithic dims: E=%d, M=%d, N=%d, K=%d", E, M, N, K)
+        logger.info("apply_monolithic dims: E=%d, M=%d, N=%d, K=%d", E, M, N, K)
         # if (E == 16 or E == 128) and M <= 64 and K == 5120 and N == 2048:
-        if (E == 16 or E == 128) and M <= 64 and K == 2048 and N == 1536:
+        if (E == 256) and M <= 64 and K == 2048 and N == 1024:
             if self.moe_monokernel_scratchpad.device != x.device:
                 self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(
                     x.device
@@ -1005,7 +1005,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
             if top_k > 1:
                 # Use the top-K monokernel variant
-                # logger.info("using topK varient monokernel")
+                logger.info("using topK variant monokernel")
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
                     router_logits,

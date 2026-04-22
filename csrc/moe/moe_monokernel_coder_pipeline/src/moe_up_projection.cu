@@ -279,6 +279,68 @@ __device__ inline void moe_up_reduction(
 }
 
 /**
+ * @brief Performs the MMA reduction and sigmoid step of up-projection for
+ * 'Tiny' kernels.
+ *
+ * This device function sums up the partial scalar products created by all
+ * warps, applied the respective weight and token activation scales, calculates
+ * the sigmoid, and finally stores the results in Global Memory.  The tile to be
+ * written is implicitly determined by the @c blockIdx.
+ *
+ * @note This function is supposed to be called by warps 0 and 1 only.
+ *
+ * @param partial_result Array of MMA results from all warps of shape [WARPS, 4,
+ * THREADS] in row-major order. Individual elements are in FP32 format.
+ * @param ws0 First weight scale for the respective expert.
+ * @param ws1 Second weight scale for the respective expert.
+ * @param ts Token activation scale.
+ * @param row Row to store the scalar products for the token.
+ * @param result Pointer to the output array of shape [BS, N] in row-major
+ * order. Individual elements are in FP32 format.
+ */
+template <typename Dims, std::size_t Rows, std::size_t Cols>
+__device__ inline void moe_up_reduction_tiny(
+    const float (&partial_result)[Rows][Cols], float ws0, float ws1, float ts,
+    unsigned row,
+  #ifdef DEBUG_MOE
+    float* __restrict__ gemm1,
+  #endif
+    T_element* __restrict__ result) {
+  // position within the block
+  using CoreDims = MoECoreDims<Dims>;
+  const unsigned thread = get_thread<Dims>();
+  const unsigned warp = get_calc_warp<Dims>();
+
+  // starting row to process
+  const unsigned base_row = blockIdx.x * CoreDims::W_UP_TILE / 2;
+
+  // combine results, reduce dependency chain on dX
+  float d0 = partial_result[0][thread + warp * 32 + 0] +
+             partial_result[1][thread + warp * 32 + 0];
+  float d2 = partial_result[0][thread + warp * 32 + 64] +
+             partial_result[1][thread + warp * 32 + 64];
+
+  for (unsigned i = 2; i < CoreDims::CALC_WARP_COUNT; i += 2) {
+    d0 += partial_result[i][thread + warp * 32 + 0] +
+          partial_result[i + 1][thread + warp * 32 + 0];
+    d2 += partial_result[i][thread + warp * 32 + 64] +
+          partial_result[i + 1][thread + warp * 32 + 64];
+  }
+
+  // for debugging purposes
+  #ifdef DEBUG_MOE
+  gemm1[row * 2 * Dims::N + (thread / 4) + base_row + 0] = d0 * ts * ws0;
+  gemm1[row * 2 * Dims::N + (thread / 4) + base_row + Dims::N] = d2 * ts * ws1;
+  #endif
+
+  // write to temporary buffer
+  float x0 = d0 * ts * ws0;
+  float w0 = d2 * ts * ws1;
+  float sig0 = (w0 * x0) / (1 + expf(-x0));
+  result[row * Dims::N + (thread / 4) + base_row] = sig0;
+}
+
+/**
  * @brief Standard kernel for the first GEMM ("up projection"), combined with a
  * sigmoid reduction.
  *
@@ -357,9 +419,13 @@ __device__ inline void moe_up_projection_topk(
   for (std::uint32_t e = 0; e < expert_count; ++e) {
     const ExpertRef& expert = shmem->experts[e];
     std::uint32_t id = expert.id;
+    const S_element* scales = expert_scales_up + id * 2 * Dims::N;
     unsigned int a_rows = expert.last_token - expert.first_token;
     // temp is indexed by sorted position (first_token..last_token)
     T_element* temp = &spec->temp_fp32[expert.first_token * Dims::N];
+
+    float ws0 = scales[base_row + thread / 4];
+    float ws1 = scales[base_row + thread / 4 + Dims::N];
 
     for (unsigned a_row = 0; a_row < a_rows; a_row += CoreDims::A_TILE) {
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
@@ -392,12 +458,9 @@ __device__ inline void moe_up_projection_topk(
         }
         pipe.producer_commit();
       } else {
-        // ── First half-K pass: columns [0, K/2) ──
-        // Block-wise: accumulate per-MMA-iteration, apply block scale each time
         for (unsigned base_col = warp * CoreDims::K_TILE;
              base_col < Dims::HIDDEN_STATES / 2;
              base_col += CoreDims::BLOCK_STRIDE) {
-          float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
           unsigned row = thread / 4;
           unsigned col = 4 * (thread % 4);
           __nv_fp8x4_e4m3 w0 =
@@ -418,19 +481,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, a02, a13, 0.f, 0.f,
-                      0.f, 0.f);
-
-          unsigned full_k_col = base_col;  // pass 1: columns [0, K/2)
-          float bws0 = get_up_block_scale<Dims>(
-              expert_scales_up, id, base_row + thread / 4, full_k_col);
-          float bws1 = get_up_block_scale<Dims>(expert_scales_up, id,
-                                                base_row + thread / 4 + Dims::N,
-                                                full_k_col);
-          d0 += md0 * bws0;
-          d1 += md1 * bws0;
-          d2 += md2 * bws1;
-          d3 += md3 * bws1;
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
       }
 
@@ -464,11 +515,9 @@ __device__ inline void moe_up_projection_topk(
         }
         pipe.producer_commit();
       } else {
-        // ── Second half-K pass: columns [K/2, K) ──
         for (unsigned base_col = warp * CoreDims::K_TILE;
              base_col < Dims::HIDDEN_STATES / 2;
              base_col += CoreDims::BLOCK_STRIDE) {
-          float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
           unsigned row = thread / 4;
           unsigned col = 4 * (thread % 4);
           __nv_fp8x4_e4m3 w0 =
@@ -489,19 +538,7 @@ __device__ inline void moe_up_projection_topk(
           __nv_fp8x4_e4m3 a13 =
               *(__nv_fp8x4_e4m3*)(&shm->a[t_index_read][row][rotate_col_32(
                   base_col + col + 16, row)]);
-          mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, a02, a13, 0.f, 0.f,
-                      0.f, 0.f);
-
-          unsigned full_k_col = base_col + Dims::HIDDEN_STATES / 2;
-          float bws0 = get_up_block_scale<Dims>(
-              expert_scales_up, id, base_row + thread / 4, full_k_col);
-          float bws1 = get_up_block_scale<Dims>(expert_scales_up, id,
-                                                base_row + thread / 4 + Dims::N,
-                                                full_k_col);
-          d0 += md0 * bws0;
-          d1 += md1 * bws0;
-          d2 += md2 * bws1;
-          d3 += md3 * bws1;
+          mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
         }
         shm->partial_result[warp][thread + 0] = d0;
         shm->partial_result[warp][thread + 32] = d1;
@@ -528,8 +565,7 @@ __device__ inline void moe_up_projection_topk(
                 ? shmem->path.bs64.token_weights[expert.first_token + row1]
                 : 0.f;
 
-        // Block-wise: weight scales already applied per-iteration.
-        moe_up_reduction<Dims>(shm->partial_result, d0, d1, d2, d3, 1.0f, 1.0f,
+        moe_up_reduction<Dims>(shm->partial_result, d0, d1, d2, d3, ws0, ws1,
                                ts0, ts1, row0 < a_rows, row1 < a_rows, row0,
                                row1,
   #ifdef DEBUG_MOE
@@ -594,6 +630,14 @@ __device__ inline void moe_up_projection_BS8_allexperts(
 
   for (std::uint32_t e = 0; e < expert_count; ++e) {
     const std::uint32_t id = shmem->experts[e].id;
+    const S_element* scales_up = expert_scales_up + id * 2 * Dims::N;
+
+    float ws0 = (base_row_up + thread / 4 < Dims::N)
+                    ? scales_up[base_row_up + thread / 4]
+                    : 0.f;
+    float ws1 = (base_row_up + thread / 4 < Dims::N)
+                    ? scales_up[base_row_up + thread / 4 + Dims::N]
+                    : 0.f;
 
     // Wait for current expert's weights
     cuda::pipeline_consumer_wait_prior<0>(pipe);
@@ -610,12 +654,11 @@ __device__ inline void moe_up_projection_BS8_allexperts(
       }
     } else {
       // ── MMA: a.up × w[w_cur].up ──────────────────────────────────────
-      // Block-wise: per-iteration scale application
+
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
       for (unsigned bc = warp * CoreDims::K_TILE, i = 0;
            i < Dims::HIDDEN_STATES / CoreDims::BLOCK_STRIDE;
            ++i, bc += CoreDims::BLOCK_STRIDE) {
-        float md0 = 0.f, md1 = 0.f, md2 = 0.f, md3 = 0.f;
         unsigned r = thread / 4, c = 4 * (thread % 4);
         __nv_fp8x4_e4m3 w0 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
                                   .up[r + 0][rotate_col_32(bc + c + 0, r)];
@@ -625,29 +668,13 @@ __device__ inline void moe_up_projection_BS8_allexperts(
                                   .up[r + 0][rotate_col_32(bc + c + 16, r)];
         __nv_fp8x4_e4m3 w3 = *(__nv_fp8x4_e4m3*)&shm->w[w_cur]
                                   .up[r + 8][rotate_col_32(bc + c + 16, r)];
+        // Activations stored with rotate_col_32 swizzle (same as weights)
         __nv_fp8x4_e4m3 a02 =
             *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 0, r)];
         __nv_fp8x4_e4m3 a13 =
             *(__nv_fp8x4_e4m3*)&shm->a.up[r][rotate_col_32(bc + c + 16, r)];
 
-        mma_fp8_fp8(md0, md1, md2, md3, w0, w1, w2, w3, a02, a13, 0.f, 0.f, 0.f,
-                    0.f);
-
-        unsigned full_k_col = bc;
-        float bws0 =
-            (base_row_up + thread / 4 < Dims::N)
-                ? get_up_block_scale<Dims>(expert_scales_up, id,
-                                           base_row_up + thread / 4, full_k_col)
-                : 0.f;
-        float bws1 = (base_row_up + thread / 4 < Dims::N)
-                         ? get_up_block_scale<Dims>(
-                               expert_scales_up, id,
-                               base_row_up + thread / 4 + Dims::N, full_k_col)
-                         : 0.f;
-        d0 += md0 * bws0;
-        d1 += md1 * bws1;
-        d2 += md2 * bws0;
-        d3 += md3 * bws1;
+        mma_fp8_fp8(d0, d1, d2, d3, w0, w1, w2, w3, a02, a13, d0, d1, d2, d3);
       }
 
       // Swap d1↔d2 for gate/up layout
@@ -672,7 +699,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
 
       if (row < batch_size) {
         for (uint32_t k = 0; k < top_k; k++) {
-          if (shmem->topk_ids_flat[row * MAX_TOPK + k] == (uint16_t)id) {
+          if (shmem->topk_ids_flat[row * MAX_TOPK + k] == (uint8_t)id) {
             store = true;
             rw = shmem->topk_weights_flat[row * MAX_TOPK + k];
             virtual_row = row * top_k + k;
@@ -693,8 +720,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
           d2 += shm->partial_result.up[i][thread + warp * 64 + 32] +
                 shm->partial_result.up[i + 1][thread + warp * 64 + 32];
         }
-        // Block-wise: weight scales already applied per-iteration in MMA loop
-        float x0 = d0 * as, w0v = d2 * as;
+        float x0 = d0 * as * ws0, w0v = d2 * as * ws1;
         if ((thread / 4) + base_row_up < Dims::N) {
           float val = rw * (w0v * x0) / (1.f + expf(-x0));
           spec->temp_bf16[virtual_row * Dims::N + (thread / 4) + base_row_up] =

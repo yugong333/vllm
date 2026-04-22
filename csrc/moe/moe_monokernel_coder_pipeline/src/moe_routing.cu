@@ -106,7 +106,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
       float winning_weight = __shfl_sync(0xFFFFFFFFU, max_val, winner);
 
       if (tid == winner) {
-        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)max_expert;
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint8_t)max_expert;
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
       }
 
@@ -144,111 +144,41 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
   static_assert(Dims::BS <= 64, "Dispatch to incorrect implementation");
 
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-  // Process experts in fixed-size chunks to avoid a per-thread
-  // float[NUM_EXPERTS] array that kills register pressure / occupancy
-  // when NUM_EXPERTS is large (e.g. 256).
-  constexpr uint32_t CHUNK = 32;
   uint32_t thread_idx = threadIdx.x;
 
   for (uint32_t tokidx = thread_idx; tokidx < num_tokens; tokidx += 256) {
-    const __nv_bfloat16* logits_row =
-        router_logits + tokidx * Dims::NUM_EXPERTS;
+    float scores[Dims::NUM_EXPERTS];
+    for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++)
+      scores[e] = (float)router_logits[tokidx * Dims::NUM_EXPERTS + e];
 
     if (scoring_func == ScoringFunc::SOFTMAX) {
-      // ── Pass 1: streaming max over all experts ──
       float mx = -FLT_MAX;
-      for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        for (uint32_t e = base; e < end; e++)
-          mx = fmaxf(mx, (float)logits_row[e]);
+      for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++)
+        mx = fmaxf(mx, scores[e]);
+      float s = 0.0f;
+      for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++) {
+        scores[e] = __expf(scores[e] - mx);
+        s += scores[e];
       }
-
-      // ── Pass 2: streaming sum of exp(x - mx) ──
-      float sum_exp = 0.0f;
-      for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        for (uint32_t e = base; e < end; e++)
-          sum_exp += __expf((float)logits_row[e] - mx);
-      }
-      float inv_sum = 1.0f / sum_exp;
-
-      // ── Pass 3: chunked top-k selection on softmax scores ──
-      float topk_vals[MAX_TOPK];
-      uint32_t topk_ids[MAX_TOPK];
-      for (uint32_t k = 0; k < top_k; k++) {
-        topk_vals[k] = -FLT_MAX;
-        topk_ids[k] = 0;
-      }
-
-      for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        float chunk_scores[CHUNK];
-        for (uint32_t i = 0; i < end - base; i++)
-          chunk_scores[i] = __expf((float)logits_row[base + i] - mx) * inv_sum;
-
-        for (uint32_t i = 0; i < end - base; i++) {
-          // Find the current minimum in the top-k heap.
-          float min_val = topk_vals[0];
-          uint32_t min_idx = 0;
-          for (uint32_t k = 1; k < top_k; k++) {
-            if (topk_vals[k] < min_val) {
-              min_val = topk_vals[k];
-              min_idx = k;
-            }
-          }
-          if (chunk_scores[i] > min_val) {
-            topk_vals[min_idx] = chunk_scores[i];
-            topk_ids[min_idx] = base + i;
-          }
-        }
-      }
-
-      for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[tokidx * MAX_TOPK + k] = (uint16_t)topk_ids[k];
-        shmem->topk_weights_flat[tokidx * MAX_TOPK + k] = topk_vals[k];
-      }
-
+      float inv = 1.0f / s;
+      for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++) scores[e] *= inv;
     } else {
-      // ── Sigmoid scoring: chunked top-k ──
-      float topk_vals[MAX_TOPK];
-      uint32_t topk_ids[MAX_TOPK];
-      for (uint32_t k = 0; k < top_k; k++) {
-        topk_vals[k] = -FLT_MAX;
-        topk_ids[k] = 0;
-      }
+      for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++)
+        scores[e] = 1.0f / (1.0f + __expf(-scores[e]));
+    }
 
-      for (uint32_t base = 0; base < Dims::NUM_EXPERTS; base += CHUNK) {
-        uint32_t end = (base + CHUNK < Dims::NUM_EXPERTS) ? base + CHUNK
-                                                          : Dims::NUM_EXPERTS;
-        float chunk_scores[CHUNK];
-        for (uint32_t i = 0; i < end - base; i++) {
-          float v = (float)logits_row[base + i];
-          chunk_scores[i] = 1.0f / (1.0f + __expf(-v));
-        }
-
-        for (uint32_t i = 0; i < end - base; i++) {
-          float min_val = topk_vals[0];
-          uint32_t min_idx = 0;
-          for (uint32_t k = 1; k < top_k; k++) {
-            if (topk_vals[k] < min_val) {
-              min_val = topk_vals[k];
-              min_idx = k;
-            }
-          }
-          if (chunk_scores[i] > min_val) {
-            topk_vals[min_idx] = chunk_scores[i];
-            topk_ids[min_idx] = base + i;
-          }
+    for (uint32_t k = 0; k < top_k; k++) {
+      float best = -FLT_MAX;
+      uint32_t best_e = 0;
+      for (uint32_t e = 0; e < Dims::NUM_EXPERTS; e++) {
+        if (scores[e] > best) {
+          best = scores[e];
+          best_e = e;
         }
       }
-
-      for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[tokidx * MAX_TOPK + k] = (uint16_t)topk_ids[k];
-        shmem->topk_weights_flat[tokidx * MAX_TOPK + k] = topk_vals[k];
-      }
+      shmem->topk_ids_flat[tokidx * MAX_TOPK + k] = (uint8_t)best_e;
+      shmem->topk_weights_flat[tokidx * MAX_TOPK + k] = best;
+      scores[best_e] = -FLT_MAX;
     }
 
     if (renormalize) {
@@ -287,28 +217,20 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
   // Build a bitset of all unique expert ids across all tokens and K slots.
-  // Use two __uint128_t words to cover up to 256 experts.
-  __uint128_t expert_bitset_lo = 0;  // experts 0–127
-  __uint128_t expert_bitset_hi = 0;  // experts 128–255
+  __uint128_t expert_bitset = 0;
   for (uint32_t t = 0; t < batch_size; t++)
     for (uint32_t k = 0; k < top_k; k++) {
       uint32_t eid = shm->topk_ids_flat[t * MAX_TOPK + k];
-      if (eid != 0xFFFF) {
-        if (eid < 128)
-          expert_bitset_lo |= __uint128_t(1) << eid;
-        else
-          expert_bitset_hi |= __uint128_t(1) << (eid - 128);
-      }
+      if (eid != 0xFF) expert_bitset |= __uint128_t(1) << eid;
     }
 
-  // Extract unique expert ids in ascending order from the low half first,
-  // then the high half.
+  uint64_t b0 = (uint64_t)(expert_bitset & 0xFFFFFFFFFFFFFFFFULL);
+  uint64_t b1 = (uint64_t)(expert_bitset >> 64);
+
+  // Extract unique expert ids in ascending order, fill experts[] and
+  // build the packed uint64 (one id per byte) simultaneously.
   uint32_t ec = 0;
   uint64_t packed = 0;
-
-  // Process low 128 bits (experts 0–127)
-  uint64_t b0 = (uint64_t)(expert_bitset_lo & 0xFFFFFFFFFFFFFFFFULL);
-  uint64_t b1 = (uint64_t)(expert_bitset_lo >> 64);
   uint32_t add = 0;
   while (b0 || b1) {
     if (b0 == 0) {
@@ -321,26 +243,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     shm->experts[ec].id = eid;
     shm->experts[ec].first_token = 0;
     shm->experts[ec].last_token = 0;
-    if (ec < 8) packed |= (uint64_t)eid << (ec * 8);
-    ec++;
-  }
-
-  // Process high 128 bits (experts 128–255)
-  b0 = (uint64_t)(expert_bitset_hi & 0xFFFFFFFFFFFFFFFFULL);
-  b1 = (uint64_t)(expert_bitset_hi >> 64);
-  add = 128;
-  while (b0 || b1) {
-    if (b0 == 0) {
-      b0 = b1;
-      b1 = 0;
-      add = 128 + 64;
-    }
-    uint32_t eid = __ffsll(b0) - 1 + add;
-    b0 &= b0 - 1;
-    shm->experts[ec].id = eid;
-    shm->experts[ec].first_token = 0;
-    shm->experts[ec].last_token = 0;
-    if (ec < 8) packed |= (uint64_t)eid << (ec * 8);
+    packed |= (uint64_t)eid << (ec * 8);
     ec++;
   }
   shm->path.bs8.expert_ids = packed;
