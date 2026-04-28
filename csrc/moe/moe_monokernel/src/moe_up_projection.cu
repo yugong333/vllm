@@ -187,6 +187,47 @@ __device__ inline void moe_request_up_expert(
 }
 
 /**
+ * @brief Load this block's slice of block-wise up-projection scales into SHM.
+ *
+ * Each CUDA block owns 8 consecutive weight rows (base_row_up..base_row_up+7)
+ * in the low half of the [2*N, K] weight matrix, plus the corresponding 8
+ * rows in the upper half (base_row_up + N..+N+7). With BLOCK_SCALE_ROW=128
+ * and base_row_up a multiple of 8, all 8 rows of each half fall within a
+ * single 128-row block. So this block needs only 2 row-slices of scales.
+ *
+ * Layout in SHM: dest[rb_local * UP_SCALE_COLS + kb] where
+ *   rb_local = 0 → lower-half row-block (row rb_lo)
+ *   rb_local = 1 → upper-half row-block (row rb_hi)
+ *
+ * This kernel targets block-wise quantization only (Qwen3.5).
+ * Called by prefetch warps.
+ */
+template <typename Dims>
+__device__ inline void moe_request_up_scale(
+    const S_element* __restrict__ expert_scales_up, std::uint32_t id,
+    S_element* __restrict__ dest) {
+  using CoreDims = MoECoreDims<Dims>;
+  constexpr uint32_t COLS = Dims::UP_SCALE_COLS;  // e.g. 16 for K=2048
+  constexpr uint32_t TILE = 2 * COLS;
+  const unsigned thread = get_thread<Dims>();
+  const unsigned warp = get_prefetch_warp<Dims>();
+  const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
+
+  // Only the first prefetch warp loads the scales — 32 scalars total for
+  // Qwen3.5 (2×16). Synchronous shared-memory writes are fine; we don't
+  // need async copy for 128 bytes.
+  if (warp == 0 && thread < TILE) {
+    uint32_t rb_local = thread / COLS;  // 0 → low half, 1 → upper half
+    uint32_t kb = thread % COLS;
+    uint32_t row = base_row_up + rb_local * Dims::N;
+    uint32_t rb_global = row / Dims::BLOCK_SCALE_ROW;
+    dest[thread] =
+        expert_scales_up[id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
+                         rb_global * Dims::UP_SCALE_COLS + kb];
+  }
+}
+
+/**
  * @brief Performs the MMA result reduction and sigmoid step of up-projection.
  *
  * This device function sums up the partial scalar products created by all
@@ -610,14 +651,31 @@ __device__ inline void moe_up_projection_BS8_allexperts(
             expert_weights_up, shmem->experts[e + 1].id, shm->w[w_cur ^ 1].up,
             pipe);
         pipe.producer_commit();
+        // Load next expert's scale slice into the other slot.
+        moe_request_up_scale<Dims>(expert_scales_up, shmem->experts[e + 1].id,
+                                   shm->up_scale[w_cur ^ 1]);
       }
     } else {
       // ── MMA: a.up × w[w_cur].up ──────────────────────────────────────
-      // Block-wise: per-iteration weight and activation scale application.
-      // Activation block scale: shmem->act_scale[tok][k_col / 128]
+      // Block-wise quantization (Qwen3.5): per-iteration weight + activation
+      // scale application. Weight scales are pre-loaded into
+      // shm->up_scale[w_cur] by the prefetch path; activation scales are in
+      // shmem->act_scale[tok][k_col / 128].
       constexpr uint32_t ACT_BLOCK = 128;
       uint32_t tok_02 = (thread % 4) * 2;      // token for d0/d1
       uint32_t tok_13 = (thread % 4) * 2 + 1;  // token for d2/d3
+
+      // Loop-invariant: whether this block's 8 weight rows fall inside
+      // the valid up-projection row range [0, N). Out-of-range blocks
+      // still do the MMA but multiply by zero scales so they don't
+      // contribute.
+      const bool in_range = (base_row_up + thread / 4 < Dims::N);
+
+      // Weight-scale pointers for this expert:
+      //   slot 0 = lower-half row-block (rows [base_row_up .. +7])
+      //   slot 1 = upper-half row-block (rows [base_row_up + N .. +N+7])
+      const S_element* up_scale_lo = &shm->up_scale[w_cur][0];
+      const S_element* up_scale_hi = &shm->up_scale[w_cur][Dims::UP_SCALE_COLS];
 
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
       for (unsigned bc = warp * CoreDims::K_TILE, i = 0;
@@ -642,16 +700,9 @@ __device__ inline void moe_up_projection_BS8_allexperts(
                     0.f);
 
         unsigned full_k_col = bc;
-        float bws0 =
-            (base_row_up + thread / 4 < Dims::N)
-                ? get_up_block_scale<Dims>(expert_scales_up, id,
-                                           base_row_up + thread / 4, full_k_col)
-                : 0.f;
-        float bws1 = (base_row_up + thread / 4 < Dims::N)
-                         ? get_up_block_scale<Dims>(
-                               expert_scales_up, id,
-                               base_row_up + thread / 4 + Dims::N, full_k_col)
-                         : 0.f;
+        uint32_t kb = full_k_col / Dims::BLOCK_SCALE_COL;
+        float bws0 = in_range ? up_scale_lo[kb] : 0.f;
+        float bws1 = in_range ? up_scale_hi[kb] : 0.f;
         // Per-token block-wise activation scale
         float as_02 = shmem->act_scale[tok_02][full_k_col / ACT_BLOCK];
         float as_13 = shmem->act_scale[tok_13][full_k_col / ACT_BLOCK];
