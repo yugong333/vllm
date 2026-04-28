@@ -12,7 +12,7 @@
 namespace moe_monokernel {
 
 using T_element =
-    float;  //< Type of GEMM1 (up projection) result as well as sigmoid
+    float;  //< Type of fp32 accumulators (partial results, out_accum)
 using OpaqueElement = std::uint32_t;  //< Auxiliary 32-bit type used to generate
                                       // better assembly code in loads
 
@@ -43,7 +43,7 @@ struct MoEGemmSpec {
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
   // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
   // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
-  // writes one row per (token, expert) pair into spec->temp_bf16/temp_fp32.
+  // writes one row per (token, expert) pair into spec->temp_bf16.
   static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
 
   // Number of blocks that contribute columns to the N-wide up-projection
@@ -62,24 +62,29 @@ struct MoEGemmSpec {
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
 
-  // Up-projection SiLU output.  BS8 and BS64 never run simultaneously, so
-  // they share the same storage via a union.
-  //   BS64: fp32 (T_element) — consumed by the BS64 down-projection which
-  //         loads tiles into shared memory via async copy.
-  //   BS8:  bf16 (A_element) — the down-projection reads block-local maxes
-  //         from temp_block_max and does a single-pass bf16→fp8 quantization.
-  union {
-    T_element temp_fp32[TEMP_ROWS * Dims::N];  //< BS64 path (fp32)
-    A_element temp_bf16[TEMP_ROWS * Dims::N];  //< BS8 path (bf16)
-  };
+  // Up-projection SiLU output.  BS8 and BS64 both now use bf16 here:
+  // the BS64 down-projection does a bf16→fp8 quantization with per-token
+  // per-block scales, just like BS8.  Storing this in bf16 (not fp32)
+  // halves the global-memory footprint and async-copy bandwidth.
+  //
+  //   BS8:  the down-projection reads block-local maxes from temp_block_max
+  //         and does a single-pass bf16→fp8 quantization.
+  //   BS64: the down-projection loads tiles into SHM and computes per-token
+  //         block-wise scales on the fly before quantizing.
+  A_element temp_bf16[TEMP_ROWS * Dims::N];
 
   // Per-block absmax of each row in temp_bf16 (BS8 path only).
   // Written by the up-projection epilogue, read by the down-projection
   // to compute the true row max without a separate global-memory pass.
   float temp_block_max[TEMP_ROWS * UP_PROJ_BLOCK_COUNT];
 
-  float act_scale[Dims::BS];  //< per-token activation quantization scale
-                              //(max/448)
+  // Per-token block-wise activation quantization scales.
+  // Block size = 128 along K dimension → K/128 scales per token.
+  // act_scale[tok][blk] = max(|x_tok[blk*128..(blk+1)*128-1]|) / 448
+  static constexpr uint32_t ACT_BLOCK_SIZE = 128;
+  static constexpr uint32_t ACT_SCALE_BLOCKS =
+      (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
+  float act_scale[Dims::BS][ACT_SCALE_BLOCKS];
 };
 
   // Maximum supported dimensions for shared memory and scratchpad allocation
@@ -143,9 +148,13 @@ struct MoE_SHM {
       A_element a[CoreDims::CALC_WARP_COUNT][Dims::HIDDEN_STATES];
     } rescale;
     struct Gemm1Data {
-      // prefetch & process tile in 2 halves
-      AQ_element a[3][CoreDims::A_TILE][CoreDims::K_DIM_HALF_PADDED_A];
-      W_element w[3][CoreDims::W_UP_TILE][CoreDims::K_DIM_HALF_PADDED_W];
+      // Full-K double-buffered activation and weight tiles.
+      // With K <= 2048 (e.g. Qwen3.5 K=2048), the full K activation tile
+      // (A_TILE × K × fp8 = 16 KB) and weight tile (W_UP_TILE × K × fp8 =
+      // 32 KB) both fit comfortably in SHM with double-buffering, removing
+      // the need for the half-K split and its triple-buffer pipeline.
+      AQ_element a[2][CoreDims::A_TILE][CoreDims::K_DIM_PADDED_A];
+      W_element w[2][CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
       T_element partial_result[CoreDims::CALC_WARP_COUNT]
                               [CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
@@ -176,8 +185,10 @@ struct MoE_SHM {
         AQ_element down[2][CoreDims::T_TILE][Dims::N];              // fp8
       } a;
 
-      // Per-row quantization scale for a.down (double-buffered).
-      S_element a_down_scale[2][CoreDims::T_TILE];
+      // Per-row per-block quantization scale for a.down (double-buffered).
+      // Block-wise (1, 128): each row of N elements gets N/128 scales.
+      static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
+      S_element a_down_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
 
       // Double-buffered weight / activation tiles.
       //
@@ -219,10 +230,21 @@ struct MoE_SHM {
     } tiny;
     // BS64 path: holds weight tiles and partial results for down-projection
     // only (up-projection uses Gemm1Data; activations come from
-    // spec->temp_fp32)
+    // spec->temp_bf16)
+    //
+    // Uses the same fp8 MMA approach as BS8: SiLU output is fetched as
+    // bf16, quantized to fp8 with per-token block-wise scales, then
+    // multiplied with fp8 weights via mma_fp8_fp8 (m16n8k32).
     struct Gemm2Data {
-      // prefetch 1 tile ahead
-      T_element t[2][CoreDims::T_TILE][Dims::N];
+      // Double-buffered bf16 staging area for SiLU output (fetched from
+      // global memory, consumed by the quantization step).
+      A_element t_bf16[2][CoreDims::T_TILE][Dims::N];
+      // Double-buffered fp8 quantized activations for MMA.
+      AQ_element t_fp8[2][CoreDims::T_TILE][Dims::N];
+      // Per-token per-block activation scales for the fp8 activations.
+      static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
+      S_element t_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
+
       W_element w[2][CoreDims::W_DOWN_TILE]
                  [Dims::N + CoreDims::PADDING / sizeof(W_element)];
       // Down-projection weight scales (double-buffered).
@@ -241,9 +263,12 @@ struct MoE_SHM {
 
   // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
-  // act_scale[tok] = max(|x_tok|)/448 — computed once per token during
-  // quantization, used inside silu for every expert this token is routed to.
-  S_element act_scale[Dims::BS];
+  // act_scale[tok][blk] = max(|x_tok[blk*128..(blk+1)*128-1]|)/448
+  // Per-token block-wise activation quantization scales for up-projection.
+  static constexpr uint32_t ACT_BLOCK_SIZE = 128;
+  static constexpr uint32_t ACT_SCALE_BLOCKS =
+      (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
+  S_element act_scale[Dims::BS][ACT_SCALE_BLOCKS];
 
   // Unique experts active in this batch, with their sorted token ranges.
   // Filled by prepare_moe_topk_BS8 (BS8) or prepare_moe_topk_BSx_Ey (BS64).
@@ -270,8 +295,7 @@ struct MoE_SHM {
 
     // BS64: sorted virtual-batch index arrays.
     // token_indexes_topk[sorted_pos] = original token index.
-    // token_weights[sorted_pos]      = act_scale (after step 3b) or
-    //                                  routing_weight (before step 3b).
+    // token_weights[sorted_pos]      = routing_weight.
     struct {
       std::uint16_t
           token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];

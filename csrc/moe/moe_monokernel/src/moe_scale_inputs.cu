@@ -17,6 +17,7 @@
   #include "moe_interface.h"
   #include "moe_internal.h"
   #include "ptx_utils.h"
+  #include "moe_debug.h"
 
 namespace moe_monokernel {
 
@@ -159,7 +160,8 @@ __device__ void moe_fetch_activation_async(
 /**
  * @brief Quantizes activation values for a single token (BS8 path).
  *
- * Reads bf16 activations from shared memory, computes act_scale = max(|x|)/448,
+ * Reads bf16 activations from shared memory, computes per-block (1, 128)
+ * activation scales: act_scale[blk] = max(|x[blk*128..(blk+1)*128-1]|) / 448,
  * writes fp8 quantized activations to @p activation_out with a 32-byte swizzle
  * (rotate_col_32) so that MMA loads can use the same rotation pattern as
  * weights, eliminating shared-memory bank conflicts.
@@ -168,24 +170,24 @@ __device__ void moe_fetch_activation_async(
  * aligned)
  * @param [out] activation_out fp8 quantized activations (8-byte aligned)
  * @param [in]  row            Row index within the tile (used for swizzle)
- * @returns act_scale = max(|x|) / 448  (only valid on thread 0 of the warp)
+ * @param [out] act_scales_out Array of per-block scales (K/128 elements)
  */
 template <typename Dims>
-__device__ float moe_scale_activation_BS8(
+__device__ void moe_scale_activation_BS8(
     const A_element* __restrict__ activation_in,
-    AQ_element* __restrict__ activation_out, std::uint32_t row) {
+    AQ_element* __restrict__ activation_out, std::uint32_t row,
+    float* __restrict__ act_scales_out) {
   static_assert(Dims::BS <= 8, "This function is only for use with BS up to 8");
   assert((uintptr_t)activation_in != (uintptr_t)activation_out);
   static_assert(Dims::HIDDEN_STATES * sizeof(A_element) % 16 == 0);
-  // suppose that act dtype is bf16
-  // one row can fit into bfloat16x8
   static_assert(Dims::HIDDEN_STATES % 8 == 0);
-  // make sure the input address is 16 byte aligned for 128 bit loading
-  // make sure the output address is 8 byte aligned for 64 bit saving
   assert((uintptr_t)activation_in % 16 == 0);
   assert((uintptr_t)activation_out % 8 == 0);
 
   using CoreDims = MoECoreDims<Dims>;
+  constexpr uint32_t ACT_BLOCK = 128;
+  constexpr uint32_t NUM_ACT_BLOCKS =
+      (Dims::HIDDEN_STATES + ACT_BLOCK - 1) / ACT_BLOCK;
   const std::uint32_t thread = get_thread<Dims>();
   const std::uint32_t thread_chunk_size =
       sizeof(BF16x8) / sizeof(*activation_in);
@@ -195,44 +197,44 @@ __device__ float moe_scale_activation_BS8(
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
 
-  // find max absolute value across all elements
-  // potential back conflcts for 4 SHM read,
-  // overhead is small because this is one pass and 4-serial only
-  __nv_bfloat162 m0{0.f, 0.f}, m1{0.f, 0.f}, m2{0.f, 0.f}, m3{0.f, 0.f};
-  for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
-       k += chunk_size) {
-    BF16x8 chunk = BF16x8::load(activation_in + k);
-    m0 = __hmax2(m0, __habs2(chunk.first_pair()));
-    m1 = __hmax2(m1, __habs2(chunk.second_pair()));
-    m2 = __hmax2(m2, __habs2(chunk.third_pair()));
-    m3 = __hmax2(m3, __habs2(chunk.fourth_pair()));
+  // Process each 128-element block separately
+  for (uint32_t blk = 0; blk < NUM_ACT_BLOCKS; ++blk) {
+    uint32_t blk_start = blk * ACT_BLOCK;
+    uint32_t blk_end = min(blk_start + ACT_BLOCK, Dims::HIDDEN_STATES);
+
+    // Find max absolute value within this block
+    __nv_bfloat162 m0{0.f, 0.f}, m1{0.f, 0.f}, m2{0.f, 0.f}, m3{0.f, 0.f};
+    for (std::uint32_t k = blk_start + thread * thread_chunk_size; k < blk_end;
+         k += chunk_size) {
+      BF16x8 chunk_val = BF16x8::load(activation_in + k);
+      m0 = __hmax2(m0, __habs2(chunk_val.first_pair()));
+      m1 = __hmax2(m1, __habs2(chunk_val.second_pair()));
+      m2 = __hmax2(m2, __habs2(chunk_val.third_pair()));
+      m3 = __hmax2(m3, __habs2(chunk_val.fourth_pair()));
+    }
+    m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
+    float m = (float)__hmax(m0.x, m0.y);
+    m = warp_reduce_max_float(m);
+    if (m < __FLT_MIN__) m = 1.f;
+
+    float blk_act_scale = m * FP8_MAX_INV;  // = max/448
+    float blk_inv_scale = FP8_MAX / m;      // = 448/max
+
+    // Quantize this block with its own scale
+    for (std::uint32_t k = blk_start + thread * thread_chunk_size; k < blk_end;
+         k += chunk_size) {
+      uint64_t packed = BF16x8::load(activation_in + k).to_fp8x8(blk_inv_scale);
+      uint32_t lo = (uint32_t)(packed);
+      uint32_t hi = (uint32_t)(packed >> 32);
+      uint32_t col0 = rotate_col_32(k, row);
+      uint32_t col1 = rotate_col_32(k + 4, row);
+      *reinterpret_cast<uint32_t*>(&activation_out[col0]) = lo;
+      *reinterpret_cast<uint32_t*>(&activation_out[col1]) = hi;
+    }
+
+    // Store per-block scale
+    if (thread == 0) act_scales_out[blk] = blk_act_scale;
   }
-  m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
-  float m = (float)__hmax(m0.x, m0.y);
-  m = warp_reduce_max_float(m);
-  if (m < __FLT_MIN__) m = 1.f;
-
-  float act_scale = m * FP8_MAX_INV;  // = max/448
-  float inv_scale = FP8_MAX / m;      // = 448/max
-
-  // quantize: x_fp8 = clamp(x_bf16 * inv_scale)
-  // Apply rotate_col_32 swizzle so MMA loads use the same rotation as weights.
-  // Each thread processes 8 fp8 elements (= 2 × 4-element groups).
-  // rotate_col_32 operates at 4-byte (4-element) granularity, so we split
-  // each 8-element chunk into two halves and write them to rotated positions.
-  for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
-       k += chunk_size) {
-    uint64_t packed = BF16x8::load(activation_in + k).to_fp8x8(inv_scale);
-    uint32_t lo = (uint32_t)(packed);
-    uint32_t hi = (uint32_t)(packed >> 32);
-    // First 4 elements at column k, second 4 at column k+4
-    uint32_t col0 = rotate_col_32(k, row);
-    uint32_t col1 = rotate_col_32(k + 4, row);
-    *reinterpret_cast<uint32_t*>(&activation_out[col0]) = lo;
-    *reinterpret_cast<uint32_t*>(&activation_out[col1]) = hi;
-  }
-
-  return act_scale;  // valid on all threads (warp_reduce_max broadcasts)
 }
 
 namespace detail {
@@ -241,18 +243,24 @@ namespace detail {
  * @brief Scales activation values for a single token (BS > 8 path).
  *
  * Quantizes one token's activations from global memory to fp8, computing
- * act_scale = max(|x|) / 448 and writing it to @p act_scale_out.
- * No routing weight folding — act_scale is stored separately.
+ * per-block (1, 128) activation scales:
+ *   act_scale[blk] = max(|x[blk*128..(blk+1)*128-1]|) / 448
+ * and writing them to @p act_scales_out.
+ * No routing weight folding — act_scales are stored separately.
  */
 template <typename Dims>
 __device__ static void moe_scale_activation_BSx_chunk(
     const A_element* __restrict__ activation_in, A_element* __restrict__ temp,
     AQ_element* __restrict__ activation_out,
-    float& __restrict__ act_scale_out) {
+    float* __restrict__ act_scales_out) {
   assert((uintptr_t)activation_in != (uintptr_t)temp);
   assert((uintptr_t)activation_out != (uintptr_t)temp);
   assert((uintptr_t)activation_in != (uintptr_t)activation_out);
   using CoreDims = MoECoreDims<Dims>;
+
+  constexpr uint32_t ACT_BLOCK = 128;
+  constexpr uint32_t NUM_ACT_BLOCKS =
+      (Dims::HIDDEN_STATES + ACT_BLOCK - 1) / ACT_BLOCK;
 
   const std::uint32_t thread = get_thread<Dims>();
   const std::uint32_t thread_chunk_size =
@@ -263,33 +271,49 @@ __device__ static void moe_scale_activation_BSx_chunk(
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
 
-  __nv_bfloat162 m0{0.0f, 0.0f}, m1{0.0f, 0.0f}, m2{0.0f, 0.0f}, m3{0.0f, 0.0f};
+  // First pass: copy to temp (needed by caller) and compute per-block max
+  // We process the entire row but track max per 128-element block.
+  float block_max[NUM_ACT_BLOCKS];
+  for (uint32_t b = 0; b < NUM_ACT_BLOCKS; ++b) block_max[b] = 0.f;
+
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
-    BF16x8 chunk = BF16x8::load(activation_in + k);
-    chunk.store_to(&temp[k]);
-    m0 = __hmax2(m0, __habs2(chunk.first_pair()));
-    m1 = __hmax2(m1, __habs2(chunk.second_pair()));
-    m2 = __hmax2(m2, __habs2(chunk.third_pair()));
-    m3 = __hmax2(m3, __habs2(chunk.fourth_pair()));
+    BF16x8 chunk_val = BF16x8::load(activation_in + k);
+    chunk_val.store_to(&temp[k]);
+
+    __nv_bfloat162 a0 = __habs2(chunk_val.first_pair());
+    __nv_bfloat162 a1 = __habs2(chunk_val.second_pair());
+    __nv_bfloat162 a2 = __habs2(chunk_val.third_pair());
+    __nv_bfloat162 a3 = __habs2(chunk_val.fourth_pair());
+    __nv_bfloat162 mx = __hmax2(__hmax2(a0, a1), __hmax2(a2, a3));
+    float local_max = (float)__hmax(mx.x, mx.y);
+
+    uint32_t blk = k / ACT_BLOCK;
+    block_max[blk] = fmaxf(block_max[blk], local_max);
   }
 
-  m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
-  float m = (float)__hmax(m0.x, m0.y);
-  m = warp_reduce_max_float(m);
-  if (m < __FLT_MIN__) m = 1.f;
+  // Warp-reduce each block's max
+  for (uint32_t b = 0; b < NUM_ACT_BLOCKS; ++b) {
+    block_max[b] = warp_reduce_max_float(block_max[b]);
+    if (block_max[b] < __FLT_MIN__) block_max[b] = 1.f;
+  }
 
-  float scale = m * FP8_MAX_INV;  // act_scale = max/448
-  float inv_scale = FP8_MAX / m;
-
+  // Second pass: quantize each block with its own scale
   uint64_t* activation_out8 = reinterpret_cast<uint64_t*>(activation_out);
   for (std::uint32_t k = thread * thread_chunk_size; k < Dims::HIDDEN_STATES;
        k += chunk_size) {
-    BF16x8 chunk = BF16x8::load(activation_in + k);
-    activation_out8[k / 8] = chunk.to_fp8x8(inv_scale);
+    uint32_t blk = k / ACT_BLOCK;
+    float inv_scale = FP8_MAX / block_max[blk];
+    BF16x8 chunk_val = BF16x8::load(activation_in + k);
+    activation_out8[k / 8] = chunk_val.to_fp8x8(inv_scale);
   }
 
-  if (thread == 0) act_scale_out = scale;
+  // Store per-block scales
+  if (thread == 0) {
+    for (uint32_t b = 0; b < NUM_ACT_BLOCKS; ++b) {
+      act_scales_out[b] = block_max[b] * FP8_MAX_INV;
+    }
+  }
 }
 
 }  // namespace detail
@@ -318,6 +342,7 @@ __device__ void moe_scale_activation_BSx(
   assert((uintptr_t)spec->activations % 8 == 0);
 
   using CoreDims = MoECoreDims<Dims>;
+  constexpr uint32_t NUM_ACT_BLOCKS = MoEGemmSpec<Dims>::ACT_SCALE_BLOCKS;
 
   if (is_calc_warp<Dims>()) {
     const std::uint32_t global_warp_count =
@@ -337,11 +362,32 @@ __device__ void moe_scale_activation_BSx(
   // spec->act_scale is written by different blocks — make visible to all
   cooperative_groups::this_grid().sync();
 
-  // copy act_scale into shmem for fast per-token access during up-projection
-  for (uint32_t i = threadIdx.x; i < token_count; i += blockDim.x)
-    shmem->act_scale[i] = spec->act_scale[i];
+  // copy per-block act_scale into shmem for fast per-token access
+  for (uint32_t i = threadIdx.x; i < token_count * NUM_ACT_BLOCKS;
+       i += blockDim.x) {
+    uint32_t tok = i / NUM_ACT_BLOCKS;
+    uint32_t blk = i % NUM_ACT_BLOCKS;
+    shmem->act_scale[tok][blk] = spec->act_scale[tok][blk];
+  }
 
   __syncthreads();
+
+  #ifdef DEBUG_MOE_PRINT
+  // Print activation quantization results for first 2 tokens
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (uint32_t tok = 0; tok < min(token_count, (uint32_t)2); ++tok) {
+      printf("[DBG64 ACT_QUANT tok=%u] act_scale (%u blocks):", tok,
+             NUM_ACT_BLOCKS);
+      for (uint32_t b = 0; b < NUM_ACT_BLOCKS; ++b)
+        printf(" %.6f", shmem->act_scale[tok][b]);
+      printf("\n");
+      printf("[DBG64 ACT_QUANT tok=%u] fp8[0..7]:", tok);
+      for (int i = 0; i < 8; i++)
+        printf(" %.4f", (float)spec->activations[tok][i]);
+      printf("\n");
+    }
+  }
+  #endif
 }
 
 }  // namespace moe_monokernel
