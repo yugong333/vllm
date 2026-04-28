@@ -775,27 +775,24 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         }
         if (!assigned) continue;
 
-        // Process each 128-element block independently
-        float regs[ITERS * 4];  // hold all converted floats
-
+        // Process each 128-element block independently, single pass per block.
   #pragma unroll
         for (std::uint32_t blk = 0; blk < NUM_DOWN_BLOCKS; ++blk) {
           std::uint32_t blk_start = blk * ACT_DOWN_BLOCK;
           std::uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
 
-          // Read bf16 from SHM into registers and find block max
+          // Read bf16 from SHM into registers and find block max.
+          // Keep the 4 converted floats in scalar registers (r0..r3) between
+          // the max-reduce and the quantize+write step.
           __nv_bfloat162 bf_01 = *reinterpret_cast<const __nv_bfloat162*>(
               &shm->w[BUF_BF16].bf16_buf[tok][col + 0]);
           __nv_bfloat162 bf_23 = *reinterpret_cast<const __nv_bfloat162*>(
               &shm->w[BUF_BF16].bf16_buf[tok][col + 2]);
           float2 f01 = __bfloat1622float2(bf_01);
           float2 f23 = __bfloat1622float2(bf_23);
-          regs[blk * 4 + 0] = f01.x;
-          regs[blk * 4 + 1] = f01.y;
-          regs[blk * 4 + 2] = f23.x;
-          regs[blk * 4 + 3] = f23.y;
-          float local_max = fmaxf(fmaxf(fabsf(f01.x), fabsf(f01.y)),
-                                  fmaxf(fabsf(f23.x), fabsf(f23.y)));
+          float r0 = f01.x, r1 = f01.y, r2 = f23.x, r3 = f23.y;
+          float local_max =
+              fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
 
           float blk_max = warp_reduce_max_float(local_max);
           if (blk_max < __FLT_MIN__) blk_max = 1.f;
@@ -803,11 +800,9 @@ __device__ inline void moe_down_projection_BS8_allexperts(
           float blk_scale = blk_max * FP8_MAX_INV;
           float blk_inv_scale = FP8_MAX / blk_max;
 
-          // Quantize this block from registers → write fp8 to SHM
-          __nv_fp8x4_e4m3 q{float4{regs[blk * 4 + 0] * blk_inv_scale,
-                                   regs[blk * 4 + 1] * blk_inv_scale,
-                                   regs[blk * 4 + 2] * blk_inv_scale,
-                                   regs[blk * 4 + 3] * blk_inv_scale}};
+          // Quantize from registers → write fp8 to SHM
+          __nv_fp8x4_e4m3 q{float4{r0 * blk_inv_scale, r1 * blk_inv_scale,
+                                   r2 * blk_inv_scale, r3 * blk_inv_scale}};
           *reinterpret_cast<__nv_fp8x4_e4m3*>(&shm->a.down[buf_fp8][tok][col]) =
               q;
 
@@ -819,8 +814,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
             printf(
                 "[DBG QUANT e=0 blk=%u] bf16_in[col=%u..]: %.6f %.6f %.6f "
                 "%.6f\n",
-                blk, col, regs[blk * 4 + 0], regs[blk * 4 + 1],
-                regs[blk * 4 + 2], regs[blk * 4 + 3]);
+                blk, col, r0, r1, r2, r3);
             printf(
                 "[DBG QUANT e=0 blk=%u] blk_max=%.6f scale=%.6f "
                 "inv_scale=%.6f\n",

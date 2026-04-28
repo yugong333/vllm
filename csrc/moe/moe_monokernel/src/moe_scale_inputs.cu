@@ -188,49 +188,56 @@ __device__ void moe_scale_activation_BS8(
   constexpr uint32_t ACT_BLOCK = 128;
   constexpr uint32_t NUM_ACT_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK - 1) / ACT_BLOCK;
+  static_assert(Dims::HIDDEN_STATES % ACT_BLOCK == 0,
+                "HIDDEN_STATES must be divisible by activation block size");
+
+  // Per-thread chunk chosen so that one warp iteration covers exactly one
+  // 128-element quant block with all 32 lanes active (32 × 4 = 128).
+  // This also keeps the converted fp32 values in 4 registers between the
+  // block-max reduction and the quantize+write step, eliminating the
+  // redundant bf16 reload that the prior 8-element-per-thread version did.
+  constexpr uint32_t FLOATS_PER_LOAD = 4;  // 4 bf16 = 8 bytes per thread
+  static_assert(CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD == ACT_BLOCK,
+                "Warp iteration must equal one 128-element quant block");
+
   const std::uint32_t thread = get_thread<Dims>();
-  const std::uint32_t thread_chunk_size =
-      sizeof(BF16x8) / sizeof(*activation_in);
-  const std::uint32_t chunk_size =
-      CoreDims::THREADS_PER_WARP * thread_chunk_size;
 
   constexpr float FP8_MAX = 448.f;
   constexpr float FP8_MAX_INV = 1.0f / 448.f;
 
-  // Process each 128-element block separately
+  // Process each 128-element block separately, single pass per block.
+  #pragma unroll
   for (uint32_t blk = 0; blk < NUM_ACT_BLOCKS; ++blk) {
     uint32_t blk_start = blk * ACT_BLOCK;
-    uint32_t blk_end = min(blk_start + ACT_BLOCK, Dims::HIDDEN_STATES);
+    uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
 
-    // Find max absolute value within this block
-    __nv_bfloat162 m0{0.f, 0.f}, m1{0.f, 0.f}, m2{0.f, 0.f}, m3{0.f, 0.f};
-    for (std::uint32_t k = blk_start + thread * thread_chunk_size; k < blk_end;
-         k += chunk_size) {
-      BF16x8 chunk_val = BF16x8::load(activation_in + k);
-      m0 = __hmax2(m0, __habs2(chunk_val.first_pair()));
-      m1 = __hmax2(m1, __habs2(chunk_val.second_pair()));
-      m2 = __hmax2(m2, __habs2(chunk_val.third_pair()));
-      m3 = __hmax2(m3, __habs2(chunk_val.fourth_pair()));
-    }
-    m0 = __hmax2(__hmax2(m0, m1), __hmax2(m2, m3));
-    float m = (float)__hmax(m0.x, m0.y);
-    m = warp_reduce_max_float(m);
-    if (m < __FLT_MIN__) m = 1.f;
+    // Load 4 bf16 as 2× bf162 → convert to 4 floats in registers
+    __nv_bfloat162 bf_01 =
+        *reinterpret_cast<const __nv_bfloat162*>(&activation_in[col + 0]);
+    __nv_bfloat162 bf_23 =
+        *reinterpret_cast<const __nv_bfloat162*>(&activation_in[col + 2]);
+    // Swallow NaNs to 0 (same semantics as BF16x8::to_fp8x8)
+    bf_01 = mask_NaNs_to_zero(bf_01);
+    bf_23 = mask_NaNs_to_zero(bf_23);
+    float2 f01 = __bfloat1622float2(bf_01);
+    float2 f23 = __bfloat1622float2(bf_23);
+    float r0 = f01.x, r1 = f01.y, r2 = f23.x, r3 = f23.y;
 
-    float blk_act_scale = m * FP8_MAX_INV;  // = max/448
-    float blk_inv_scale = FP8_MAX / m;      // = 448/max
+    float local_max =
+        fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
+    float blk_max = warp_reduce_max_float(local_max);
+    if (blk_max < __FLT_MIN__) blk_max = 1.f;
 
-    // Quantize this block with its own scale
-    for (std::uint32_t k = blk_start + thread * thread_chunk_size; k < blk_end;
-         k += chunk_size) {
-      uint64_t packed = BF16x8::load(activation_in + k).to_fp8x8(blk_inv_scale);
-      uint32_t lo = (uint32_t)(packed);
-      uint32_t hi = (uint32_t)(packed >> 32);
-      uint32_t col0 = rotate_col_32(k, row);
-      uint32_t col1 = rotate_col_32(k + 4, row);
-      *reinterpret_cast<uint32_t*>(&activation_out[col0]) = lo;
-      *reinterpret_cast<uint32_t*>(&activation_out[col1]) = hi;
-    }
+    float blk_act_scale = blk_max * FP8_MAX_INV;  // = max/448
+    float blk_inv_scale = FP8_MAX / blk_max;      // = 448/max
+
+    // Quantize the 4 floats we already have in registers → fp8x4 (4 bytes)
+    // and write with rotate_col_32 swizzle so MMA loads hit distinct banks.
+    __nv_fp8x4_e4m3 q{float4{r0 * blk_inv_scale, r1 * blk_inv_scale,
+                             r2 * blk_inv_scale, r3 * blk_inv_scale}};
+    uint32_t packed = type_pun<uint32_t>(q);
+    uint32_t swz_col = rotate_col_32(col, row);
+    *reinterpret_cast<uint32_t*>(&activation_out[swz_col]) = packed;
 
     // Store per-block scale
     if (thread == 0) act_scales_out[blk] = blk_act_scale;

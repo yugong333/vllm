@@ -86,6 +86,11 @@ __device__ void moe_kernel_topk_BS8(
     moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
         expert_weights_up, shmem->experts[0].id, shm->w[1].up, pipe);
     pipe.producer_commit();
+    // Prefetch this block's slice of the up-projection weight scales for
+    // expert 0 into SHM slot 1 (matches w_cur=1 start in
+    // moe_up_projection_BS8_allexperts).
+    moe_request_up_scale<Dims>(expert_scales_up, shmem->experts[0].id,
+                               shm->up_scale[1]);
   } else {
     const std::uint32_t cw = get_calc_warp<Dims>();
     if (cw < batch_size) {

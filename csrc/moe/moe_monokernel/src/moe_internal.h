@@ -96,6 +96,35 @@ using Dims_Max = MoEDimensions<1024, 256, 1024, 256>;
 using Dims_Max = MoEDimensions<1024, 1024, 5120, 256>;
   #endif
 
+// ── Block-wise quantization detection (forward declaration) ──────────────
+// These helpers are used in the MoE_SHM layout below and defined with full
+// SFINAE semantics further down. Here we just need the compile-time bool,
+// so we duplicate the minimal detection inline.
+template <typename Dims>
+struct shm_is_block_wise {
+  template <typename D>
+  static constexpr auto test(int) -> decltype(D::QUANT_GRAN, bool()) {
+    return D::QUANT_GRAN == QuantGranularity::BLOCK_WISE;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
+// Number of column-blocks in the up-projection scale tensor. For block-wise
+// this is ceil(K / BLOCK_SCALE_COL); for per-channel we return 1 (unused
+// placeholder so the SHM field is harmlessly tiny).
+template <typename Dims, bool IsBlockWise = shm_is_block_wise<Dims>::value>
+struct shm_up_scale_cols {
+  static constexpr uint32_t value = 1;
+};
+template <typename Dims>
+struct shm_up_scale_cols<Dims, true> {
+  static constexpr uint32_t value = Dims::UP_SCALE_COLS;
+};
+
 /**
  * @brief contains various constants used within the MoE monokernel.
  */
@@ -215,6 +244,20 @@ struct MoE_SHM {
       static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
           ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
       S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+
+      // Up-projection weight scales (double-buffered, block-wise only).
+      // Block-wise (128×128): each block's weight tile spans 8 rows in the
+      // low half and 8 rows in the upper half of the 2*N weight rows. With
+      // BLOCK_SCALE_ROW=128 and base_row_up multiple of 8, all 8 rows fall
+      // in a single row-block. So we need 2 row-blocks × ceil(K/128)
+      // col-blocks per expert per CUDA block.
+      //
+      // For per-channel this field is sized to a trivial placeholder (never
+      // read). We keep it allocated unconditionally to avoid template-
+      // dependent SHM layout branching.
+      static constexpr uint32_t UP_SCALE_TILE_SIZE =
+          2 * shm_up_scale_cols<Dims>::value;
+      S_element up_scale[2][UP_SCALE_TILE_SIZE];
 
       // Scratch pad for MMA partial results (up and down share the same space).
       union {
