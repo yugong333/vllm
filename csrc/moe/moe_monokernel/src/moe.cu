@@ -11,6 +11,7 @@
 #include "moe_interface.h"
 
 #define INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#include "moe_debug.h"
 #include "moe_down_projection.cu"
 #include "moe_internal.h"
 #include "moe_prepare.cu"
@@ -88,11 +89,8 @@ __device__ void moe_kernel_topk_BS8(
   } else {
     const std::uint32_t cw = get_calc_warp<Dims>();
     if (cw < batch_size) {
-      float act_scale =
-          moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw);
-      if (get_thread<Dims>() == 0) {
-        shmem->act_scale[cw] = act_scale;
-      }
+      moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw,
+                                     shmem->act_scale[cw]);
     }
   }
   // // Wait for Phase 2 weight prefetch to complete before Phase 3 reads
@@ -120,6 +118,14 @@ __device__ void moe_kernel_topk_BS8(
       expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem);
 
   // ── Phase 5: Writeback SHM fp32 accumulator → global bf16 output ────────
+#ifdef DEBUG_MOE_PRINT
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    printf("[DBG FINAL out_accum[0][0..15]:");
+    for (unsigned c = 0; c < 16 && c < CoreDims::W_DOWN_TILE; c++)
+      printf(" %.4f", shm->out_accum[0][c]);
+    printf("\n");
+  }
+#endif
   for (unsigned tok = 0; tok < batch_size; ++tok) {
     for (unsigned col = threadIdx.x; col < CoreDims::W_DOWN_TILE;
          col += blockDim.x) {
@@ -172,24 +178,11 @@ __device__ void moe_kernel_topk_BS64(
 
   // Step 3: quantize activations once per original token.
   // Writes spec->activations[tok] (fp8) and shmem->act_scale[tok].
+  //
+  // Note: Stage 3b (copy routing_weight → topk_weights_flat) was removed.
+  // The down-projection now reads path.bs64.token_weights[sorted_pos]
+  // directly — the copy-back was a redundant pass.
   moe_scale_activation_BSx<Dims>(activations_in, token_count, spec, shmem);
-
-  // Step 3b: for each sorted slot, store act_scale in token_weights (for
-  // up-proj inside silu) and routing_weight in topk_weights_flat (for
-  // down-proj). token_weights[sorted_pos] was set to routing_weight in prepare
-  // step.
-  {
-    const uint32_t virtual_batch = token_count * top_k;
-    for (uint32_t sp = threadIdx.x; sp < virtual_batch; sp += blockDim.x) {
-      uint32_t tok = shmem->path.bs64.token_indexes_topk[sp];
-      float rw =
-          shmem->path.bs64.token_weights[sp];   // routing_weight (from prepare)
-      float as = shmem->act_scale[tok];         // act_scale (from step 3)
-      shmem->path.bs64.token_weights[sp] = as;  // act_scale for up-proj
-      shmem->topk_weights_flat[sp] = rw;        // routing_weight for down-proj
-    }
-  }
-  __syncthreads();
 
   // Step 4: up-projection (reads token_weights per sorted slot)
   moe_up_projection_topk<Dims>(expert_weights_up, expert_scales_up, spec,
