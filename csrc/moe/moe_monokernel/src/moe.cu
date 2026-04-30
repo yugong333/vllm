@@ -64,6 +64,10 @@ __device__ void moe_kernel_topk_BS8(
   auto* shm = &shmem->u.tiny;
 
   // ── Phase 1: prefetch activations into w[0].orig || routing ─────────────
+  // Phase 1 is always executed — routing (topK / prepare_moe_topk) writes
+  // shmem->experts and shmem->topk_ids_flat which later phases depend on.
+  // Skipping it would leave those fields uninitialized and make profiling
+  // garbage.
   if (is_prefetch_warp<Dims>()) {
     const std::uint32_t pw = get_prefetch_warp<Dims>();
     for (std::uint32_t tok = pw; tok < batch_size;
@@ -80,40 +84,95 @@ __device__ void moe_kernel_topk_BS8(
   cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
 
-  // ── Phase 2: quantize w[0].orig → a.up || prefetch w_up[0] into w[1] ───
-  if (is_prefetch_warp<Dims>()) {
-    pipe.producer_acquire();
-    moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-        expert_weights_up, shmem->experts[0].id, shm->w[1].up, pipe);
-    pipe.producer_commit();
-    // Prefetch this block's slice of the up-projection weight scales for
-    // expert 0 into SHM slot 1 (matches w_cur=1 start in
-    // moe_up_projection_BS8_allexperts).
-    moe_request_up_scale<Dims>(expert_scales_up, shmem->experts[0].id,
-                               shm->up_scale[1]);
-  } else {
-    const std::uint32_t cw = get_calc_warp<Dims>();
-    if (cw < batch_size) {
-      moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw,
-                                     shmem->act_scale[cw]);
+  // ── Phase 2: quantize w[0].orig → a.up || prefetch w_up → w[1] ────────
+  // GRID=128 design, two-expert-group parallelism:
+  //   UP_GRID = 2*N / W_UP_TILE = 64 row-tiles cover the full 2*N weight
+  //   rows for one expert. With GRID_SIZE=128, we run TWO groups of
+  //   UP_GRID blocks each, processing DIFFERENT experts in parallel:
+  //     group 0 (blockIdx.x in [0,  UP_GRID))  → experts at indices 0,2,4,...
+  //     group 1 (blockIdx.x in [UP_GRID, 2*UP_GRID)) → experts 1,3,5,...
+  //   Within each group, blockIdx.x % UP_GRID indexes the row-tile.
+  //
+  // Each group prefetches its OWN starting expert's weights + scales.
+  constexpr std::uint32_t UP_GRID = 2 * Dims::N / CoreDims::W_UP_TILE;
+  constexpr std::uint32_t UP_GROUPS =
+      Dims::KernelConfig::GRID_SIZE / UP_GRID;  // 1 or 2
+  static_assert(Dims::KernelConfig::GRID_SIZE % UP_GRID == 0,
+                "GRID_SIZE must be a multiple of UP_GRID.");
+  static_assert(UP_GROUPS <= 2,
+                "Two-expert parallelism supports up to 2 groups.");
+  const std::uint32_t up_group = blockIdx.x / UP_GRID;
+  const std::uint32_t up_block_idx = blockIdx.x % UP_GRID;
+  const bool in_up = (up_group < UP_GROUPS);
+
+  // Skip Phase 2 entirely if this block is not in any up-proj group (only
+  // relevant if GRID_SIZE > UP_GROUPS*UP_GRID, which currently never
+  // happens — kept for safety).
+  if (in_up) {
+    // Each group starts from expert index `up_group` (0 or 1), stepping
+    // by UP_GROUPS. If there are fewer experts than groups, the trailing
+    // group's starting expert may not exist; skip the prefetch in that
+    // case.
+    const std::uint32_t my_expert_start = up_group;
+    const bool my_group_has_work = my_expert_start < shmem->expert_count;
+
+    if (is_prefetch_warp<Dims>()) {
+#ifndef MONO_PROFILE_SKIP_PREFETCH
+      if (my_group_has_work) {
+        pipe.producer_acquire();
+        // Fetch this group's starting expert's weights using this block's
+        // row-tile (not blockIdx directly) so both groups reuse the same
+        // 64-row-tile layout.
+        const unsigned base_row_up = up_block_idx * CoreDims::W_UP_TILE / 2;
+        moe_request_up_expert_for_row<Dims, Dims::HIDDEN_STATES>(
+            expert_weights_up, shmem->experts[my_expert_start].id, base_row_up,
+            shm->w[1].up, pipe);
+        pipe.producer_commit();
+        moe_request_up_scale_for_row<Dims>(expert_scales_up,
+                                           shmem->experts[my_expert_start].id,
+                                           base_row_up, shm->up_scale[1]);
+      }
+#endif
+    } else {
+#ifndef MONO_PROFILE_SKIP_CALC
+      // Both groups independently quantize the input activations into
+      // their own SHM. (Redundant across blocks but fully parallel.)
+      const std::uint32_t cw = get_calc_warp<Dims>();
+      if (cw < batch_size) {
+        moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw,
+                                       shmem->act_scale[cw]);
+      }
+#endif
     }
   }
-  // // Wait for Phase 2 weight prefetch to complete before Phase 3 reads
-  // w[1].up cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
 
-  // ── Phase 3: Up-projection — all experts, double-buffered w[].up ────────
-  moe_up_projection_BS8_allexperts<Dims>(expert_weights_up, expert_scales_up,
-                                         top_k, batch_size, spec, shmem);
+  // ── Phase 3: Up-projection — two expert groups in parallel ──────────────
+  // Group `g` (blocks [g*UP_GRID, (g+1)*UP_GRID)) iterates experts starting
+  // at index `g`, stepping by UP_GROUPS. Each group writes to DIFFERENT
+  // virtual_row slots of spec->temp_bf16 (because each expert has its own
+  // k index within a token's top-K list), so the two groups never have a
+  // write conflict.
+  if (in_up && up_group < shmem->expert_count) {
+    moe_up_projection_BS8_allexperts<Dims>(
+        expert_weights_up, expert_scales_up, top_k, batch_size, spec, shmem,
+        up_block_idx, /*expert_start=*/up_group,
+        /*expert_stride=*/UP_GROUPS);
+  }
 
   // ── Single grid.sync — all blocks finish writing spec->temp_bf16 ──────
   cooperative_groups::this_grid().sync();
 
   // Zero the per-block fp32 output accumulator in SHM.
+  // Zero exactly the `[BS][W_DOWN_TILE]` logical shape, not including row
+  // padding, to preserve the 2D indexing `out_accum[tok][col]` used below.
   const unsigned base_row_dn = blockIdx.x * CoreDims::W_DOWN_TILE;
   for (unsigned idx = threadIdx.x; idx < Dims::BS * CoreDims::W_DOWN_TILE;
-       idx += blockDim.x)
-    ((T_element*)shm->out_accum)[idx] = 0.f;
+       idx += blockDim.x) {
+    unsigned tok = idx / CoreDims::W_DOWN_TILE;
+    unsigned col = idx % CoreDims::W_DOWN_TILE;
+    shm->out_accum[tok][col] = 0.f;
+  }
   __syncthreads();
 
   // ── Phase 4: Down-projection — pipelined 4-stage design ──────────────

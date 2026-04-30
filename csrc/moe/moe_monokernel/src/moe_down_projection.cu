@@ -387,12 +387,14 @@ __device__ inline void moe_down_projection_topk(
 
   // Prime: prefetch first expert's weights + first token tile (bf16)
   if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
     pipe.producer_acquire();
     moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
                                   first_expert.id, shm, 0, pipe);
     moe_request_temp_token<Dims>(spec->temp_bf16, first_expert, 0,
                                  shm->t_bf16[0], pipe);
     pipe.producer_commit();
+  #endif
   }
 
   std::uint32_t t_index = 1;  // ping-pong for t_bf16 fetch
@@ -443,6 +445,7 @@ __device__ inline void moe_down_projection_topk(
   #endif
 
       if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         // Prefetch next tile while calc warps quantize + MMA
         pipe.producer_acquire();
         if (e + 1 < expert_count && a_row == 0) {
@@ -459,7 +462,9 @@ __device__ inline void moe_down_projection_topk(
                                        0, shm->t_bf16[t_index ^ 1], pipe);
         }
         pipe.producer_commit();
+  #endif
       } else {
+  #ifndef MONO_PROFILE_SKIP_CALC
         // ── Calc warps: quantize bf16 → fp8 ──────────────────────────────
         // Each calc warp handles one or more tokens.
         // Per-block (1, 128) quantization: each 128-element block gets its
@@ -470,7 +475,7 @@ __device__ inline void moe_down_projection_topk(
              tok += CoreDims::CALC_WARP_COUNT) {
           float regs[NUM_DOWN_BLOCKS * 4];
 
-  #pragma unroll
+    #pragma unroll
           for (std::uint32_t blk = 0; blk < NUM_DOWN_BLOCKS; ++blk) {
             std::uint32_t blk_start = blk * ACT_DOWN_BLOCK;
             std::uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
@@ -507,6 +512,7 @@ __device__ inline void moe_down_projection_topk(
             if (thread == 0) shm->t_scale[q_index][tok][blk] = blk_scale;
           }
         }
+  #endif
       }
 
       __syncthreads();
@@ -537,6 +543,7 @@ __device__ inline void moe_down_projection_topk(
 
       // ── MMA: fp8 weights × fp8 activations ────────────────────────────
       if (!is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_CALC
         static_assert(CoreDims::W_DOWN_TILE % 8 == 0);
 
         // D-output mapping (m16n8k32):
@@ -550,6 +557,7 @@ __device__ inline void moe_down_projection_topk(
                                 shm->t_fp8[q_index][thread / 4],
                                 shm->t_scale[q_index], tok_02, tok_13, s0, s1,
                                 shm->partial_result);
+  #endif
       }
 
       __syncthreads();
@@ -569,10 +577,12 @@ __device__ inline void moe_down_projection_topk(
       // D-mapping: d0/d2 → sorted_row0 = (t%4)*2, d1/d3 → sorted_row1
       unsigned sorted_row0 = expert.first_token + a_row + (thread % 4) * 2;
       unsigned sorted_row1 = sorted_row0 + 1;
+  #ifndef MONO_PROFILE_SKIP_CALC
       moe_down_reduction_topk<Dims>(shm->partial_result,
                                     sorted_row0 < expert.last_token,
                                     sorted_row1 < expert.last_token,
                                     sorted_row0, sorted_row1, shmem, result);
+  #endif
 
   #ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
@@ -706,6 +716,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
     // ── Stage A: prefetch w_down → w[BUF_W] || quantize w[BUF_BF16].bf16_buf →
     // a.down[buf_fp8]
     if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       // Fetch this expert's w_down + scales into w[BUF_W].down
       pipe.producer_acquire();
       {
@@ -745,7 +756,9 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         }
       }
       pipe.producer_commit();
+  #endif
     } else {
+  #ifndef MONO_PROFILE_SKIP_CALC
       // Calc warps: quantize w[BUF_BF16].bf16_buf → a.down[buf_fp8]
       // Per-block (1, 128) quantization: each 128-element block gets its own
       // scale. With N=512, that's 4 blocks per row.
@@ -775,8 +788,9 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         }
         if (!assigned) continue;
 
-        // Process each 128-element block independently, single pass per block.
-  #pragma unroll
+          // Process each 128-element block independently, single pass per
+          // block.
+    #pragma unroll
         for (std::uint32_t blk = 0; blk < NUM_DOWN_BLOCKS; ++blk) {
           std::uint32_t blk_start = blk * ACT_DOWN_BLOCK;
           std::uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
@@ -808,7 +822,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
 
           if (thread == 0) shm->a_down_scale[buf_fp8][tok][blk] = blk_scale;
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
           // Print ALL 4 blocks of bf16 input + quantization for expert 0, tok 0
           if (blockIdx.x == 0 && thread == 0 && tok == 0 && e == 0) {
             printf(
@@ -827,9 +841,10 @@ __device__ inline void moe_down_projection_BS8_allexperts(
                 (float)shm->a.down[buf_fp8][tok][col + 2],
                 (float)shm->a.down[buf_fp8][tok][col + 3]);
           }
-  #endif
+    #endif
         }
       }
+  #endif
     }
 
     // Wait for w_down fetch to complete
@@ -839,6 +854,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
     // ── Stage B: prefetch next bf16 → w[BUF_BF16] || MMA + reduce ────────
     // No conflict: bf16 goes to w[0], MMA reads weights from w[1].
     if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       // Fetch next expert's bf16 intermediate into w[BUF_BF16].bf16_buf
       if (e + 1 < expert_count) {
         const std::uint32_t next_id = shmem->experts[e + 1].id;
@@ -865,7 +881,9 @@ __device__ inline void moe_down_projection_BS8_allexperts(
         }
         pipe.producer_commit();
       }
+  #endif
     } else {
+  #ifndef MONO_PROFILE_SKIP_CALC
       // Calc warps: MMA a.down[buf_fp8] × w[BUF_W].down
       // Zero partial results
       for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
@@ -907,7 +925,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
                               shm->a_down_scale[buf_fp8], tok_02, tok_13, s0,
                               s1, shm->partial_result.down);
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
       if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0) {
         printf("\n[DBG MMA_INPUTS e=0] w_scales (row-block 0, 4 col-blocks):");
         for (uint32_t si = 0; si < 4; si++)
@@ -934,6 +952,7 @@ __device__ inline void moe_down_projection_BS8_allexperts(
           printf(" %.4f", (float)shm->w[BUF_W].down[8][wi]);
         printf("\n");
       }
+    #endif
   #endif
     }
     __syncthreads();
@@ -964,7 +983,13 @@ __device__ inline void moe_down_projection_BS8_allexperts(
     //   row_far  = t/4 + 8   (weight row for d2)
     //
     // Store to out_accum[token][weight_row + wr].
+    //
+    // GRID=128 design (W_DOWN_TILE = W_DOWN_MMA_TILE = 16): only one outer
+    // MMA tile per block, so the partial_result array has a single "wr=0"
+    // slot. Distribute the 4 d-output reductions (d0..d3) across 4 calc
+    // warps so the reduction pipeline doesn't serialize in a single warp.
     if (!is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_CALC
       const std::uint32_t tok0 = (thread % 4) * 2;
       const std::uint32_t tok1 = (thread % 4) * 2 + 1;
       const std::uint32_t row_col = thread / 4;  // weight row for d0 (d2 = +8)
@@ -983,41 +1008,79 @@ __device__ inline void moe_down_projection_BS8_allexperts(
             break;
           }
 
-      for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
-           wr < CoreDims::W_DOWN_TILE;
-           wr += CoreDims::W_DOWN_MMA_TILE * CoreDims::CALC_WARP_COUNT) {
-        float d0 = shm->partial_result.down[wr / 2][thread + 0];
-        float d1 = shm->partial_result.down[wr / 2][thread + 32];
-        float d2 = shm->partial_result.down[wr / 2][thread + 64];
-        float d3 = shm->partial_result.down[wr / 2][thread + 96];
-        for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
-          d0 += shm->partial_result.down[wr / 2 + i][thread + 0];
-          d1 += shm->partial_result.down[wr / 2 + i][thread + 32];
-          d2 += shm->partial_result.down[wr / 2 + i][thread + 64];
-          d3 += shm->partial_result.down[wr / 2 + i][thread + 96];
-        }
+      // Fast path (W_DOWN_TILE == W_DOWN_MMA_TILE): 4-warp reduction.
+      //   warp 0: reduce + store d0 → out_accum[tok0][row_col]
+      //   warp 1: reduce + store d1 → out_accum[tok1][row_col]
+      //   warp 2: reduce + store d2 → out_accum[tok0][row_col + 8]
+      //   warp 3: reduce + store d3 → out_accum[tok1][row_col + 8]
+      // Warps 4..7 are idle during reduction but are still used for MMA.
+      if constexpr (CoreDims::W_DOWN_TILE == CoreDims::W_DOWN_MMA_TILE) {
+        // All four d-values share the same partial_result row (wr=0).
+        if (warp < 4) {
+          const std::uint32_t d_idx = warp;           // 0..3
+          const std::uint32_t read_off = d_idx * 32;  // 0, 32, 64, 96
 
-        if (s0) {
-          shm->out_accum[tok0][row_col + wr + 0] += d0;
-          if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[tok0][row_col + wr + 8] += d2;
-        }
-        if (s1) {
-          shm->out_accum[tok1][row_col + wr + 0] += d1;
-          if (CoreDims::W_DOWN_TILE % 16 == 0 || wr + 8 < CoreDims::W_DOWN_TILE)
-            shm->out_accum[tok1][row_col + wr + 8] += d3;
-        }
+          float acc = shm->partial_result.down[0][thread + read_off];
+          for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
+            acc += shm->partial_result.down[i][thread + read_off];
+          }
 
-  #ifdef DEBUG_MOE_PRINT
-        if (blockIdx.x == 0 && warp == 0 && thread < 8 && e == 0) {
-          printf(
-              "[DBG REDUCE e=0 t=%u tok0=%u tok1=%u row_col=%u wr=%u s0=%d "
-              "s1=%d d0=%.4f d1=%.4f d2=%.4f d3=%.4f\n",
-              thread, tok0, tok1, row_col, wr, (int)s0, (int)s1, d0, d1, d2,
-              d3);
+          // Map d_idx → (target_tok, target_col_offset):
+          //   d0 (warp 0): tok0, col+0
+          //   d1 (warp 1): tok1, col+0
+          //   d2 (warp 2): tok0, col+8
+          //   d3 (warp 3): tok1, col+8
+          const bool is_d02 = (d_idx & 1) == 0;  // d0 or d2 → tok0
+          const bool is_far = (d_idx & 2) != 0;  // d2 or d3 → col+8
+          const bool store = is_d02 ? s0 : s1;
+          const std::uint32_t target_tok = is_d02 ? tok0 : tok1;
+          const std::uint32_t target_col = row_col + (is_far ? 8 : 0);
+
+          if (store) {
+            shm->out_accum[target_tok][target_col] += acc;
+          }
         }
-  #endif
+      } else {
+        // Legacy path (W_DOWN_TILE > 16): same as before.
+        for (unsigned wr = warp * CoreDims::W_DOWN_MMA_TILE;
+             wr < CoreDims::W_DOWN_TILE;
+             wr += CoreDims::W_DOWN_MMA_TILE * CoreDims::CALC_WARP_COUNT) {
+          float d0 = shm->partial_result.down[wr / 2][thread + 0];
+          float d1 = shm->partial_result.down[wr / 2][thread + 32];
+          float d2 = shm->partial_result.down[wr / 2][thread + 64];
+          float d3 = shm->partial_result.down[wr / 2][thread + 96];
+          for (unsigned i = 1; i < CoreDims::CALC_WARP_COUNT; ++i) {
+            d0 += shm->partial_result.down[wr / 2 + i][thread + 0];
+            d1 += shm->partial_result.down[wr / 2 + i][thread + 32];
+            d2 += shm->partial_result.down[wr / 2 + i][thread + 64];
+            d3 += shm->partial_result.down[wr / 2 + i][thread + 96];
+          }
+
+          if (s0) {
+            shm->out_accum[tok0][row_col + wr + 0] += d0;
+            if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+                wr + 8 < CoreDims::W_DOWN_TILE)
+              shm->out_accum[tok0][row_col + wr + 8] += d2;
+          }
+          if (s1) {
+            shm->out_accum[tok1][row_col + wr + 0] += d1;
+            if (CoreDims::W_DOWN_TILE % 16 == 0 ||
+                wr + 8 < CoreDims::W_DOWN_TILE)
+              shm->out_accum[tok1][row_col + wr + 8] += d3;
+          }
+
+    #ifdef DEBUG_MOE_PRINT
+          if (blockIdx.x == 0 && warp == 0 && thread < 8 && e == 0) {
+            printf(
+                "[DBG REDUCE e=0 t=%u tok0=%u tok1=%u row_col=%u wr=%u s0=%d "
+                "s1=%d d0=%.4f d1=%.4f d2=%.4f d3=%.4f\n",
+                thread, tok0, tok1, row_col, wr, (int)s0, (int)s1, d0, d1, d2,
+                d3);
+          }
+    #endif
+        }
       }
+  #endif
     }
 
     // Flip a.down double-buffer index only (w[] slots are fixed)

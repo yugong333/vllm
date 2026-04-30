@@ -143,8 +143,8 @@ __device__ inline void moe_request_input_tokens(
  */
 template <typename Dims, std::size_t CopyCols, std::size_t Rows,
           std::size_t Cols>
-__device__ inline void moe_request_up_expert(
-    const W_element* __restrict__ source, std::uint32_t id,
+__device__ inline void moe_request_up_expert_for_row(
+    const W_element* __restrict__ source, std::uint32_t id, unsigned base_row,
     W_element (&dest)[Rows][Cols],
     cuda::pipeline<cuda::thread_scope_thread>& pipe) {
   static_assert(CopyCols <= Cols);
@@ -155,8 +155,6 @@ __device__ inline void moe_request_up_expert(
   const unsigned warp = get_prefetch_warp<Dims>();
   const unsigned chunk_size = 16 / sizeof(*source);
 
-  // starting row to process
-  const unsigned base_row = blockIdx.x * CoreDims::W_UP_TILE / 2;
   const unsigned item_cols_per_iteration =
       CoreDims::THREADS_PER_WARP * chunk_size;
 
@@ -187,31 +185,42 @@ __device__ inline void moe_request_up_expert(
 }
 
 /**
+ * @brief Legacy wrapper: compute base_row from blockIdx.x.
+ *
+ * Use this for code paths (e.g. BS64) that map blockIdx.x 1:1 to up-proj
+ * row tiles. For the BS8 two-expert-group design, call the
+ * `moe_request_up_expert_for_row` variant directly with an explicit
+ * `base_row` derived from the logical up-block index.
+ */
+template <typename Dims, std::size_t CopyCols, std::size_t Rows,
+          std::size_t Cols>
+__device__ inline void moe_request_up_expert(
+    const W_element* __restrict__ source, std::uint32_t id,
+    W_element (&dest)[Rows][Cols],
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+  using CoreDims = MoECoreDims<Dims>;
+  const unsigned base_row = blockIdx.x * CoreDims::W_UP_TILE / 2;
+  moe_request_up_expert_for_row<Dims, CopyCols>(source, id, base_row, dest,
+                                                pipe);
+}
+
+/**
  * @brief Load this block's slice of block-wise up-projection scales into SHM.
  *
- * Each CUDA block owns 8 consecutive weight rows (base_row_up..base_row_up+7)
- * in the low half of the [2*N, K] weight matrix, plus the corresponding 8
- * rows in the upper half (base_row_up + N..+N+7). With BLOCK_SCALE_ROW=128
- * and base_row_up a multiple of 8, all 8 rows of each half fall within a
- * single 128-row block. So this block needs only 2 row-slices of scales.
- *
- * Layout in SHM: dest[rb_local * UP_SCALE_COLS + kb] where
- *   rb_local = 0 → lower-half row-block (row rb_lo)
- *   rb_local = 1 → upper-half row-block (row rb_hi)
- *
- * This kernel targets block-wise quantization only (Qwen3.5).
- * Called by prefetch warps.
+ * `base_row_up` is the first weight row (in the lower half of the 2*N rows)
+ * owned by this block, i.e. `base_row_up ∈ [0, N)` with 8-row granularity.
+ * This lets callers decouple the scale fetch from `blockIdx.x` — needed
+ * by the two-expert-group BS8 design where both groups reuse the same
+ * row-tile layout but with different blockIdx ranges.
  */
 template <typename Dims>
-__device__ inline void moe_request_up_scale(
+__device__ inline void moe_request_up_scale_for_row(
     const S_element* __restrict__ expert_scales_up, std::uint32_t id,
-    S_element* __restrict__ dest) {
-  using CoreDims = MoECoreDims<Dims>;
+    unsigned base_row_up, S_element* __restrict__ dest) {
   constexpr uint32_t COLS = Dims::UP_SCALE_COLS;  // e.g. 16 for K=2048
   constexpr uint32_t TILE = 2 * COLS;
   const unsigned thread = get_thread<Dims>();
   const unsigned warp = get_prefetch_warp<Dims>();
-  const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
 
   // Only the first prefetch warp loads the scales — 32 scalars total for
   // Qwen3.5 (2×16). Synchronous shared-memory writes are fine; we don't
@@ -225,6 +234,21 @@ __device__ inline void moe_request_up_scale(
         expert_scales_up[id * Dims::UP_SCALE_ROWS * Dims::UP_SCALE_COLS +
                          rb_global * Dims::UP_SCALE_COLS + kb];
   }
+}
+
+/**
+ * @brief Legacy wrapper — computes base_row_up from blockIdx.x.
+ *
+ * Used by code paths that map blockIdx.x 1:1 to up-proj row tiles
+ * (the single-group design).
+ */
+template <typename Dims>
+__device__ inline void moe_request_up_scale(
+    const S_element* __restrict__ expert_scales_up, std::uint32_t id,
+    S_element* __restrict__ dest) {
+  using CoreDims = MoECoreDims<Dims>;
+  const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
+  moe_request_up_scale_for_row<Dims>(expert_scales_up, id, base_row_up, dest);
 }
 
 /**
@@ -305,8 +329,8 @@ __device__ inline void moe_up_reduction(
   float w0 = d2 * ts0 * ws1;
   float w1 = d3 * ts1 * ws1;
 
-  float sig0 = (w0 * x0) / (1 + expf(-x0));
-  float sig1 = (w1 * x1) / (1 + expf(-x1));
+  float sig0 = (w0 * x0) / (1 + __expf(-x0));
+  float sig1 = (w1 * x1) / (1 + __expf(-x1));
 
   // write to temporary buffer (fp32 → bf16; saturation-free round-to-nearest)
   // Guard: blocks beyond N have no valid up-proj columns to write.
@@ -384,6 +408,7 @@ __device__ inline void moe_up_projection_topk(
 
   // ── Prime: fetch expert[0].w + expert[0].first_tile ──────────────────────
   if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
     const ExpertRef& expert = shmem->experts[0];
     pipe.producer_acquire();
     moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
@@ -393,6 +418,7 @@ __device__ inline void moe_up_projection_topk(
         activations, &shmem->path.bs64.token_indexes_topk[expert.first_token],
         shm->a[0], expert.last_token, pipe);
     pipe.producer_commit();
+  #endif
   }
 
   std::uint32_t t_read = 0;  // current read slot for activations
@@ -417,6 +443,7 @@ __device__ inline void moe_up_projection_topk(
       float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
 
       if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         // ── Prefetch ahead for the NEXT iteration ───────────────────────
         // Case A: still have more activation tiles for this expert
         //         → fetch next tile into a[t_read ^ 1]; weights stay put.
@@ -445,7 +472,9 @@ __device__ inline void moe_up_projection_topk(
               shm->a[t_read ^ 1], next.last_token - next.first_token, pipe);
           pipe.producer_commit();
         }
+  #endif
       } else {
+  #ifndef MONO_PROFILE_SKIP_CALC
         // ── Calc warps: MMA current tile × current expert weights ────────
         // Block-wise: apply per-iteration weight + activation scales.
         constexpr uint32_t ACT_BLOCK = 128;
@@ -458,7 +487,7 @@ __device__ inline void moe_up_projection_topk(
                             ? shmem->path.bs64.token_indexes_topk[sorted_pos1]
                             : 0;
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
         if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
           printf(
               "[DBG64 UP e=0] sorted_pos0=%u sorted_pos1=%u tok0=%u tok1=%u "
@@ -467,7 +496,7 @@ __device__ inline void moe_up_projection_topk(
               expert.last_token);
           printf("[DBG64 UP e=0] expert_id=%u a_rows=%u\n", id, a_rows);
         }
-  #endif
+    #endif
 
         // d0..d3 are declared before the if/else — just reset them here.
         d0 = 0.f;
@@ -520,7 +549,7 @@ __device__ inline void moe_up_projection_topk(
         shm->partial_result[warp][thread + 64] = d2;
         shm->partial_result[warp][thread + 96] = d3;
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
         if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0 &&
             warp == 0) {
           printf(
@@ -528,6 +557,7 @@ __device__ inline void moe_up_projection_topk(
               "(gate0,gate1,up0,up1)\n",
               d0, d1, d2, d3);
         }
+    #endif
   #endif
       }
 
@@ -537,6 +567,7 @@ __device__ inline void moe_up_projection_topk(
 
       // ── Reduce + SiLU + write (only warp 0) ────────────────────────
       if (!is_prefetch_warp<Dims>() && warp == 0) {
+  #ifndef MONO_PROFILE_SKIP_CALC
         std::uint32_t row0 = a_row + (thread % 4) * 2 + 0;
         std::uint32_t row1 = a_row + (thread % 4) * 2 + 1;
         // Routing weight is NOT applied here — it's applied once in the
@@ -547,12 +578,12 @@ __device__ inline void moe_up_projection_topk(
         moe_up_reduction<Dims>(shm->partial_result, d0, d1, d2, d3, 1.0f, 1.0f,
                                ts0, ts1, row0 < a_rows, row1 < a_rows, row0,
                                row1,
-  #ifdef DEBUG_MOE
+    #ifdef DEBUG_MOE
                                &spec->gemm1[expert.first_token * 2 * Dims::N],
-  #endif
+    #endif
                                temp);
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
         if (blockIdx.x == 0 && threadIdx.x == 0 && e == 0 && a_row == 0) {
           printf("[DBG64 UP_REDUCE e=0] row0=%u row1=%u ts0=%.6f ts1=%.6f\n",
                  row0, row1, ts0, ts1);
@@ -567,6 +598,7 @@ __device__ inline void moe_up_projection_topk(
             printf("\n");
           }
         }
+    #endif
   #endif
       }
 
@@ -617,7 +649,8 @@ __device__ inline void moe_up_projection_BS8_allexperts(
     const W_element* __restrict__ expert_weights_up,
     const S_element* __restrict__ expert_scales_up, std::uint32_t top_k,
     std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
-    MoE_SHM<Dims>* __restrict__ shmem) {
+    MoE_SHM<Dims>* __restrict__ shmem, std::uint32_t up_block_idx = 0xffffffffu,
+    std::uint32_t expert_start = 0, std::uint32_t expert_stride = 1) {
   static_assert(Dims::BS <= 8);
   using CoreDims = MoECoreDims<Dims>;
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
@@ -625,37 +658,51 @@ __device__ inline void moe_up_projection_BS8_allexperts(
   const unsigned thread = get_thread<Dims>();
   const unsigned warp = get_any_warp<Dims>();
 
-  const unsigned base_row_up = blockIdx.x * CoreDims::W_UP_TILE / 2;
+  // If the caller didn't pass an explicit up_block_idx, default to
+  // blockIdx.x (single-group behaviour, identical to the pre-refactor code).
+  // Otherwise use the provided index, which decouples the row-tile
+  // assignment from blockIdx and lets multiple block groups share the same
+  // row-tile layout (two-expert-parallel design).
+  const unsigned effective_bid =
+      (up_block_idx == 0xffffffffu) ? blockIdx.x : up_block_idx;
+  const unsigned base_row_up = effective_bid * CoreDims::W_UP_TILE / 2;
 
   auto* shm = &shmem->u.tiny;
   const std::uint32_t expert_count = shmem->expert_count;
 
   cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-  // w_up[0] was already prefetched into w[1].up by phase 2 in moe.cu.
-  // We start with w_cur=1 (the buffer that has the first expert's weights).
+  // w_up[expert_start] was already prefetched into w[1].up by phase 2 in
+  // moe.cu for this group. We start with w_cur=1 (the buffer holding the
+  // first expert's weights for this group).
   std::uint32_t w_cur = 1;
 
-  for (std::uint32_t e = 0; e < expert_count; ++e) {
+  for (std::uint32_t e = expert_start; e < expert_count; e += expert_stride) {
     const std::uint32_t id = shmem->experts[e].id;
+    const std::uint32_t e_next = e + expert_stride;
+    const bool has_next = e_next < expert_count;
 
     // Wait for current expert's weights
     cuda::pipeline_consumer_wait_prior<0>(pipe);
     __syncthreads();
 
     if (is_prefetch_warp<Dims>()) {
-      // Prefetch NEXT expert's up-weights into the other buffer
-      if (e + 1 < expert_count) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
+      // Prefetch NEXT expert (for this group) into the other buffer
+      if (has_next) {
         pipe.producer_acquire();
-        moe_request_up_expert<Dims, Dims::HIDDEN_STATES>(
-            expert_weights_up, shmem->experts[e + 1].id, shm->w[w_cur ^ 1].up,
-            pipe);
+        moe_request_up_expert_for_row<Dims, Dims::HIDDEN_STATES>(
+            expert_weights_up, shmem->experts[e_next].id, base_row_up,
+            shm->w[w_cur ^ 1].up, pipe);
         pipe.producer_commit();
         // Load next expert's scale slice into the other slot.
-        moe_request_up_scale<Dims>(expert_scales_up, shmem->experts[e + 1].id,
-                                   shm->up_scale[w_cur ^ 1]);
+        moe_request_up_scale_for_row<Dims>(
+            expert_scales_up, shmem->experts[e_next].id, base_row_up,
+            shm->up_scale[w_cur ^ 1]);
       }
+  #endif
     } else {
+  #ifndef MONO_PROFILE_SKIP_CALC
       // ── MMA: a.up × w[w_cur].up ──────────────────────────────────────
       // Block-wise quantization (Qwen3.5): per-iteration weight + activation
       // scale application. Weight scales are pre-loaded into
@@ -723,6 +770,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
       shm->partial_result.up[warp][thread + 32] = d1;
       shm->partial_result.up[warp][thread + 64] = d2;
       shm->partial_result.up[warp][thread + 96] = d3;
+  #endif
     }
     __syncthreads();
 
@@ -746,6 +794,7 @@ __device__ inline void moe_up_projection_BS8_allexperts(
     //
     // Warp 0 handles token=(t%4)*2,   warp 1 handles token=(t%4)*2+1.
     // Output column = weight_row = t/4 + base_row_up.
+  #ifndef MONO_PROFILE_SKIP_CALC
     if (warp < 2) {
       const std::uint32_t tok = (thread % 4) * 2 + warp;  // token index
       bool store = false;
@@ -781,12 +830,13 @@ __device__ inline void moe_up_projection_BS8_allexperts(
 
         // Output column = weight_row = thread/4 + base_row_up
         if ((thread / 4) + base_row_up < Dims::N) {
-          float val = rw * (w0v * x0) / (1.f + expf(-x0));
+          float val = rw * (w0v * x0) / (1.f + __expf(-x0));
           spec->temp_bf16[virtual_row * Dims::N + (thread / 4) + base_row_up] =
               (__nv_bfloat16)val;
         }
       }
     }
+  #endif
 
     w_cur ^= 1;
     __syncthreads();

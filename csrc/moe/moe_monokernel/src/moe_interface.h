@@ -42,11 +42,19 @@ struct MoEDimensions {
 // w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
 // w2:  [256, 2048, 512]
 //
-// GRID_SIZE must satisfy both projection stages simultaneously:
-//   Up-proj:   GRID_SIZE = 2*N / W_UP_TILE = 1024 / 16 = 64
-//   Down-proj: W_DOWN_TILE = K / GRID_SIZE = 2048 / 64 = 32  (% 8 == 0 ✓)
-// Using GRID_SIZE > 64 would cause blocks beyond 63 to index past the
-// 2*N weight rows in the up-projection, producing OOB reads.
+// GRID_SIZE sizing:
+//   Up-proj:   UP_GRID = 2*N / W_UP_TILE = 1024 / 16 = 64 blocks needed
+//              to cover the full 2*N weight rows with W_UP_TILE=16 each.
+//   Down-proj: W_DOWN_TILE = K / GRID_SIZE, must be a multiple of 8 and
+//              divisible by W_DOWN_MMA_TILE = 16 for full-utilization MMA.
+//              GRID_SIZE=64 → W_DOWN_TILE=32 (2 MMA iters/block).
+//              GRID_SIZE=128 → W_DOWN_TILE=16 (1 MMA iter/block, fills
+//              more SMs for the down-proj phase).
+//
+// If GRID_SIZE > UP_GRID, blocks [UP_GRID, GRID_SIZE) skip the up-proj
+// entirely (see moe_kernel_topk_BS8 in moe.cu) and only participate in
+// the down-proj. This keeps the up-proj tiling intact while using more
+// SMs for the typically heavier down-proj stage.
 struct Dims_BS8_E256_Qwen3_5_30B_A3B {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -104,7 +112,15 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8 {
   static constexpr uint32_t DOWN_SCALE_COLS =
       (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
   struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 64;
+    // GRID_SIZE = 128:
+    //   Down-proj: W_DOWN_TILE = K / GRID = 2048 / 128 = 16 rows per block.
+    //     This exactly matches W_DOWN_MMA_TILE = 16, so each block does
+    //     one MMA iteration and 128 SMs run in parallel (vs 64 before).
+    //   Up-proj: only blocks [0, 64) participate in Phase 3. Blocks
+    //     [64, 128) skip the up-proj work and idle at the grid.sync,
+    //     then re-join all 128 blocks for Phase 4 (down-proj) and Phase 5
+    //     (writeback). See moe_kernel_topk_BS8 in moe.cu.
+    static constexpr std::uint32_t GRID_SIZE = 128;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
   };
 };
@@ -128,6 +144,10 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
   static constexpr uint32_t DOWN_SCALE_COLS =
       (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
   struct KernelConfig {
+    // See comment in Dims_BS8_... above for the GRID=128 design.
+    // BS64 keeps GRID=64 for now: its up-proj uses a different codepath
+    // (moe_up_projection_topk) with a different tiling scheme, and we
+    // focus step 1 on the BS8 path.
     static constexpr std::uint32_t GRID_SIZE = 64;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
   };
