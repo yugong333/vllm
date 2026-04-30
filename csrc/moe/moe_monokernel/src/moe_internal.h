@@ -9,6 +9,22 @@
 
   #include "moe_interface.h"
 
+// ── Profiling build flags ──────────────────────────────────────────────────
+// Define one of these to isolate the cost of calc vs prefetch warps:
+//
+//   MONO_PROFILE_SKIP_CALC     : calc warp branches are compiled out.
+//                                Only prefetch warps do real work; calc
+//                                warps still participate in syncs so the
+//                                kernel doesn't deadlock. Outputs are
+//                                garbage — useful only for timing.
+//
+//   MONO_PROFILE_SKIP_PREFETCH : prefetch warp branches are compiled out.
+//                                Calc warps run normally but read garbage
+//                                (no new data prefetched). Outputs garbage.
+//
+// Branch bodies in the kernel are wrapped with the corresponding
+// #ifndef guards — see the is_prefetch_warp / !is_prefetch_warp sites.
+
 namespace moe_monokernel {
 
 using T_element =
@@ -157,6 +173,21 @@ struct MoECoreDims {
 
   static constexpr unsigned PADDING =
       32;  // this works *slightly* better than 16 due to reduced L2 transfers
+
+  // Row padding (in bytes) for the down-projection fp8 tiles (both the
+  // weight tile w[].down and the activation tile a.down). The MMA inner
+  // loop reads each row with `byte_offset = row * stride + 4 * (t % 4)`
+  // plus a row-stride of `t / 4`. For the reads to hit all 32 banks, we
+  // need `(stride_bytes / 4) % 32 >= 4`, i.e. the row stride in dwords
+  // must leave at least 4 unique banks per row step so the `t % 4`
+  // contribution (0..3) doesn't collide across rows.
+  //
+  // With N=512 (stride 128 dwords, which is 0 mod 32 → 8-way conflict),
+  // adding 16 bytes (4 dwords) gives 132 dwords → 4 mod 32. Combined
+  // with t%4 this covers all 32 banks uniformly. PADDING=32 (the global
+  // constant above) gives 136 dwords → 8 mod 32, only 4 unique banks
+  // per 4 rows → 2-way conflict. So we use DOWN_ROW_PADDING=16 here.
+  static constexpr unsigned DOWN_ROW_PADDING = 16;
   static constexpr unsigned K_DIM_PADDED_A = Dims::HIDDEN_STATES;
   static constexpr unsigned K_DIM_PADDED_W = Dims::HIDDEN_STATES;
   static constexpr unsigned K_DIM_HALF_PADDED_A = Dims::HIDDEN_STATES / 2;
@@ -209,9 +240,15 @@ struct MoE_SHM {
       // a.down[2] is double-buffered for the down-projection pipeline:
       // one buffer is consumed by MMA while the other is written by
       // quantization.
+      //
+      // a.down rows are padded by DOWN_ROW_PADDING bytes so that the MMA
+      // inner loop's per-row stride lands on distinct banks for all 8
+      // rows touched by a warp (see comment on DOWN_ROW_PADDING above).
       union {
         AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[2][CoreDims::T_TILE][Dims::N];              // fp8
+        AQ_element down[2][CoreDims::T_TILE]
+                       [Dims::N + CoreDims::DOWN_ROW_PADDING /
+                                      sizeof(AQ_element)];  // fp8
       } a;
 
       // Per-row per-block quantization scale for a.down (double-buffered).
@@ -233,8 +270,9 @@ struct MoE_SHM {
         A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
         A_element bf16_buf[CoreDims::T_TILE][Dims::N];
         W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-        W_element down[CoreDims::W_DOWN_TILE]
-                      [Dims::N + CoreDims::PADDING / sizeof(W_element)];
+        W_element
+            down[CoreDims::W_DOWN_TILE]
+                [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(W_element)];
       } w[2];
 
       // Down-projection weight scales (double-buffered).
@@ -269,7 +307,14 @@ struct MoE_SHM {
       } partial_result;
 
       // Per-block fp32 accumulator for down-projection output.
-      T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE];
+      // Pad the row to avoid a 4-way bank conflict on write: without
+      // padding, `row_stride_dwords % 32 == 16 == tok0*stride % 32`
+      // for the 4 distinct tok0 values {0, 2, 4, 6} accessed by threads
+      // with the same `t/4`. A 1-dword padding (4 bytes) shifts the
+      // per-token offset off the shared bank-group, fully eliminating
+      // the conflict for W_DOWN_TILE in {16, 32}.
+      static constexpr uint32_t OUT_ACCUM_ROW_PAD = 1;
+      T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE + OUT_ACCUM_ROW_PAD];
     } tiny;
     // BS64 path: holds weight tiles and partial results for down-projection
     // only (up-projection uses Gemm1Data; activations come from
@@ -282,14 +327,18 @@ struct MoE_SHM {
       // Double-buffered bf16 staging area for SiLU output (fetched from
       // global memory, consumed by the quantization step).
       A_element t_bf16[2][CoreDims::T_TILE][Dims::N];
-      // Double-buffered fp8 quantized activations for MMA.
-      AQ_element t_fp8[2][CoreDims::T_TILE][Dims::N];
+      // Double-buffered fp8 quantized activations for MMA. Row-padded
+      // to avoid bank conflicts in the MMA inner loop — see the comment
+      // on DOWN_ROW_PADDING in MoECoreDims.
+      AQ_element
+          t_fp8[2][CoreDims::T_TILE]
+               [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(AQ_element)];
       // Per-token per-block activation scales for the fp8 activations.
       static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
       S_element t_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
 
       W_element w[2][CoreDims::W_DOWN_TILE]
-                 [Dims::N + CoreDims::PADDING / sizeof(W_element)];
+                 [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(W_element)];
       // Down-projection weight scales (double-buffered).
       // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
       static constexpr uint32_t DOWN_SCALE_TILE_SIZE =

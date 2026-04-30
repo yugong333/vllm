@@ -1167,7 +1167,28 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_internal.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_interface.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_debug.h"
     )
+    # Uncomment the next line to enable debug printf in the monokernel:
+    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   PROPERTIES COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
+
+    # Profiling flags — uncomment ONE of the two to isolate the wall-clock
+    # cost of calc vs prefetch warps at barrier stalls. The kernel
+    # produces garbage outputs with either flag; it's only useful for
+    # timing the remaining work via NCU or a wall-clock comparison.
+    #
+    #   SKIP_CALC     : calc-warp bodies compiled out. Prefetches still
+    #                   issue — measures "how fast would the kernel be
+    #                   if the calc path were free?"
+    #   SKIP_PREFETCH : prefetch-warp bodies compiled out. Calc still
+    #                   runs on whatever's in SHM — measures "how fast
+    #                   would the kernel be if data were already there?"
+    #
+    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC")
+    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH")
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
