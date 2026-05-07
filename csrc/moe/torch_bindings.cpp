@@ -42,16 +42,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
 #ifndef USE_ROCM
   // Top-K Monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
   m.def(
-      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8(Tensor activations_in,"
-      "Tensor router_logits,"
-      "Tensor expert_weights_up, Tensor expert_scales_up,"
-      "Tensor expert_weights_down, Tensor expert_scales_down,"
-      "Tensor! activations_out, Tensor! scratchpad,"
-      "int top_k, int scoring_func, bool renormalize) -> ()");
-  m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
-         &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_impl);
-
-  m.def(
       "moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(Tensor "
       "activations_in,"
       "Tensor router_logits,"
@@ -61,6 +51,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int top_k, int scoring_func, bool renormalize) -> ()");
   m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
          &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
+
+  // WGMMA variant of the BS8 kernel — the only BS8 implementation.
+  m.def(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA(Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA",
+         torch::kCUDA,
+         &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl);
+
+  // TMA + WGMMA variant of the BS8 kernel.  A/B alternative to the WGMMA
+  // reference kernel above; selects USE_TMA=true via KernelConfig.
+  m.def(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
+         torch::kCUDA,
+         &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

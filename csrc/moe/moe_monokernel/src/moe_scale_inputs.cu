@@ -244,6 +244,222 @@ __device__ void moe_scale_activation_BS8(
   }
 }
 
+/**
+ * @brief WGMMA variant of @ref moe_scale_activation_BS8.
+ *
+ * Writes the quantized fp8 activations in **canonical WGMMA K-major**
+ * layout for the B operand of `wgmma.mma_async.m64nNk32.e4m3`:
+ *
+ *   out[k_chunk16][tok_0_7][k_inner_0_15]
+ *
+ * where k_chunk16 ∈ [0, K/16) — one core matrix per k_chunk.  Each
+ * core matrix is 8 tokens × 16 contiguous K-bytes, matching the
+ * hardware's 8×16-byte core-matrix tile (PTX §9.7.16.5.1.2).
+ *
+ * This layout is **N-outer, K-inner**: within a core matrix, the
+ * 16 contiguous bytes are 16 consecutive K-values for ONE token.
+ * That's the only layout WGMMA accepts for fp8 operands — they must
+ * always be K-major.
+ *
+ * The function only writes its owned token slot (`row`); other tokens
+ * at the same k_chunk are written by other calc warps.
+ *
+ * @param activation_in  bf16 input activations for this token (K elements)
+ * @param dest           Shape [K/16][8][16] fp8 K-major buffer
+ * @param row            Token slot (0..BS-1) that this call populates
+ * @param act_scales_out Per-token per-block scales (K/128 elements)
+ */
+template <typename Dims, std::size_t DestRows, std::size_t DestCols,
+          std::size_t DestN>
+__device__ void moe_scale_activation_BS8_wgmma(
+    const A_element* __restrict__ activation_in,
+    AQ_element (&dest)[DestRows][DestCols][DestN], std::uint32_t row,
+    float* __restrict__ act_scales_out) {
+  static_assert(Dims::BS <= 8, "This function is only for use with BS up to 8");
+  // Canonical WGMMA K-major B-operand layout:
+  //   dest[k_chunk16][tok_0_7][k_inner_0_15]
+  static_assert(DestRows == Dims::HIDDEN_STATES / 16,
+                "dest outer dim must be K/16 (number of K-chunks of 16)");
+  static_assert(DestCols == 8, "dest middle dim must be 8 (N rows per tile)");
+  static_assert(DestN == 16,
+                "dest inner dim must be 16 (K bytes per core matrix)");
+  static_assert(Dims::HIDDEN_STATES % 128 == 0,
+                "HIDDEN_STATES must be a multiple of 128 (activation block)");
+
+  using CoreDims = MoECoreDims<Dims>;
+  constexpr uint32_t ACT_BLOCK = 128;
+  constexpr uint32_t NUM_ACT_BLOCKS = Dims::HIDDEN_STATES / ACT_BLOCK;
+  constexpr uint32_t FLOATS_PER_LOAD = 4;
+  static_assert(CoreDims::THREADS_PER_WARP * FLOATS_PER_LOAD == ACT_BLOCK,
+                "Warp iteration must equal one 128-element quant block");
+
+  const std::uint32_t thread = get_thread<Dims>();
+  constexpr float FP8_MAX = 448.f;
+  constexpr float FP8_MAX_INV = 1.0f / 448.f;
+
+  // Process each 128-element block. Each thread covers 4 K-values.
+  // With 8 K-chunks (of 16) per 128-block, thread*4 is always aligned
+  // such that its 4 K-values fall within a single 16-wide K-chunk.
+  #pragma unroll
+  for (uint32_t blk = 0; blk < NUM_ACT_BLOCKS; ++blk) {
+    uint32_t blk_start = blk * ACT_BLOCK;
+    uint32_t col = blk_start + thread * FLOATS_PER_LOAD;
+
+    __nv_bfloat162 bf_01 =
+        *reinterpret_cast<const __nv_bfloat162*>(&activation_in[col + 0]);
+    __nv_bfloat162 bf_23 =
+        *reinterpret_cast<const __nv_bfloat162*>(&activation_in[col + 2]);
+    bf_01 = mask_NaNs_to_zero(bf_01);
+    bf_23 = mask_NaNs_to_zero(bf_23);
+    float2 f01 = __bfloat1622float2(bf_01);
+    float2 f23 = __bfloat1622float2(bf_23);
+    float r0 = f01.x, r1 = f01.y, r2 = f23.x, r3 = f23.y;
+
+    float local_max =
+        fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
+    float blk_max = warp_reduce_max_float(local_max);
+    if (blk_max < __FLT_MIN__) blk_max = 1.f;
+
+    float blk_act_scale = blk_max * FP8_MAX_INV;
+    float blk_inv_scale = FP8_MAX / blk_max;
+
+    AQ_element q0 = (AQ_element)(r0 * blk_inv_scale);
+    AQ_element q1 = (AQ_element)(r1 * blk_inv_scale);
+    AQ_element q2 = (AQ_element)(r2 * blk_inv_scale);
+    AQ_element q3 = (AQ_element)(r3 * blk_inv_scale);
+
+    // K-major canonical write:
+    //   dest[(col+i)/16][row][(col+i)%16] = q_i
+    // Each thread owns 4 consecutive K-values (col..col+3). Since
+    // col is always aligned to 4 and chunk width is 16, the 4 values
+    // always fall within the same k_chunk (col/16 == (col+3)/16 when
+    // col%16 ∈ {0, 4, 8, 12}).
+    uint32_t kc = col / 16;
+    uint32_t ki = col % 16;
+    dest[kc][row][ki + 0] = q0;
+    dest[kc][row][ki + 1] = q1;
+    dest[kc][row][ki + 2] = q2;
+    dest[kc][row][ki + 3] = q3;
+
+    if (thread == 0) act_scales_out[blk] = blk_act_scale;
+  }
+}
+
+/**
+ * @brief v1 streaming-pipeline per-K-tile bf16 → fp8 quantization.
+ *
+ * Called by the 8 calc warps (warps 0..7) during the streaming K-loop's
+ * quantize half-stage.  Each calc warp handles EXACTLY ONE token slot
+ * (warp_id == tok_slot), converting 128 bf16 K-values into 128 fp8
+ * K-values with a per-token-per-128-K-block scale.
+ *
+ * Input layout:
+ *   bf16_in[tok][0..127]  — contiguous bf16 activations for token `tok`,
+ *                            for the current K=128 tile.
+ *
+ * Output layout (canonical WGMMA K-major):
+ *   fp8_act[kc][tok][ki]  — where kc = 0..7, tok = 0..7, ki = 0..15,
+ *                            and kc*16 + ki = global K within the tile.
+ *
+ * Scale output:
+ *   act_scale_for_step    — one fp32 scale value per token (this K-step's
+ *                            block-wise scale for blk = k_step_idx).
+ *                            Caller supplies a pointer to the (tok, blk)
+ *                            slot of shmem->act_scale.
+ *
+ * Thread distribution: 32 threads per warp, each owning 4 K-values
+ * (4 × 32 = 128 = one full tile).  Warp-reduce finds the block max.
+ * If `tok >= batch_size`, the warp zero-fills its fp8 slot and writes
+ * act_scale = 1.0f (neutral — the scale-apply will multiply by zero via
+ * the `as_0X = (tok < batch_size) ? ... : 0.f` guard in the up-proj
+ * kernel, so this scale value is never consumed).
+ *
+ * The canonical fp8 output layout means thread t writes its 4 quantized
+ * values at
+ *   fp8_act[(col+i)/16][tok][(col+i)%16]
+ * where col = t * 4 and i in 0..3.  With 4 consecutive K-values per
+ * thread and a 16-wide chunk, all 4 values fall in the same kc.
+ *
+ * @tparam Dims              MoE dims.
+ * @tparam BF16InRows        Must be T_TILE (8).
+ * @tparam BF16InCols        Must be K_STEP_WGMMA (128).
+ * @tparam Fp8NumChunks      Must be K_STEP_WGMMA / 16 (8).
+ * @tparam Fp8Tok            Must be T_TILE (8).
+ * @tparam Fp8KInner         Must be 16.
+ * @param  bf16_in           SHM-resident bf16 input tile [T_TILE][128].
+ * @param  fp8_act           SHM output fp8 tile
+ *                            [Fp8NumChunks][T_TILE][Fp8KInner].
+ * @param  tok               Token slot this call is writing (= calc warp id).
+ * @param  batch_size        Number of real tokens (remaining zero-filled).
+ * @param  act_scale_for_step fp32 destination for this token's scale.
+ */
+template <typename Dims, std::size_t BF16InRows, std::size_t BF16InCols,
+          std::size_t Fp8NumChunks, std::size_t Fp8Tok, std::size_t Fp8KInner>
+__device__ __forceinline__ void moe_streaming_quantize_k128(
+    const A_element (&bf16_in)[BF16InRows][BF16InCols],
+    AQ_element (&fp8_act)[Fp8NumChunks][Fp8Tok][Fp8KInner], std::uint32_t tok,
+    std::uint32_t batch_size, float* __restrict__ act_scale_for_step) {
+  static_assert(Dims::BS <= 8, "Streaming quantize is for BS<=8");
+  static_assert(BF16InRows == 8, "bf16_in must have 8 token rows");
+  static_assert(BF16InCols == 128, "bf16_in must have 128 K cols");
+  static_assert(Fp8NumChunks == 8, "fp8_act must have 8 K-chunks of 16");
+  static_assert(Fp8Tok == 8, "fp8_act must have 8 token rows");
+  static_assert(Fp8KInner == 16, "fp8_act inner dim must be 16");
+
+  const std::uint32_t thread = get_thread<Dims>();  // 0..31
+  constexpr float FP8_MAX = 448.f;
+  constexpr float FP8_MAX_INV = 1.0f / 448.f;
+
+  if (tok >= batch_size) {
+    // Zero-fill the unused token slot so WGMMA's B operand sees no
+    // stray fp8 NaN bit patterns.  32 threads × 4 bytes = 128 B =
+    // one full token row across all 8 K-chunks.
+    const uint32_t col = thread * 4;  // 0, 4, 8, ..., 124
+    const uint32_t kc = col / 16;
+    const uint32_t ki = col % 16;
+    fp8_act[kc][tok][ki + 0] = (AQ_element)0;
+    fp8_act[kc][tok][ki + 1] = (AQ_element)0;
+    fp8_act[kc][tok][ki + 2] = (AQ_element)0;
+    fp8_act[kc][tok][ki + 3] = (AQ_element)0;
+    if (thread == 0) *act_scale_for_step = 1.0f;
+    return;
+  }
+
+  // Real token path: load 4 bf16, warp-reduce max, quantize.
+  const uint32_t col = thread * 4;
+  __nv_bfloat162 bf_01 =
+      *reinterpret_cast<const __nv_bfloat162*>(&bf16_in[tok][col + 0]);
+  __nv_bfloat162 bf_23 =
+      *reinterpret_cast<const __nv_bfloat162*>(&bf16_in[tok][col + 2]);
+  bf_01 = mask_NaNs_to_zero(bf_01);
+  bf_23 = mask_NaNs_to_zero(bf_23);
+  float2 f01 = __bfloat1622float2(bf_01);
+  float2 f23 = __bfloat1622float2(bf_23);
+  float r0 = f01.x, r1 = f01.y, r2 = f23.x, r3 = f23.y;
+
+  float local_max =
+      fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
+  float blk_max = warp_reduce_max_float(local_max);
+  if (blk_max < __FLT_MIN__) blk_max = 1.f;
+
+  const float blk_act_scale = blk_max * FP8_MAX_INV;
+  const float blk_inv_scale = FP8_MAX / blk_max;
+
+  AQ_element q0 = (AQ_element)(r0 * blk_inv_scale);
+  AQ_element q1 = (AQ_element)(r1 * blk_inv_scale);
+  AQ_element q2 = (AQ_element)(r2 * blk_inv_scale);
+  AQ_element q3 = (AQ_element)(r3 * blk_inv_scale);
+
+  const uint32_t kc = col / 16;
+  const uint32_t ki = col % 16;
+  fp8_act[kc][tok][ki + 0] = q0;
+  fp8_act[kc][tok][ki + 1] = q1;
+  fp8_act[kc][tok][ki + 2] = q2;
+  fp8_act[kc][tok][ki + 3] = q3;
+
+  if (thread == 0) *act_scale_for_step = blk_act_scale;
+}
+
 namespace detail {
 
 /**
