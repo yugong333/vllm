@@ -60,6 +60,7 @@ __device__ void moe_kernel_topk_BS8(
   static_assert(Dims::BS <= 8);
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
+  static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
   // ── Phase 1: routing (topK) — no prefetch needed ────────────────────────
@@ -113,7 +114,7 @@ __device__ void moe_kernel_topk_BS8(
   const bool in_up = (up_group < UP_GROUPS);
 
   // Phase 2 is a no-op for the v1 streaming WGMMA pipeline.  Phase 3's
-  // moe_up_projection_BS8_allexperts_wgmma does its own priming:
+  // moe_up_projection_BS8_allexperts_wgmma_tma does its own priming:
   //   (1) prefetch bf16_in[0] from global
   //   (2) prefetch w[0] and bf16_in[1] || quantize bf16_in[0] → fp8[0]
   // and then the streaming K-loop alternates WGMMA + bf16 prefetch with
@@ -127,29 +128,15 @@ __device__ void moe_kernel_topk_BS8(
   // k index within a token's top-K list), so the groups never have a
   // write conflict.
   //
-  // Compile-time dispatch (spec R6.4):
-  //   - `USE_WGMMA && USE_TMA`  → `moe_up_projection_BS8_allexperts_wgmma_tma`
-  //     (TMA loaders for both bf16 activations and fp8 weights; requires
-  //     the two `__grid_constant__ CUtensorMap` kernel parameters).
-  //   - `USE_WGMMA` only        → existing
-  //   `moe_up_projection_BS8_allexperts_wgmma`
-  //     (cp.async reference path; descriptors are ignored).
-  //
-  // The BS8 path asserts `use_wgmma<Dims>::value` at the top of this
-  // function, so no non-WGMMA branch is needed.
+  // The BS8 path is TMA+WGMMA only; the kernel asserts
+  // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
+  // this function, so dispatch is unconditional.
   if (in_up && up_group < shmem->expert_count) {
-    if constexpr (use_wgmma<Dims>::value && use_tma<Dims>::value) {
-      moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
-          activations_in, expert_weights_up, expert_scales_up, top_k,
-          batch_size, spec, shmem, up_weights_desc, activations_desc,
-          up_block_idx, /*expert_start=*/up_group,
-          /*expert_stride=*/UP_GROUPS);
-    } else {
-      moe_up_projection_BS8_allexperts_wgmma<Dims>(
-          activations_in, expert_weights_up, expert_scales_up, top_k,
-          batch_size, spec, shmem, up_block_idx, /*expert_start=*/up_group,
-          /*expert_stride=*/UP_GROUPS);
-    }
+    moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
+        activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
+        spec, shmem, up_weights_desc, activations_desc, up_block_idx,
+        /*expert_start=*/up_group,
+        /*expert_stride=*/UP_GROUPS);
   }
 
   // ── Single grid.sync — all blocks finish writing spec->temp_bf16 ──────
@@ -164,26 +151,12 @@ __device__ void moe_kernel_topk_BS8(
   // The WGMMA down-projection function zeroes its own per-block
   // out_accum in SHM internally, so no pre-zero is needed here.
   //
-  // Compile-time dispatch (spec R9.4, R10.2, R13.1):
-  //   - `USE_WGMMA && USE_TMA` → `moe_down_projection_BS8_allexperts_wgmma_tma`
-  //     (TMA loaders for the down-proj weight + intermediate activation
-  //     tiles; requires the two new `__grid_constant__ CUtensorMap`
-  //     kernel parameters).
-  //   - `USE_WGMMA` only       → existing
-  //   `moe_down_projection_BS8_allexperts_wgmma`
-  //     (cp.async reference path; descriptors are ignored).
-  //
-  // The BS8 path asserts `use_wgmma<Dims>::value` at the top of this
-  // function, so no non-WGMMA branch is needed.
-  if constexpr (use_wgmma<Dims>::value && use_tma<Dims>::value) {
-    moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
-        expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
-        down_weights_desc, down_activations_desc);
-  } else if constexpr (use_wgmma<Dims>::value) {
-    moe_down_projection_BS8_allexperts_wgmma<Dims>(expert_weights_down,
-                                                   expert_scales_down, top_k,
-                                                   batch_size, spec, shmem);
-  }
+  // The BS8 path is TMA+WGMMA only; the kernel asserts
+  // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
+  // this function, so dispatch is unconditional.
+  moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
+      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
+      down_weights_desc, down_activations_desc);
 
   // ── grid.sync — all blocks finish writing spec->down_partial_out ───
   cooperative_groups::this_grid().sync();

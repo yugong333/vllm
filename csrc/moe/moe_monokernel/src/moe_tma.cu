@@ -201,15 +201,7 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
       // the pointer value, it never writes through it.
       const_cast<void*>(weights_ptr), global_dim, global_strides, box_dim,
       element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      // SWIZZLE_128B: bank-conflict-free SHM reads during WGMMA. The
-      // WGMMA A-descriptor must use swizzle=1 (128B mode) on the
-      // paired read to unscramble. Data layout remains canonical
-      // Major::K — the swizzle permutes bytes within each 128-byte row
-      // for bank spreading, not for layout transpose. The Python
-      // pre-interleave (interleave_for_tma_wgmma_down) is still
-      // required; it handles the core-matrix transpose which is
-      // separate from the swizzle.
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   // R6.5: on failure, raise a TORCH_CHECK naming the failing tensor so the

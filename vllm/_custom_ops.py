@@ -310,7 +310,14 @@ def moe_monokernel_topk(
         "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
     if M <= 8:
-        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA(
+        # BS8 uses the TMA+WGMMA kernel. The TMA descriptors expect the
+        # up-projection weights to be pre-interleaved via
+        # `interleave_for_tma_wgmma` and the down-projection weights via
+        # `interleave_for_tma_wgmma_down` before this op is called.
+        # Callers that want to use the high-level op without manual
+        # pre-interleaving should stage those transforms in the model
+        # loader (one-off, per-expert weight prep), not per-forward.
+        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
             activations_in,
             router_logits,
             expert_weights_up,

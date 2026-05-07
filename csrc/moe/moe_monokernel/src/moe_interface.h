@@ -117,42 +117,11 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
 //     WGMMA descriptors reference them directly.
 //
 // The rest of the kernel (BS8 down-proj, BS64 paths) is unchanged.
-struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 512;
-  static constexpr uint32_t BS = 8;
-  static constexpr uint32_t M = 8;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
-  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
-  static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  static constexpr uint32_t UP_SCALE_ROWS =
-      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
-  static constexpr uint32_t UP_SCALE_COLS =
-      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
-  static constexpr uint32_t DOWN_SCALE_ROWS =
-      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
-  static constexpr uint32_t DOWN_SCALE_COLS =
-      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
-  struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 128;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-    // Selects the WGMMA up-proj code path and its SHM layout.
-    static constexpr bool USE_WGMMA = true;
-    // TMA-based weight/activation loading is opt-in; default false so this
-    // reference WGMMA variant keeps the existing cp.async loaders. The
-    // Dims_BS8_..._WGMMA_TMA variant sets USE_TMA=true to enable TMA.
-    static constexpr bool USE_TMA = false;
-  };
-};
-
-// ── TMA variant of the BS8 WGMMA block-wise kernel ───────────────────────
-// Mirrors `Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA` exactly but sets
-// `KernelConfig::USE_TMA = true` on top of `USE_WGMMA = true` so the
-// up-projection dispatches to `moe_up_projection_BS8_allexperts_wgmma_tma`
-// (TMA loaders for both bf16 activations and fp8 weights).  Registered as
-// an A/B alternative to the cp.async reference variant (spec R8.1, R8.3).
+// ── BS8 WGMMA kernel (TMA-only) ─────────────────────────────────────────
+// Single BS8 variant: TMA + WGMMA. The cp.async reference variant has
+// been removed; BS8 callers must pre-interleave up-projection weights
+// via `interleave_for_tma_wgmma` and down-projection weights via
+// `interleave_for_tma_wgmma_down` before launching the kernel.
 struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
