@@ -164,16 +164,11 @@ MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
     moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
 
-// WGMMA variant of the BS8 path — the only BS8 implementation. Selects
-// USE_WGMMA=true via KernelConfig.
-MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
-    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl,
-    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA)
-
-// TMA + WGMMA variant of the BS8 path.  Same shape as the WGMMA reference
-// kernel above, but selects the TMA-based weight + activation load path in
-// Phase 3 via `KernelConfig::USE_TMA = true`.  Registered as the A/B
-// alternative used for bit-exact correctness testing (spec R8.2).
+// TMA + WGMMA variant of the BS8 path — the only BS8 implementation.
+// Selects the TMA-based weight + activation load path in Phase 3 via
+// `KernelConfig::USE_TMA = true`. Callers must pre-interleave the up and
+// down projection weights (see `interleave_for_tma_wgmma` /
+// `interleave_for_tma_wgmma_down` in the Python bindings).
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl,
     moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA)
