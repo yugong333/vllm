@@ -69,6 +69,41 @@
     const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);                   \
     const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);             \
                                                                                \
+    /* TMA descriptors for the BS8 WGMMA up-projection path (spec R6.2,        \
+       R6.3) and down-projection path (spec R9.1, R9.2, R9.3).  Non-TMA        \
+       variants leave these zero-initialized — the kernel parameters are     \
+       always present on the signature but the TMA path is the only            \
+       consumer.  TMA-enabled variants build real descriptors via the          \
+       host-side factories and pass them in kernel_args positions matching     \
+       the kernel signature. */                                                \
+    CUtensorMap up_weights_desc{};                                             \
+    CUtensorMap activations_desc{};                                            \
+    CUtensorMap down_weights_desc{};                                           \
+    CUtensorMap down_activations_desc{};                                       \
+    if constexpr (use_tma<dims>::value) {                                      \
+      up_weights_desc = create_up_weight_tma_desc(                             \
+          reinterpret_cast<const void*>(expert_weights_up_ptr),                \
+          dims::NUM_EXPERTS, dims::N, dims::K);                                \
+      activations_desc = create_activations_tma_desc(                          \
+          reinterpret_cast<const void*>(activations_in_ptr), dims::BS,         \
+          dims::HIDDEN_STATES);                                                \
+      /* Down-projection weight descriptor.  The Python caller is              \
+         responsible for passing `expert_weights_down` pre-interleaved via     \
+         `interleave_for_tma_wgmma_down` when USE_TMA is true (spec R9.5). */  \
+      down_weights_desc = create_down_weight_tma_desc(                         \
+          reinterpret_cast<const void*>(expert_weights_down_ptr),              \
+          dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N);                    \
+      /* Down-projection activation descriptor reads from `spec->temp_fp8`     \
+         which lives inside the scratchpad.  Compute the device pointer        \
+         from the scratchpad base + the compile-time offset of temp_fp8        \
+         inside `MoEGemmSpec<dims>` (spec R9.2). */                            \
+      const void* temp_fp8_ptr =                                               \
+          reinterpret_cast<const char*>(scratchpad_ptr) +                      \
+          MoEGemmSpec<dims>::TEMP_FP8_OFFSET;                                  \
+      down_activations_desc = create_down_activation_tma_desc(                 \
+          temp_fp8_ptr, MoEGemmSpec<dims>::TEMP_ROWS_TMA, dims::N);            \
+    }                                                                          \
+                                                                               \
     void* kernel_args[] = {(void*)&activations_in_ptr,                         \
                            (void*)&num_tokens,                                 \
                            (void*)&router_logits_ptr,                          \
@@ -82,7 +117,11 @@
                            (void*)&shmem_size,                                 \
                            (void*)&top_k_u32,                                  \
                            (void*)&sf,                                         \
-                           (void*)&renormalize};                               \
+                           (void*)&renormalize,                                \
+                           (void*)&up_weights_desc,                            \
+                           (void*)&activations_desc,                           \
+                           (void*)&down_weights_desc,                          \
+                           (void*)&down_activations_desc};                     \
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();              \
     CUDA_CHECK(cudaFuncSetAttribute(                                           \
         moe_kernel_topk<dims>, cudaFuncAttributeMaxDynamicSharedMemorySize,    \
@@ -122,8 +161,19 @@
 // Qwen3.5-35B FP8 block-wise (128×128) quantization (E=256, K=2048, N=512,
 // TP=1)
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
-    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_impl,
-    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8)
-MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
     moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
+
+// WGMMA variant of the BS8 path — the only BS8 implementation. Selects
+// USE_WGMMA=true via KernelConfig.
+MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
+    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl,
+    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA)
+
+// TMA + WGMMA variant of the BS8 path.  Same shape as the WGMMA reference
+// kernel above, but selects the TMA-based weight + activation load path in
+// Phase 3 via `KernelConfig::USE_TMA = true`.  Registered as the A/B
+// alternative used for bit-exact correctness testing (spec R8.2).
+MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
+    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl,
+    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA)

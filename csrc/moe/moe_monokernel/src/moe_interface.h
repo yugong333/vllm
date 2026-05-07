@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -41,33 +42,6 @@ struct MoEDimensions {
 //   hidden_size (K) = 2048, moe_intermediate_size (N) = 512
 // w13: [256, 1024, 2048] → N=512 (half of fused gate+up), K=2048
 // w2:  [256, 2048, 512]
-//
-// GRID_SIZE sizing:
-//   Up-proj:   UP_GRID = 2*N / W_UP_TILE = 1024 / 16 = 64 blocks needed
-//              to cover the full 2*N weight rows with W_UP_TILE=16 each.
-//   Down-proj: W_DOWN_TILE = K / GRID_SIZE, must be a multiple of 8 and
-//              divisible by W_DOWN_MMA_TILE = 16 for full-utilization MMA.
-//              GRID_SIZE=64 → W_DOWN_TILE=32 (2 MMA iters/block).
-//              GRID_SIZE=128 → W_DOWN_TILE=16 (1 MMA iter/block, fills
-//              more SMs for the down-proj phase).
-//
-// If GRID_SIZE > UP_GRID, blocks [UP_GRID, GRID_SIZE) skip the up-proj
-// entirely (see moe_kernel_topk_BS8 in moe.cu) and only participate in
-// the down-proj. This keeps the up-proj tiling intact while using more
-// SMs for the typically heavier down-proj stage.
-struct Dims_BS8_E256_Qwen3_5_30B_A3B {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 512;
-  static constexpr uint32_t BS = 8;
-  static constexpr uint32_t M = 8;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 64;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-  };
-};
-
 struct Dims_BS64_E256_Qwen3_5_30B_A3B {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -92,39 +66,6 @@ struct Dims_BS64_E256_Qwen3_5_30B_A3B {
 // has its own FP8 scale.
 //   Up-proj scales:   [E, ceil(2*N/128), ceil(K/128)] = [E, 8, 16]
 //   Down-proj scales: [E, ceil(K/128), ceil(N/128)]   = [E, 16, 4]
-struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8 {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 512;
-  static constexpr uint32_t BS = 8;
-  static constexpr uint32_t M = 8;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
-  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
-  static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  // Derived scale dimensions
-  static constexpr uint32_t UP_SCALE_ROWS =
-      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
-  static constexpr uint32_t UP_SCALE_COLS =
-      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
-  static constexpr uint32_t DOWN_SCALE_ROWS =
-      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
-  static constexpr uint32_t DOWN_SCALE_COLS =
-      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
-  struct KernelConfig {
-    // GRID_SIZE = 128:
-    //   Down-proj: W_DOWN_TILE = K / GRID = 2048 / 128 = 16 rows per block.
-    //     This exactly matches W_DOWN_MMA_TILE = 16, so each block does
-    //     one MMA iteration and 128 SMs run in parallel (vs 64 before).
-    //   Up-proj: only blocks [0, 64) participate in Phase 3. Blocks
-    //     [64, 128) skip the up-proj work and idle at the grid.sync,
-    //     then re-join all 128 blocks for Phase 4 (down-proj) and Phase 5
-    //     (writeback). See moe_kernel_topk_BS8 in moe.cu.
-    static constexpr std::uint32_t GRID_SIZE = 128;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-  };
-};
-
 struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -150,6 +91,93 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
     // focus step 1 on the BS8 path.
     static constexpr std::uint32_t GRID_SIZE = 64;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
+  };
+};
+
+// ── WGMMA variant of the BS8 block-wise kernel (v1 dual-WG K=128) ────────
+// Opts into the Hopper wgmma.mma_async fp8 path for Phase 3 (up-proj)
+// only.  All other phases (routing, input-quant-setup, down-proj,
+// writeback) use the existing mma.sync code.
+//
+// Layout implications when USE_WGMMA=true:
+//   - W_UP_TILE_WGMMA = 128 (each block owns 128 weight rows per K-step:
+//     64 for WG0 + 64 for WG1, with WG0 = gate[base..base+31] + up,
+//     WG1 = gate[base+32..base+63] + up).
+//   - UP_GRID = 2*N / 128 = 8 row-tiles per expert.
+//   - With GRID_SIZE = 128, UP_GROUPS = 128 / 8 = 16 experts in parallel
+//     (expert_stride = 16).
+//   - K_STEP_WGMMA = 128: each K-step consumes K=128 via 4 chained
+//     wgmma.mma_async.m64n8k32 instructions per WG.
+//   - K_TILES_WGMMA = 2048 / 128 = 16 K-steps per expert per block.
+//   - Streaming activation pipeline: bf16 input and fp8 activation tiles
+//     are K=128 and double-buffered; weight tile is K=128×128 and
+//     single-buffered.  Phase 2's upfront full-K quantization is removed.
+//   - SHM layout for `w_wgmma` and `a.fp8_act` uses canonical K-major
+//     (8×16-byte core matrices) without `rotate_col_32` swizzling, so
+//     WGMMA descriptors reference them directly.
+//
+// The rest of the kernel (BS8 down-proj, BS64 paths) is unchanged.
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    // Selects the WGMMA up-proj code path and its SHM layout.
+    static constexpr bool USE_WGMMA = true;
+    // TMA-based weight/activation loading is opt-in; default false so this
+    // reference WGMMA variant keeps the existing cp.async loaders. The
+    // Dims_BS8_..._WGMMA_TMA variant sets USE_TMA=true to enable TMA.
+    static constexpr bool USE_TMA = false;
+  };
+};
+
+// ── TMA variant of the BS8 WGMMA block-wise kernel ───────────────────────
+// Mirrors `Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA` exactly but sets
+// `KernelConfig::USE_TMA = true` on top of `USE_WGMMA = true` so the
+// up-projection dispatches to `moe_up_projection_BS8_allexperts_wgmma_tma`
+// (TMA loaders for both bf16 activations and fp8 weights).  Registered as
+// an A/B alternative to the cp.async reference variant (spec R8.1, R8.3).
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    // Enables the TMA-based weight + activation load path in Phase 3 of the
+    // BS8 WGMMA up-projection kernel.
+    static constexpr bool USE_TMA = true;
   };
 };
 
@@ -213,7 +241,11 @@ __global__ extern void moe_kernel_topk(
     const S_element* __restrict expert_scales_down,
     R_element* __restrict activations_out, void* __restrict__ scratchpad,
     size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize);
+    ScoringFunc scoring_func, bool renormalize,
+    __grid_constant__ CUtensorMap const up_weights_desc,
+    __grid_constant__ CUtensorMap const activations_desc,
+    __grid_constant__ CUtensorMap const down_weights_desc,
+    __grid_constant__ CUtensorMap const down_activations_desc);
 
 }  // namespace moe_monokernel
 

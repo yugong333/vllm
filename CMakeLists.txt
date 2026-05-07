@@ -1145,8 +1145,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/moe/moe_wna16.cu")
 
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
+    # moe_tma.cu is a standalone host-side TU that defines the
+    # CUtensorMap descriptor factories consumed by the TMA WGMMA variant.
+    # Unlike the other src/*.cu files, it is NOT #included into moe.cu —
+    # it is compiled independently and linked.
     set(SRCS
-       "csrc/moe/moe_monokernel/moe_wrapper.cu")
+       "csrc/moe/moe_monokernel/moe_wrapper.cu"
+       "csrc/moe/moe_monokernel/src/moe_tma.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "9.0a")
@@ -1167,11 +1172,27 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_internal.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_interface.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_debug.h"
+    )
+    # moe_tma.cu depends on moe_tma.h; declare so rebuilds happen when
+    # the header changes.
+    set_property(SOURCE "csrc/moe/moe_monokernel/src/moe_tma.cu" APPEND PROPERTY
+      OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
     )
     # Uncomment the next line to enable debug printf in the monokernel:
     # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   PROPERTIES COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
+
+    # Focused WGMMA input/output debug: prints the A (weight) and B
+    # (activation) SHM tiles for block 0, expert 0, first K-step, plus
+    # the accumulator values after the first 128-K-block commit.  Used
+    # to cross-check against a Python reference of the same WGMMA.
+    # Disabled after WGMMA bring-up was confirmed correct.
+    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   PROPERTIES COMPILE_DEFINITIONS "WGMMA_INPUT_DEBUG")
 
     # Profiling flags — uncomment ONE of the two to isolate the wall-clock
     # cost of calc vs prefetch warps at barrier stalls. The kernel

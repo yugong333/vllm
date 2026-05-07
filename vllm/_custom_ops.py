@@ -316,7 +316,7 @@ def moe_monokernel_topk(
         "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
     if M <= 8:
-        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8(
+        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA(
             activations_in,
             router_logits,
             expert_weights_up,

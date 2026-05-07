@@ -345,6 +345,59 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   }
   shm->path.bs8.expert_ids = packed;
   shm->expert_count = ec;
+
+  // ── TMA-only: build the three per-expert reorganization tables ──────────
+  // expert_routed_count[eid] = # of routed (tok, k_in_topk) pairs selecting eid
+  // expert_slot_start[eid]   = exclusive prefix sum over expert_routed_count
+  // sorted_slot[pair]        = destination row in spec->temp_fp8 for the
+  //                            up-proj SiLU+fp8 writeback, where
+  //                            pair = tok * top_k + k_in_topk.  Equal to
+  //                            expert_slot_start[eid] + intra-expert rank.
+  //
+  // Iterating (t, k) in ascending order guarantees the intra-expert rank is
+  // lexicographic in (tok, k_in_topk), so the layout is deterministic (R11.2).
+  // Sentinel topk_ids_flat == 0xFFFF (unrouted slot) is skipped.
+  //
+  // Cost: ≤ NUM_EXPERTS (= 256) zero/prefix iterations + batch_size * top_k
+  // (≤ 64) routed-pair iterations.  All on thread 0 — no inter-thread sync.
+  if constexpr (use_tma<Dims>::value) {
+    auto* tma_shm = &shm->u.tiny_wgmma_tma;
+
+    // Pass 1: zero counts, then count routed pairs per expert.
+    for (uint32_t eid = 0; eid < Dims::NUM_EXPERTS; ++eid) {
+      tma_shm->expert_routed_count[eid] = 0;
+    }
+    for (uint32_t t = 0; t < batch_size; t++) {
+      for (uint32_t k = 0; k < top_k; k++) {
+        uint16_t eid = shm->topk_ids_flat[t * MAX_TOPK + k];
+        if (eid != 0xFFFF) tma_shm->expert_routed_count[eid]++;
+      }
+    }
+
+    // Pass 2: exclusive prefix sum → expert_slot_start.
+    // Invariant at end: running == batch_size * top_k (at most 64 for BS=8).
+    uint32_t running = 0;
+    for (uint32_t eid = 0; eid < Dims::NUM_EXPERTS; ++eid) {
+      tma_shm->expert_slot_start[eid] = (uint16_t)running;
+      running += tma_shm->expert_routed_count[eid];
+    }
+
+    // Pass 3: assign each routed pair its destination slot.
+    // `write_head` is a local counter so we don't disturb expert_routed_count
+    // (which Phase 4 reads to size the bulk activation TMA).
+    // For BS=8, top_k=8, NUM_EXPERTS=256 this is 256 B on thread 0's stack.
+    uint8_t write_head[Dims::NUM_EXPERTS] = {0};
+    for (uint32_t t = 0; t < batch_size; t++) {
+      for (uint32_t k = 0; k < top_k; k++) {
+        uint16_t eid = shm->topk_ids_flat[t * MAX_TOPK + k];
+        if (eid == 0xFFFF) continue;
+        uint32_t pair = t * top_k + k;
+        uint32_t rank = write_head[eid]++;
+        tma_shm->sorted_slot[pair] =
+            (uint8_t)(tma_shm->expert_slot_start[eid] + rank);
+      }
+    }
+  }
 }
 
 }  // namespace moe_monokernel

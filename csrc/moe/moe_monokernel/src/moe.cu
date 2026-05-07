@@ -16,6 +16,7 @@
 #include "moe_internal.h"
 #include "moe_prepare.cu"
 #include "moe_scale_inputs.cu"
+#include "moe_tma.h"
 #include "moe_up_projection.cu"
 #include "moe_routing.cu"
 #undef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
@@ -23,28 +24,24 @@
 namespace moe_monokernel {
 
 /**
- * @brief Top-K MoE kernel — split-phase path for BS <= 8.
+ * @brief Top-K MoE kernel — split-phase WGMMA path for BS <= 8.
  *
- * Compact SHM layout with unions:
- *   a: fp8 up-activations / double-buffered fp8 down-activations
- *   w[2]: double-buffered orig(bf16) / w_up(fp8) / w_down(fp8)
- *   partial_result: up / down scratch
+ * Uses the v1 dual-warpgroup K=128 streaming WGMMA pipeline for both
+ * up- and down-projections.
  *
  * Pipeline:
- *   Phase 1: fetch orig into w[0].orig || routing + topK
- *   Phase 2: quantize w[0].orig → a.up || prefetch w_up into w[1].up
- *   Phase 3: up-proj loop (double-buffered w[].up)
- *            → SiLU → write bf16 to spec->temp_bf16
+ *   Phase 1: routing + topK (prefetch warps idle)
+ *   Phase 2: no-op (streaming WGMMA up-proj does its own priming)
+ *   Phase 3: up-proj — streaming WGMMA with on-the-fly bf16→fp8
+ *            quantize → SiLU → write bf16 to spec->temp_bf16
  *   grid.sync()
- *   Phase 4: down-proj pipelined design with fixed w[2] slot roles:
- *            w[0] = bf16 intermediates, w[1] = fp8 weights
- *            Stage 0: all warps fetch expert 0's bf16 → w[0].bf16_buf
- *            Per expert:
- *              Stage A: prefetch w_down → w[1] || quantize w[0].bf16_buf →
- * a.down Stage B: prefetch next bf16 → w[0] || MMA a.down × w[1].down → accum
- *   Phase 5: writeback out_accum → global bf16
+ *   Phase 4: down-proj — streaming WGMMA; each block writes a
+ *            per-expert-group fp32 partial sum to
+ *            spec->down_partial_out[group][tok][col]
+ *   grid.sync()
+ *   Phase 5: reduce across groups, write bf16 activations_out.
  *
- * 1 grid sync total.
+ * 2 grid syncs total.
  */
 template <typename Dims>
 __device__ void moe_kernel_topk_BS8(
@@ -56,145 +53,188 @@ __device__ void moe_kernel_topk_BS8(
     const S_element* __restrict__ expert_scales_down,
     R_element* __restrict__ activations_out, uint32_t top_k,
     ScoringFunc scoring_func, bool renormalize,
-    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem) {
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
+    CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
+    CUtensorMap const& down_weights_desc,
+    CUtensorMap const& down_activations_desc) {
   static_assert(Dims::BS <= 8);
+  static_assert(use_wgmma<Dims>::value,
+                "BS8 path requires the WGMMA configuration (use_wgmma).");
   using CoreDims = MoECoreDims<Dims>;
 
-  cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
-  auto* shm = &shmem->u.tiny;
-
-  // ── Phase 1: prefetch activations into w[0].orig || routing ─────────────
-  // Phase 1 is always executed — routing (topK / prepare_moe_topk) writes
-  // shmem->experts and shmem->topk_ids_flat which later phases depend on.
-  // Skipping it would leave those fields uninitialized and make profiling
-  // garbage.
+  // ── Phase 1: routing (topK) — no prefetch needed ────────────────────────
+  // Phase 1 runs routing (topK / prepare_moe_topk) which writes
+  // shmem->experts and shmem->topk_ids_flat that later phases depend on.
+  //
+  // The WGMMA streaming pipeline reads bf16 activations directly from
+  // global memory one K=128 tile at a time (see Phase 3), so no
+  // prefetch into SHM is needed here. Prefetch warps idle during Phase 1.
   if (is_prefetch_warp<Dims>()) {
-    const std::uint32_t pw = get_prefetch_warp<Dims>();
-    for (std::uint32_t tok = pw; tok < batch_size;
-         tok += CoreDims::PREFETCH_WARP_COUNT)
-      moe_fetch_activation_async<Dims>(
-          activations_in + tok * Dims::HIDDEN_STATES, shm->w[0].orig[tok],
-          pipe);
+    // WGMMA path: prefetch warps have nothing to do here. The streaming
+    // pipeline's first bf16 prefetch is issued inside Phase 3 priming.
   } else {
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
                    shmem);
     sync_calc_threads<Dims>();
     prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem);
   }
-  cuda::pipeline_consumer_wait_prior<0>(pipe);
   __syncthreads();
 
-  // ── Phase 2: quantize w[0].orig → a.up || prefetch w_up → w[1] ────────
-  // GRID=128 design, two-expert-group parallelism:
-  //   UP_GRID = 2*N / W_UP_TILE = 64 row-tiles cover the full 2*N weight
-  //   rows for one expert. With GRID_SIZE=128, we run TWO groups of
-  //   UP_GRID blocks each, processing DIFFERENT experts in parallel:
-  //     group 0 (blockIdx.x in [0,  UP_GRID))  → experts at indices 0,2,4,...
-  //     group 1 (blockIdx.x in [UP_GRID, 2*UP_GRID)) → experts 1,3,5,...
-  //   Within each group, blockIdx.x % UP_GRID indexes the row-tile.
+  // ── Phase 2: setup up-projection group mapping ──────────────────────────
+  // GRID=128 design, expert-group parallelism (WGMMA path):
+  //   UP_GRID = 2*N / W_UP_TILE_EFFECTIVE blocks cover the full 2*N weight
+  //   rows for one expert.  With GRID_SIZE=128, we run
+  //   UP_GROUPS = GRID_SIZE / UP_GRID groups processing DIFFERENT experts
+  //   in parallel, with each group's blocks indexed by
+  //   blockIdx.x % UP_GRID.
   //
-  // Each group prefetches its OWN starting expert's weights + scales.
-  constexpr std::uint32_t UP_GRID = 2 * Dims::N / CoreDims::W_UP_TILE;
-  constexpr std::uint32_t UP_GROUPS =
-      Dims::KernelConfig::GRID_SIZE / UP_GRID;  // 1 or 2
+  //   WGMMA v1 path (W_UP_TILE_EFFECTIVE=128): UP_GRID = 2*N/128,
+  //   UP_GROUPS = 128 / UP_GRID.  For N=512: UP_GRID=8, UP_GROUPS=16
+  //   (sixteen experts processed in parallel per grid).
+  constexpr std::uint32_t UP_GRID = 2 * Dims::N / CoreDims::W_UP_TILE_EFFECTIVE;
+  constexpr std::uint32_t UP_GROUPS = Dims::KernelConfig::GRID_SIZE / UP_GRID;
   static_assert(Dims::KernelConfig::GRID_SIZE % UP_GRID == 0,
                 "GRID_SIZE must be a multiple of UP_GRID.");
-  static_assert(UP_GROUPS <= 2,
-                "Two-expert parallelism supports up to 2 groups.");
+  // UP_GROUPS = number of expert groups processed in parallel per grid.
+  // Each token contributes at most `top_k` virtual_row slots in
+  // spec->temp_bf16, so at most `top_k` blocks write to any given token
+  // (one per expert in the token's top-K list).  Blocks processing
+  // experts NOT in a token's top-K silently skip the write.  Therefore
+  // UP_GROUPS has no upper bound from a correctness standpoint — only
+  // a wasted-work concern (higher UP_GROUPS ⇒ more WGMMAs whose
+  // experts aren't in any active token's top-K list).
+  //
+  // We cap at UP_GROUPS <= NUM_EXPERTS (trivially always true) and
+  // leave perf tuning to the caller's choice of GRID_SIZE / UP_GRID.
+  static_assert(UP_GROUPS <= Dims::NUM_EXPERTS,
+                "UP_GROUPS cannot exceed the total number of experts.");
   const std::uint32_t up_group = blockIdx.x / UP_GRID;
   const std::uint32_t up_block_idx = blockIdx.x % UP_GRID;
   const bool in_up = (up_group < UP_GROUPS);
 
-  // Skip Phase 2 entirely if this block is not in any up-proj group (only
-  // relevant if GRID_SIZE > UP_GROUPS*UP_GRID, which currently never
-  // happens — kept for safety).
-  if (in_up) {
-    // Each group starts from expert index `up_group` (0 or 1), stepping
-    // by UP_GROUPS. If there are fewer experts than groups, the trailing
-    // group's starting expert may not exist; skip the prefetch in that
-    // case.
-    const std::uint32_t my_expert_start = up_group;
-    const bool my_group_has_work = my_expert_start < shmem->expert_count;
-
-    if (is_prefetch_warp<Dims>()) {
-#ifndef MONO_PROFILE_SKIP_PREFETCH
-      if (my_group_has_work) {
-        pipe.producer_acquire();
-        // Fetch this group's starting expert's weights using this block's
-        // row-tile (not blockIdx directly) so both groups reuse the same
-        // 64-row-tile layout.
-        const unsigned base_row_up = up_block_idx * CoreDims::W_UP_TILE / 2;
-        moe_request_up_expert_for_row<Dims, Dims::HIDDEN_STATES>(
-            expert_weights_up, shmem->experts[my_expert_start].id, base_row_up,
-            shm->w[1].up, pipe);
-        pipe.producer_commit();
-        moe_request_up_scale_for_row<Dims>(expert_scales_up,
-                                           shmem->experts[my_expert_start].id,
-                                           base_row_up, shm->up_scale[1]);
-      }
-#endif
-    } else {
-#ifndef MONO_PROFILE_SKIP_CALC
-      // Both groups independently quantize the input activations into
-      // their own SHM. (Redundant across blocks but fully parallel.)
-      const std::uint32_t cw = get_calc_warp<Dims>();
-      if (cw < batch_size) {
-        moe_scale_activation_BS8<Dims>(shm->w[0].orig[cw], shm->a.up[cw], cw,
-                                       shmem->act_scale[cw]);
-      }
-#endif
-    }
-  }
+  // Phase 2 is a no-op for the v1 streaming WGMMA pipeline.  Phase 3's
+  // moe_up_projection_BS8_allexperts_wgmma does its own priming:
+  //   (1) prefetch bf16_in[0] from global
+  //   (2) prefetch w[0] and bf16_in[1] || quantize bf16_in[0] → fp8[0]
+  // and then the streaming K-loop alternates WGMMA + bf16 prefetch with
+  // quantize + weight prefetch.
   __syncthreads();
 
-  // ── Phase 3: Up-projection — two expert groups in parallel ──────────────
+  // ── Phase 3: Up-projection — expert groups in parallel ────────────────
   // Group `g` (blocks [g*UP_GRID, (g+1)*UP_GRID)) iterates experts starting
   // at index `g`, stepping by UP_GROUPS. Each group writes to DIFFERENT
   // virtual_row slots of spec->temp_bf16 (because each expert has its own
-  // k index within a token's top-K list), so the two groups never have a
+  // k index within a token's top-K list), so the groups never have a
   // write conflict.
+  //
+  // Compile-time dispatch (spec R6.4):
+  //   - `USE_WGMMA && USE_TMA`  → `moe_up_projection_BS8_allexperts_wgmma_tma`
+  //     (TMA loaders for both bf16 activations and fp8 weights; requires
+  //     the two `__grid_constant__ CUtensorMap` kernel parameters).
+  //   - `USE_WGMMA` only        → existing
+  //   `moe_up_projection_BS8_allexperts_wgmma`
+  //     (cp.async reference path; descriptors are ignored).
+  //
+  // The BS8 path asserts `use_wgmma<Dims>::value` at the top of this
+  // function, so no non-WGMMA branch is needed.
   if (in_up && up_group < shmem->expert_count) {
-    moe_up_projection_BS8_allexperts<Dims>(
-        expert_weights_up, expert_scales_up, top_k, batch_size, spec, shmem,
-        up_block_idx, /*expert_start=*/up_group,
-        /*expert_stride=*/UP_GROUPS);
+    if constexpr (use_wgmma<Dims>::value && use_tma<Dims>::value) {
+      moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
+          activations_in, expert_weights_up, expert_scales_up, top_k,
+          batch_size, spec, shmem, up_weights_desc, activations_desc,
+          up_block_idx, /*expert_start=*/up_group,
+          /*expert_stride=*/UP_GROUPS);
+    } else {
+      moe_up_projection_BS8_allexperts_wgmma<Dims>(
+          activations_in, expert_weights_up, expert_scales_up, top_k,
+          batch_size, spec, shmem, up_block_idx, /*expert_start=*/up_group,
+          /*expert_stride=*/UP_GROUPS);
+    }
   }
 
   // ── Single grid.sync — all blocks finish writing spec->temp_bf16 ──────
   cooperative_groups::this_grid().sync();
 
-  // Zero the per-block fp32 output accumulator in SHM.
-  // Zero exactly the `[BS][W_DOWN_TILE]` logical shape, not including row
-  // padding, to preserve the 2D indexing `out_accum[tok][col]` used below.
-  const unsigned base_row_dn = blockIdx.x * CoreDims::W_DOWN_TILE;
-  for (unsigned idx = threadIdx.x; idx < Dims::BS * CoreDims::W_DOWN_TILE;
-       idx += blockDim.x) {
-    unsigned tok = idx / CoreDims::W_DOWN_TILE;
-    unsigned col = idx % CoreDims::W_DOWN_TILE;
-    shm->out_accum[tok][col] = 0.f;
+  // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
+  // Each block owns DOWN_COL_TILE=128 output cols; blocks partition
+  // into DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Each group
+  // writes a partial sum into spec->down_partial_out[group][tok][col];
+  // Phase 5 reduces across groups into activations_out (bf16).
+  //
+  // The WGMMA down-projection function zeroes its own per-block
+  // out_accum in SHM internally, so no pre-zero is needed here.
+  //
+  // Compile-time dispatch (spec R9.4, R10.2, R13.1):
+  //   - `USE_WGMMA && USE_TMA` → `moe_down_projection_BS8_allexperts_wgmma_tma`
+  //     (TMA loaders for the down-proj weight + intermediate activation
+  //     tiles; requires the two new `__grid_constant__ CUtensorMap`
+  //     kernel parameters).
+  //   - `USE_WGMMA` only       → existing
+  //   `moe_down_projection_BS8_allexperts_wgmma`
+  //     (cp.async reference path; descriptors are ignored).
+  //
+  // The BS8 path asserts `use_wgmma<Dims>::value` at the top of this
+  // function, so no non-WGMMA branch is needed.
+  if constexpr (use_wgmma<Dims>::value && use_tma<Dims>::value) {
+    moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
+        expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
+        down_weights_desc, down_activations_desc);
+  } else if constexpr (use_wgmma<Dims>::value) {
+    moe_down_projection_BS8_allexperts_wgmma<Dims>(expert_weights_down,
+                                                   expert_scales_down, top_k,
+                                                   batch_size, spec, shmem);
   }
-  __syncthreads();
 
-  // ── Phase 4: Down-projection — pipelined 4-stage design ──────────────
-  // For each expert: fetch bf16 intermediate → SHM, quantize bf16→fp8,
-  // MMA fp8×fp8 with w_down, all pipelined with double-buffering.
-  moe_down_projection_BS8_allexperts<Dims>(
-      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem);
+  // ── grid.sync — all blocks finish writing spec->down_partial_out ───
+  cooperative_groups::this_grid().sync();
 
-  // ── Phase 5: Writeback SHM fp32 accumulator → global bf16 output ────────
-#ifdef DEBUG_MOE_PRINT
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("[DBG FINAL out_accum[0][0..15]:");
-    for (unsigned c = 0; c < 16 && c < CoreDims::W_DOWN_TILE; c++)
-      printf(" %.4f", shm->out_accum[0][c]);
-    printf("\n");
-  }
-#endif
-  for (unsigned tok = 0; tok < batch_size; ++tok) {
-    for (unsigned col = threadIdx.x; col < CoreDims::W_DOWN_TILE;
-         col += blockDim.x) {
-      activations_out[tok * Dims::HIDDEN_STATES + base_row_dn + col] =
-          (R_element)shm->out_accum[tok][col];
+  // ── Phase 5 (WGMMA): reduction + writeback ─────────────────────────
+  // Each block reads its own DOWN_COL_TILE=128 output cols ×
+  // DOWN_GROUPS groups × Dims::BS tokens of fp32 partials from GM and
+  // sums across the DOWN_GROUPS dim into bf16 activations_out.
+  //
+  // Block-to-col mapping mirrors Phase 4a: only blocks with
+  // `blockIdx.x < DOWN_GRID` are responsible for writing (the first
+  // DOWN_GRID blocks cover the full HIDDEN_STATES output).  Blocks
+  // beyond DOWN_GRID would map to duplicate cols via
+  // `blockIdx.x % DOWN_GRID`, so we gate on the primary group
+  // (down_group == 0) to avoid redundant writes.
+  constexpr std::uint32_t DOWN_GRID_LOCAL = CoreDims::DOWN_GRID;
+  constexpr std::uint32_t DOWN_GROUPS_LOCAL = CoreDims::DOWN_GROUPS;
+  constexpr std::uint32_t DOWN_COL_TILE_LOCAL = CoreDims::DOWN_COL_TILE;
+  const std::uint32_t down_group_r = blockIdx.x / DOWN_GRID_LOCAL;
+  const std::uint32_t down_block_idx_r = blockIdx.x % DOWN_GRID_LOCAL;
+  const std::uint32_t base_col_r = down_block_idx_r * DOWN_COL_TILE_LOCAL;
+
+  if (down_group_r == 0) {
+    const std::uint32_t group_stride_r = Dims::BS * Dims::HIDDEN_STATES;
+
+    // Sum the DOWN_GROUPS partials for tokens in [0, batch_size) and
+    // write bf16 to activations_out.
+    for (std::uint32_t flat = threadIdx.x;
+         flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
+      const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
+      const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
+      const std::uint32_t col = base_col_r + col_in_block;
+
+      float sum = 0.f;
+#pragma unroll
+      for (std::uint32_t g = 0; g < DOWN_GROUPS_LOCAL; ++g) {
+        sum += spec->down_partial_out[g * group_stride_r +
+                                      tok * Dims::HIDDEN_STATES + col];
+      }
+      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)sum;
+    }
+
+    // Zero out activations_out[tok] for tok in [batch_size, Dims::BS)
+    // for this block's DOWN_COL_TILE col stripe.
+    for (std::uint32_t flat = threadIdx.x;
+         flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
+         flat += blockDim.x) {
+      const std::uint32_t tok = batch_size + flat / DOWN_COL_TILE_LOCAL;
+      const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
+      const std::uint32_t col = base_col_r + col_in_block;
+      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
     }
   }
 }
@@ -262,6 +302,14 @@ __device__ void moe_kernel_topk_BS64(
  * @brief Top-K MoE kernel with configurable scoring and renormalization.
  *
  * Dispatches to moe_kernel_topk_BS8 (BS <= 8) or moe_kernel_topk_BS64 (BS > 8).
+ *
+ * `up_weights_desc` and `activations_desc` are the host-built TMA
+ * descriptors consumed by `moe_up_projection_BS8_allexperts_wgmma_tma` when
+ * `use_tma<Dims>::value` is true.  For non-TMA variants the torch-binding
+ * wrapper passes zero-initialized `CUtensorMap` values and the descriptors
+ * are never read (spec R6.1, R6.3).  The `__grid_constant__` qualifier
+ * places them in constant memory coherent with all threads without SMEM
+ * cost.
  */
 template <typename Dims>
 __global__ void moe_kernel_topk(
@@ -273,7 +321,30 @@ __global__ void moe_kernel_topk(
     const S_element* __restrict__ expert_scales_down,
     R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
     size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
-    ScoringFunc scoring_func, bool renormalize) {
+    ScoringFunc scoring_func, bool renormalize,
+    __grid_constant__ CUtensorMap const up_weights_desc,
+    __grid_constant__ CUtensorMap const activations_desc,
+    __grid_constant__ CUtensorMap const down_weights_desc,
+    __grid_constant__ CUtensorMap const down_activations_desc) {
+  // ── Compile-time preconditions on `Dims` (spec R7.3, R11.3) ─────────────
+  // These fire at the first point where `Dims` is instantiated, so any
+  // misconfigured variant is caught at compile time before any TMA /
+  // WGMMA code is instantiated below.
+  //
+  //  * R7.3: `USE_TMA` requires `USE_WGMMA`. There is no TMA support for
+  //    the scalar up-projection path.
+  //  * R11.3: For every TMA-enabled variant, `MoE_SHM<Dims>` must fit in
+  //    the H100 opt-in 228 KB per-block SHM budget. The existing 224 KB
+  //    check inside `get_moe_shmem_size<Dims>()` is tighter, but this
+  //    assertion documents the per-variant TMA budget and catches future
+  //    SHM-layout regressions that loosen the opt-in cap.
+  static_assert(!use_tma<Dims>::value || use_wgmma<Dims>::value,
+                "USE_TMA requires USE_WGMMA; no TMA support for the scalar "
+                "path.");
+  static_assert(!use_tma<Dims>::value || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
+                "MoE_SHM<Dims> exceeds the 228 KB per-block SHM budget "
+                "for TMA variants.");
+
   assert(MoECoreDims<Dims>::THREADS_PER_WARP == 32);
   assert(blockDim.x == Dims::KernelConfig::BLOCK_SIZE);
   assert(blockDim.y == 1);
@@ -300,10 +371,12 @@ __global__ void moe_kernel_topk(
   cooperative_groups::this_grid().sync();
 
   if constexpr (Dims::BS <= 8) {
-    moe_kernel_topk_BS8<Dims>(
-        activations_in, token_count, router_logits, expert_weights_up,
-        expert_scales_up, expert_weights_down, expert_scales_down,
-        activations_out, top_k, scoring_func, renormalize, spec, shmem);
+    moe_kernel_topk_BS8<Dims>(activations_in, token_count, router_logits,
+                              expert_weights_up, expert_scales_up,
+                              expert_weights_down, expert_scales_down,
+                              activations_out, top_k, scoring_func, renormalize,
+                              spec, shmem, up_weights_desc, activations_desc,
+                              down_weights_desc, down_activations_desc);
   } else {
     moe_kernel_topk_BS64<Dims>(
         activations_in, token_count, router_logits, expert_weights_up,
