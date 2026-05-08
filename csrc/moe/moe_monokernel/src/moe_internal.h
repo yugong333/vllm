@@ -832,9 +832,22 @@ struct MoE_SHM {
         // consistently within 1024-byte-aligned regions. Both
         // `w_wgmma` and `w_down_wgmma` alias the same SHM bytes, so
         // the alignas applies to both views.
-        alignas(1024) W_element w_wgmma[2][W_WGMMA_M][W_WGMMA_K];       // 32 KB (up-proj)
-        alignas(1024) W_element w_down_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (down-proj)
+        alignas(1024)
+            W_element w_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (up-proj)
+        alignas(1024) W_element
+            w_down_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (down-proj)
       };
+
+      union {
+        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
+        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
+      } w[2];
+
+      S_element a_down_scale[2][CoreDims::T_TILE][2];
+
+      static constexpr uint32_t W_DOWN_SCALE_COLS =
+          shm_down_scale_cols<Dims>::value;
+      S_element w_down_scale[2][2][W_DOWN_SCALE_COLS];
 
       static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
           ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
