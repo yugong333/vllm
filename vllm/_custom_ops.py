@@ -319,16 +319,41 @@ def moe_monokernel_topk(
         # BS8 uses the TMA+WGMMA kernel. The TMA descriptors expect the
         # up-projection weights to be pre-interleaved via
         # `interleave_for_tma_wgmma` and the down-projection weights via
-        # `interleave_for_tma_wgmma_down` before this op is called.
-        # Callers that want to use the high-level op without manual
-        # pre-interleaving should stage those transforms in the model
-        # loader (one-off, per-expert weight prep), not per-forward.
+        # `interleave_for_tma_wgmma_down`. We apply the interleave here
+        # lazily on first call and cache the result on the weight
+        # tensors' `_tma_interleaved*` attributes so subsequent calls
+        # with the same weights are free. Model loaders can also apply
+        # the transform ahead of time to skip the first-call cost.
+        from interleave_weights import (
+            interleave_for_tma_wgmma,
+            interleave_for_tma_wgmma_down,
+        )
+
+        up_interleaved = getattr(expert_weights_up, "_tma_interleaved", None)
+        if up_interleaved is None:
+            up_interleaved = interleave_for_tma_wgmma(
+                expert_weights_up).contiguous()
+            try:
+                expert_weights_up._tma_interleaved = up_interleaved
+            except (AttributeError, RuntimeError):
+                pass
+
+        down_interleaved = getattr(
+            expert_weights_down, "_tma_interleaved_down", None)
+        if down_interleaved is None:
+            down_interleaved = interleave_for_tma_wgmma_down(
+                expert_weights_down).contiguous()
+            try:
+                expert_weights_down._tma_interleaved_down = down_interleaved
+            except (AttributeError, RuntimeError):
+                pass
+
         torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
             activations_in,
             router_logits,
-            expert_weights_up,
+            up_interleaved,
             expert_scales_up,
-            expert_weights_down,
+            down_interleaved,
             expert_scales_down,
             activations_out,
             scratchpad,
