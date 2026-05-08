@@ -1025,12 +1025,21 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   static_assert(Dims::N % K_STEP_DOWN == 0,
                 "Dims::N must be a multiple of K_STEP_DOWN=128");
 
-  // A descriptor strides for 128×128 canonical Major::K layout — unchanged
-  // from the cp.async path because `interleave_for_tma_wgmma_down` applies
-  // the Major::K permutation host-side, so the TMA with `SWIZZLE_NONE`
-  // writes the canonical layout directly into SHM.
-  //   LBO = 128 B  (one 8-row × 16-byte K-core-matrix)
-  //   SBO = 1024 B (one 8-row M-block = 8 K-core-matrices × 128 B)
+  // A descriptor strides for 128×128 canonical Major::K layout —
+  // SWIZZLE_NONE. LBO = 128 B (one 8-row × 16-byte K-core-matrix),
+  // SBO = 1024 B (one 8-row M-block = 8 K-core-matrices × 128 B). The
+  // Python pre-interleave (interleave_for_tma_wgmma_down) produces the
+  // canonical Major::K layout and the TMA descriptor uses SWIZZLE_NONE
+  // so the TMA-written SHM bytes match this layout byte-for-byte.
+  //
+  // NOTE: tried switching to SWIZZLE_128B (descriptor) + swizzle=1 (WGMMA)
+  // + A_LBO=16 per CUTLASS make_gmma_desc<Major::K> for LayoutType::B128,
+  // with alignas(1024) on w_down_wgmma for proper alignment, but accuracy
+  // broke (cos ~0.12). The exact combination of descriptor settings,
+  // pre-interleave layout, and WGMMA LBO/SBO semantics under swizzle mode
+  // needs careful verification against a CUTLASS reference implementation
+  // before re-attempting. For now, SWIZZLE_NONE is kept; bank-conflict
+  // optimization is deferred.
   constexpr std::uint64_t A_LBO = 128;
   constexpr std::uint64_t A_SBO = 1024;
   // B descriptor strides for the 8-token × 128-K fp8 activation tile
