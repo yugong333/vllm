@@ -325,18 +325,17 @@ def moe_monokernel_topk(
 
         up_interleaved = getattr(expert_weights_up, "_tma_interleaved", None)
         if up_interleaved is None:
-            up_interleaved = interleave_for_tma_wgmma(
-                expert_weights_up).contiguous()
+            up_interleaved = interleave_for_tma_wgmma(expert_weights_up).contiguous()
             try:
                 expert_weights_up._tma_interleaved = up_interleaved
             except (AttributeError, RuntimeError):
                 pass
 
-        down_interleaved = getattr(
-            expert_weights_down, "_tma_interleaved_down", None)
+        down_interleaved = getattr(expert_weights_down, "_tma_interleaved_down", None)
         if down_interleaved is None:
             down_interleaved = interleave_for_tma_wgmma_down(
-                expert_weights_down).contiguous()
+                expert_weights_down
+            ).contiguous()
             try:
                 expert_weights_down._tma_interleaved_down = down_interleaved
             except (AttributeError, RuntimeError):
