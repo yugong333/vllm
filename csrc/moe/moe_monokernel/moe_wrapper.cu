@@ -81,22 +81,28 @@
     CUtensorMap down_weights_desc{};                                           \
     CUtensorMap down_activations_desc{};                                       \
     if constexpr (use_tma<dims>::value) {                                      \
+      /* Up-projection weight descriptor (SWIZZLE_128B).  Callers MUST         \
+         pre-interleave `expert_weights_up` via                                \
+         `interleave_for_tma_wgmma_up` in Python — the helper repacks        \
+         gate/up row stripes so a single 128x128 TMA fetches the full          \
+         WGMMA A-tile. */                                                      \
       up_weights_desc = create_up_weight_tma_desc(                             \
           reinterpret_cast<const void*>(expert_weights_up_ptr),                \
           dims::NUM_EXPERTS, dims::N, dims::K);                                \
       activations_desc = create_activations_tma_desc(                          \
           reinterpret_cast<const void*>(activations_in_ptr), dims::BS,         \
           dims::HIDDEN_STATES);                                                \
-      /* Down-projection weight descriptor.  The Python caller is              \
-         responsible for passing `expert_weights_down` pre-interleaved via     \
-         `interleave_for_tma_wgmma_down` when USE_TMA is true (spec R9.5). */  \
+      /* Down-projection weight descriptor (SWIZZLE_128B).  Callers MUST       \
+         NOT pre-interleave `expert_weights_down` — the TMA hardware         \
+         applies the core-matrix XOR swizzle at write time and expects         \
+         the raw row-major `[E, K, N]` fp8 tensor. */                          \
       down_weights_desc = create_down_weight_tma_desc(                         \
           reinterpret_cast<const void*>(expert_weights_down_ptr),              \
           dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N);                    \
       /* Down-projection activation descriptor reads from `spec->temp_fp8`     \
          which lives inside the scratchpad.  Compute the device pointer        \
          from the scratchpad base + the compile-time offset of temp_fp8        \
-         inside `MoEGemmSpec<dims>` (spec R9.2). */                            \
+         inside `MoEGemmSpec<dims>`. */                                        \
       const void* temp_fp8_ptr =                                               \
           reinterpret_cast<const char*>(scratchpad_ptr) +                      \
           MoEGemmSpec<dims>::TEMP_FP8_OFFSET;                                  \
@@ -164,11 +170,13 @@ MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
     moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
 
-// TMA + WGMMA variant of the BS8 path — the only BS8 implementation.
-// Selects the TMA-based weight + activation load path in Phase 3 via
-// `KernelConfig::USE_TMA = true`. Callers must pre-interleave the up and
-// down projection weights (see `interleave_for_tma_wgmma` /
-// `interleave_for_tma_wgmma_down` in the Python bindings).
+// TMA + WGMMA + SWIZZLE_128B variant of the BS8 path — the only BS8
+// implementation.  Selects the TMA-based weight + activation load path
+// in Phase 3 via `KernelConfig::USE_TMA = true`.  Up-projection weights
+// must be repacked via `interleave_for_tma_wgmma_up` (gate/up row
+// interleave for single-issue TMA); down-projection weights are passed
+// raw row-major (the TMA hardware applies the core-matrix XOR swizzle
+// at write time).
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl,
     moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA)

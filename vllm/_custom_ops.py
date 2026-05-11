@@ -316,34 +316,22 @@ def moe_monokernel_topk(
         "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
     if M <= 8:
-        # BS8 uses the TMA+WGMMA kernel. The TMA descriptors expect the
-        # up-projection weights to be pre-interleaved via
-        # `interleave_for_tma_wgmma` and the down-projection weights via
-        # `interleave_for_tma_wgmma_down`. We apply the interleave here
-        # lazily on first call and cache the result on the weight
-        # tensors' `_tma_interleaved*` attributes so subsequent calls
-        # with the same weights are free. Model loaders can also apply
-        # the transform ahead of time to skip the first-call cost.
-        from interleave_weights import (
-            interleave_for_tma_wgmma,
-            interleave_for_tma_wgmma_down,
-        )
+        # BS8 uses the TMA+WGMMA kernel with SWIZZLE_128B on both weight
+        # sides.  The up-projection weights must be repacked via
+        # `interleave_for_tma_wgmma_up` (gate/up row interleave so one
+        # 128x128 TMA fetches a full WGMMA A-tile); the down-projection
+        # weights are passed raw — the TMA hardware applies the
+        # core-matrix XOR swizzle at write time.  The repack is cached
+        # on the weight tensor's `_tma_interleaved_up` attribute so
+        # subsequent calls with the same weights are free; model loaders
+        # can also apply the transform ahead of time.
+        from interleave_weights import interleave_for_tma_wgmma_up
 
-        up_interleaved = getattr(expert_weights_up, "_tma_interleaved", None)
+        up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up", None)
         if up_interleaved is None:
-            up_interleaved = interleave_for_tma_wgmma(expert_weights_up).contiguous()
+            up_interleaved = interleave_for_tma_wgmma_up(expert_weights_up).contiguous()
             try:
-                expert_weights_up._tma_interleaved = up_interleaved
-            except (AttributeError, RuntimeError):
-                pass
-
-        down_interleaved = getattr(expert_weights_down, "_tma_interleaved_down", None)
-        if down_interleaved is None:
-            down_interleaved = interleave_for_tma_wgmma_down(
-                expert_weights_down
-            ).contiguous()
-            try:
-                expert_weights_down._tma_interleaved_down = down_interleaved
+                expert_weights_up._tma_interleaved_up = up_interleaved
             except (AttributeError, RuntimeError):
                 pass
 
@@ -352,7 +340,7 @@ def moe_monokernel_topk(
             router_logits,
             up_interleaved,
             expert_scales_up,
-            down_interleaved,
+            expert_weights_down,
             expert_scales_down,
             activations_out,
             scratchpad,

@@ -117,11 +117,17 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
 //     WGMMA descriptors reference them directly.
 //
 // The rest of the kernel (BS8 down-proj, BS64 paths) is unchanged.
-// ── BS8 WGMMA kernel (TMA-only) ─────────────────────────────────────────
-// Single BS8 variant: TMA + WGMMA. The cp.async reference variant has
-// been removed; BS8 callers must pre-interleave up-projection weights
-// via `interleave_for_tma_wgmma` and down-projection weights via
-// `interleave_for_tma_wgmma_down` before launching the kernel.
+// ── BS8 WGMMA kernel (TMA + SWIZZLE_128B) ───────────────────────────────
+// Single BS8 variant: TMA + WGMMA with SWIZZLE_128B on both weight sides.
+// Callers MUST NOT pre-interleave the weights for canonical Major::K
+// byte order — the TMA hardware applies the 8-row × 128-byte core-matrix
+// XOR swizzle at write time.
+//
+// Up-projection weights MUST be repacked via
+// `interleave_for_tma_wgmma_up` (gate/up row interleave) so a single
+// 128×128 TMA fetches one full WGMMA A-tile.  Down-projection weights
+// are passed RAW row-major `[E, K, N]`.  Activation B operands always
+// use SWIZZLE_NONE.
 struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -144,8 +150,8 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     static constexpr std::uint32_t GRID_SIZE = 128;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
     static constexpr bool USE_WGMMA = true;
-    // Enables the TMA-based weight + activation load path in Phase 3 of the
-    // BS8 WGMMA up-projection kernel.
+    // Enables the TMA-based weight + activation load path in Phase 3 of
+    // the BS8 WGMMA up-projection kernel.
     static constexpr bool USE_TMA = true;
   };
 };

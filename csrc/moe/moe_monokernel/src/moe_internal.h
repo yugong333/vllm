@@ -62,23 +62,14 @@ struct MoEGemmSpec {
   // writes one row per (token, expert) pair into spec->temp_bf16.
   static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
 
-  // TMA path uses a tighter stride that excludes the 8-row padding above.
-  // The padding exists only to guard against off-by-one writes in the
-  // scalar/BS64 paths; the BS8 WGMMA up-proj epilogue only ever writes
-  // to rows [0, BS * SPEC_MAX_TOPK) = [0, 64) via `sorted_slot`.  Using
-  // TEMP_ROWS directly for the TMA K-chunk-major stride would waste
-  // 128 B / K-chunk * N/16 K-chunks = 4 KB of GM bandwidth per Phase-4
-  // launch AND produce a non-power-of-2 stride (1152 B) that interacts
-  // poorly with L2 prefetch.  TEMP_ROWS_TMA = BS * SPEC_MAX_TOPK yields
-  // a clean 1024-B K-chunk stride at the standard Qwen3.5 shape.
+  // TMA path uses a tighter outer-axis extent that excludes the 8-row
+  // padding above.  The padding exists only to guard against off-by-one
+  // writes in the scalar/BS64 paths; the BS8 WGMMA up-proj epilogue only
+  // ever writes to rows `[0, BS * SPEC_MAX_TOPK) = [0, 64)` via
+  // `sorted_slot`.  `TEMP_ROWS_TMA = BS * SPEC_MAX_TOPK` (= 64 for
+  // Qwen3.5-35B) is the value passed to `create_down_activation_tma_desc`
+  // as the outer-axis `globalDim`.
   static constexpr uint32_t TEMP_ROWS_TMA = Dims::BS * SPEC_MAX_TOPK;
-
-  // Number of blocks that contribute columns to the N-wide up-projection
-  // output.  Each block writes W_UP_COLS_PER_BLOCK columns; blocks beyond N
-  // are idle.  W_UP_TILE is always 16, so each block covers 8 columns.
-  static constexpr uint32_t W_UP_COLS_PER_BLOCK = 8;  // = W_UP_TILE / 2
-  static constexpr uint32_t UP_PROJ_BLOCK_COUNT =
-      (Dims::N + W_UP_COLS_PER_BLOCK - 1) / W_UP_COLS_PER_BLOCK;
 
   #ifdef DEBUG_MOE
   // Debug information passed out. The actual token_indexes are stored in shared
@@ -89,21 +80,13 @@ struct MoEGemmSpec {
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
 
-  // Up-projection SiLU output.  BS8 and BS64 both now use bf16 here:
-  // the BS64 down-projection does a bf16→fp8 quantization with per-token
-  // per-block scales, just like BS8.  Storing this in bf16 (not fp32)
-  // halves the global-memory footprint and async-copy bandwidth.
+  // Up-projection SiLU output (BS64 path only).
   //
-  //   BS8:  the down-projection reads block-local maxes from temp_block_max
-  //         and does a single-pass bf16→fp8 quantization.
-  //   BS64: the down-projection loads tiles into SHM and computes per-token
-  //         block-wise scales on the fly before quantizing.
+  // The BS64 down-projection fetches this bf16 intermediate and does a
+  // bf16→fp8 quantization with per-token block-wise scales on the fly
+  // before the MMA.  Storing this in bf16 (not fp32) halves the
+  // global-memory footprint and async-copy bandwidth.
   A_element temp_bf16[TEMP_ROWS * Dims::N];
-
-  // Per-block absmax of each row in temp_bf16 (BS8 path only).
-  // Written by the up-projection epilogue, read by the down-projection
-  // to compute the true row max without a separate global-memory pass.
-  float temp_block_max[TEMP_ROWS * UP_PROJ_BLOCK_COUNT];
 
   // ── WGMMA-path-only up-proj → down-proj scratchpad ───────────────────
   // Used when `use_wgmma<Dims>::value == true`.  The up-projection
@@ -375,8 +358,6 @@ struct MoECoreDims {
       Dims::HIDDEN_STATES / Dims::KernelConfig::GRID_SIZE;
   static constexpr std::uint32_t T_TILE = 8;
 
-  static constexpr std::uint32_t W_DIM = 2 * Dims::N;
-
   static constexpr unsigned BLOCK_STRIDE = CALC_WARP_COUNT * K_TILE;
 
   static constexpr unsigned PADDING =
@@ -399,7 +380,6 @@ struct MoECoreDims {
   static constexpr unsigned K_DIM_PADDED_A = Dims::HIDDEN_STATES;
   static constexpr unsigned K_DIM_PADDED_W = Dims::HIDDEN_STATES;
   static constexpr unsigned K_DIM_HALF_PADDED_A = Dims::HIDDEN_STATES / 2;
-  static constexpr unsigned K_DIM_HALF_PADDED_W = Dims::HIDDEN_STATES / 2;
 };
 
 // 1 tile per warp
@@ -426,352 +406,13 @@ struct MoE_SHM {
       T_element partial_result[CoreDims::CALC_WARP_COUNT]
                               [CoreDims::W_UP_TILE * CoreDims::T_TILE];
     } gemm1;
-    // BS8 split-phase path: up-projection and down-projection run as
-    // separate all-experts loops with a single grid.sync() in between.
-    //
-    // Compact union layout:
-    //   a: fp8 up-activations / double-buffered fp8 down-activations
-    //   w[2]: ping-pong orig(bf16) / w_up(fp8) / bf16_buf(bf16) / w_down(fp8)
-    //   partial_result: up / down scratch
-    //
-    // Down-projection uses a pipelined design with fixed w[2] slot roles:
-    //   w[0].bf16_buf:  bf16 intermediate results from global memory
-    //   w[1].down:      fp8 down-projection weights
-    //   a.down[2]:      double-buffered fp8 quantized activations for MMA
-    //                   (reuses the same union as a.up — safe because all
-    //                   up-projections finish before any down-projection
-    //                   starts)
-    struct TinyData {
-      // Input activations for up- and down-projection (mutually exclusive).
-      // Up-projection is fully complete (with grid.sync) before
-      // down-projection begins, so a.up and a.down[2] safely share storage.
-      // a.down[2] is double-buffered for the down-projection pipeline:
-      // one buffer is consumed by MMA while the other is written by
-      // quantization.
-      //
-      // a.down rows are padded by DOWN_ROW_PADDING bytes so that the MMA
-      // inner loop's per-row stride lands on distinct banks for all 8
-      // rows touched by a warp (see comment on DOWN_ROW_PADDING above).
-      union {
-        AQ_element up[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];  // fp8
-        AQ_element down[2][CoreDims::T_TILE]
-                       [Dims::N + CoreDims::DOWN_ROW_PADDING /
-                                      sizeof(AQ_element)];  // fp8
-      } a;
-
-      // Per-row per-block quantization scale for a.down (double-buffered).
-      // Block-wise (1, 128): each row of N elements gets N/128 scales.
-      static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
-      S_element a_down_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
-
-      // Double-buffered weight / activation tiles.
-      //
-      // During init (Phase 1–2), w[0].orig holds the raw bf16 activations
-      // fetched from global memory (before quantization), and w[1].up holds
-      // the first expert's up-projection weights.
-      //
-      // During the down-projection (Phase 4), w[2] has fixed roles:
-      // w[0] holds bf16 intermediate results (w[0].bf16_buf) and
-      // w[1] holds fp8 down-projection weights (w[1].down).
-      // They use separate slots so bf16_buf and w_down never conflict.
-      union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
-        W_element up[CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
-        W_element
-            down[CoreDims::W_DOWN_TILE]
-                [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(W_element)];
-      } w[2];
-
-      // Down-projection weight scales (double-buffered).
-      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
-      //   For K=2048, GRID=64: W_DOWN_TILE=32, so ceil(32/128)=1
-      //   For N=512: ceil(512/128)=4, so 1*4=4 scales per expert per block
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
-
-      // Up-projection weight scales (double-buffered, block-wise only).
-      // Block-wise (128×128): each block's weight tile spans 8 rows in the
-      // low half and 8 rows in the upper half of the 2*N weight rows. With
-      // BLOCK_SCALE_ROW=128 and base_row_up multiple of 8, all 8 rows fall
-      // in a single row-block. So we need 2 row-blocks × ceil(K/128)
-      // col-blocks per expert per CUDA block.
-      //
-      // For per-channel this field is sized to a trivial placeholder (never
-      // read). We keep it allocated unconditionally to avoid template-
-      // dependent SHM layout branching.
-      static constexpr uint32_t UP_SCALE_TILE_SIZE =
-          2 * shm_up_scale_cols<Dims>::value;
-      S_element up_scale[2][UP_SCALE_TILE_SIZE];
-
-      // Scratch pad for MMA partial results (up and down share the same space).
-      union {
-        T_element up[CoreDims::CALC_WARP_COUNT]
-                    [CoreDims::W_UP_TILE * CoreDims::T_TILE];
-        T_element
-            down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
-                [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
-      } partial_result;
-
-      // Per-block fp32 accumulator for down-projection output.
-      // Pad the row to avoid a 4-way bank conflict on write: without
-      // padding, `row_stride_dwords % 32 == 16 == tok0*stride % 32`
-      // for the 4 distinct tok0 values {0, 2, 4, 6} accessed by threads
-      // with the same `t/4`. A 1-dword padding (4 bytes) shifts the
-      // per-token offset off the shared bank-group, fully eliminating
-      // the conflict for W_DOWN_TILE in {16, 32}.
-      static constexpr uint32_t OUT_ACCUM_ROW_PAD = 1;
-      T_element out_accum[Dims::BS][CoreDims::W_DOWN_TILE + OUT_ACCUM_ROW_PAD];
-    } tiny;
-
-    // ── TinyDataWGMMA: SHM layout for the WGMMA up-proj path (Stage 1) ─
-    //
-    // Used when `use_wgmma<Dims>::value == true`.  Only the up-projection
-    // (Phase 2–3) uses this layout; the down-projection (Phase 4–5) still
-    // uses the same code and SHM fields as the scalar path (reachable
-    // via the `down` sub-view below, which mirrors `TinyData`'s down-side
-    // members bit-for-bit so we don't double up on SHM).
-    //
-    // v1 streaming-pipeline layout:
-    //
-    //   * bf16_in[2]:  double-buffered bf16 input tile. Each slot holds
-    //                  T_TILE=8 tokens × K_STEP_WGMMA=128 bf16 values
-    //                  = 2 KB per slot, 4 KB total.  Prefetched per
-    //                  K-step from global activations_in; consumed by
-    //                  the streaming quantize step.
-    //
-    //   * fp8_act[2]:  double-buffered fp8 activation tile in canonical
-    //                  WGMMA K-major (N-outer, K-inner) layout.  Each
-    //                  slot holds T_TILE=8 tokens × K_STEP_WGMMA=128
-    //                  fp8 values = 1 KB per slot, 2 KB total.  Produced
-    //                  by streaming quantize, consumed by the 4 chained
-    //                  WGMMAs of that K-step.
-    //
-    //   * w_wgmma:     single-buffered 128×128 K-tile of weights.
-    //                  Rows [0..31]   = WG0 gate rows [base..base+31]
-    //                  Rows [32..63]  = WG0 up   rows [base+N..base+N+31]
-    //                  Rows [64..95]  = WG1 gate rows [base+32..base+63]
-    //                  Rows [96..127] = WG1 up   rows [base+N+32..base+N+63]
-    //                  128 rows × 128 K × fp8 = 16 KB.  Stored in
-    //                  WGMMA canonical Major::K layout (8-row × 16-byte
-    //                  core matrices).
-    //
-    // Up-side SHM footprint: 4 KB (bf16_in) + 2 KB (fp8_act)
-    //                        + 32 KB (w_wgmma, double-buffered) + scales
-    //                        + partial_result ≈ 42 KB.
-    //
-    // Down-side streaming members (`a_down_wgmma`, `w_down_wgmma`,
-    // `a_down_scale`, `w_down_scale`, `out_accum`) alias the up-side
-    // `fp8_act` / `w_wgmma` bytes via anonymous unions (Phase 3 and
-    // Phase 4 are separated by a grid.sync, so the reuse is safe).
-    //
-    // The old Stage-1 fields (`a.down[2]`, `a_down_scale[2][8][N/128]`,
-    // `w[].down`) are removed; they are replaced by the double-buffered
-    // streaming tiles declared below.
-    struct TinyDataWGMMA {
-      // ── Streaming activation pipeline (v1) ─────────────────────────
-      //
-      // Double-buffered bf16 input tile.  Prefetch warps cp.async
-      // activations_in[tok * K + s*128 .. tok * K + s*128+127] into
-      // bf16_in[slot][tok][0..127].  Calc warps read from this and
-      // write fp8_act (see below).
-      //
-      // Shape: [2 slots][T_TILE=8 tokens][K_STEP_WGMMA=128 bf16 values]
-      // Size:  2 × 8 × 128 × 2 B = 4 KB
-      static constexpr uint32_t BF16_IN_K = CoreDims::K_STEP_WGMMA;  // 128
-      A_element bf16_in[2][CoreDims::T_TILE][BF16_IN_K];
-
-      // Double-buffered fp8 activation tile in canonical WGMMA K-major
-      // layout (N-outer, K-inner at core-matrix granularity).  The 4
-      // chained wgmma.mma_async.m64n8k32 instructions of each K-step
-      // read this with a B descriptor pointing at
-      // `fp8_act[slot][sub_k*2][0][0]`, with LBO=128 (one 8×16-byte
-      // core matrix) and SBO=128 (1 N-block for N=8).  (sub_k in [0,4)
-      // is the index of the m64n8k32 within the K=128 step; each
-      // sub-WGMMA consumes 2 consecutive K-chunks.)
-      //
-      // Canonical byte layout for one m64n8k32 B operand (K=32, N=8):
-      //   byte tok*16 + k%16 + (k/16)*128   for k in [0..31], tok in [0..7]
-      // Extended to K=128: 8 core matrices along K, same pattern.  We
-      // index this as [k_chunk][tok][k_inner_0_15]:
-      //   fp8_act[slot][kc][tok][ki] = byte (slot)*1024 + kc*128 + tok*16 + ki
-      //
-      // This matches the canonical layout exactly: each 128-B core
-      // matrix is 8 tokens × 16 K-bytes, and 8 core matrices stack
-      // along K with LBO=128 B.
-      //
-      // Shape: [2 slots][8 k-chunks][T_TILE=8 tokens][16 fp8 K-values]
-      // Size:  2 × 8 × 8 × 16 = 2048 B = 2 KB
-      static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
-      static constexpr uint32_t FP8_ACT_NUM_CHUNKS =
-          CoreDims::K_STEP_WGMMA / FP8_ACT_K_CHUNK;  // 128 / 16 = 8
-
-      // Anonymous union: `fp8_act` (up-proj Phase 3) and `a_down_wgmma`
-      // (down-proj Phase 4 streaming tile) alias the same 2 KB of SHM.
-      // The grid.sync between Phase 3 and Phase 4 guarantees no overlap.
-      //
-      // Both views use canonical WGMMA K-major layout
-      //   [slot][k_chunk][tok][k_inner]
-      // so the descriptors are identical; only the name differs to make
-      // the access sites self-documenting.
-      union {
-        AQ_element fp8_act[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                          [FP8_ACT_K_CHUNK];  // 2 KB — up-proj Phase 3
-        AQ_element a_down_wgmma[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                               [FP8_ACT_K_CHUNK];  // 2 KB — down-proj Phase 4
-      };
-
-      // Double-buffered 128×128 weight tile in canonical Major::K layout
-      // (v2 streaming pipeline).
-      //
-      // Canonical byte offset for element (m, k) within ONE slot where
-      // m in [0, 128), k in [0, 128):
-      //   m_outer = m / 8   in [0, 16)
-      //   m_inner = m % 8   in [0, 8)
-      //   k_outer = k / 16  in [0, 8)
-      //   k_inner = k % 16  in [0, 16)
-      //   byte_off = m_outer * (8 * K_STEP_WGMMA) + k_outer * 128 + m_inner *
-      //   16 + k_inner
-      //            = m_outer * 1024 + k_outer * 128 + m_inner * 16 + k_inner
-      //
-      // Descriptor strides for one m64n8k32 WGMMA starting at (m=0, k=0):
-      //   LBO = 128 B  (8-row × 16-byte core matrix width along K)
-      //   SBO = 1024 B (8-row M-block = 8 K-core-matrices of 128 B)
-      //
-      // WG0 reads rows [0..63]   (desc_a base = &w_wgmma[slot][0][0])
-      // WG1 reads rows [64..127] (desc_a base = &w_wgmma[slot][0][0] + 64*128)
-      //
-      // The pipeline alternates read/write slots per K-step:
-      //   step s  reads slot s%2, prefetch warps write slot (s+1)%2.
-      // This lets WGMMA compute for step s overlap with the weight
-      // prefetch for step s+1 on different SHM slots — no read/write
-      // hazard, no forced serialization on the single slot.
-      //
-      // Size: 2 slots × 128 × 128 × 1 B = 32 KB.
-      //
-      // Anonymous union: `w_wgmma` (up-proj Phase 3) aliases
-      // `w_down_wgmma` (down-proj Phase 4 streaming tile) — both are
-      // 32 KB (2 slots × 128 rows × 128 K-bytes of fp8), and the
-      // grid.sync between Phase 3 and Phase 4 makes the reuse safe.
-      static constexpr uint32_t W_WGMMA_M = 128;  // M dim of weight tile
-      static constexpr uint32_t W_WGMMA_K = CoreDims::K_STEP_WGMMA;  // 128
-      union {
-        W_element w_wgmma[2][W_WGMMA_M][W_WGMMA_K];       // 32 KB (up-proj)
-        W_element w_down_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (down-proj)
-      };
-
-      // Phase-1 bf16 staging (single slot — not double-buffered).
-      // The Phase-4 down-proj weights now live in `w_down_wgmma` above
-      // (streaming K=128 tiles), so the old `w[].down` alias is gone.
-      union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
-      } w[2];
-
-      // Per-token per-64-col activation scales for the WGMMA down-proj
-      // streaming tile (double-buffered, matches a_down_wgmma slots).
-      //
-      //   Shape: [2 slots][T_TILE=8 tokens][2 halves of the 128-K step]
-      //   Size:  2 × 8 × 2 × 4 B = 128 B
-      //
-      // For each K-step s in [0, K_TILES_DOWN), the 128-K tile splits
-      // into two 64-K halves:
-      //   a_down_scale[slot][tok][0] = scale for K[s*128 .. s*128+63]
-      //   a_down_scale[slot][tok][1] = scale for K[s*128+64 .. s*128+127]
-      // Both halves come from spec->temp_act_scale written by the
-      // up-proj epilogue's per-64-col fused quantization.
-      S_element a_down_scale[2][CoreDims::T_TILE][2];
-
-      // Per-expert per-K-step down-projection weight scales for the
-      // streaming WGMMA path (double-buffered).
-      //
-      //   Shape: [2 slots][2 row-blocks (WG0, WG1)][DOWN_SCALE_COLS col-blocks]
-      //
-      // A down-block owns 128 output cols; WG0 → cols [base..base+63],
-      // WG1 → cols [base+64..base+127].  These map to weight-M rows
-      // [base..base+63] (WG0) and [base+64..base+127] (WG1) of the
-      // down-proj weight matrix, which may land in 1 or 2 distinct
-      // 128-row scale blocks depending on `base_col % 128`.  Per K-step
-      // we pick one scale per WG (weight scales are per 128×128 block
-      // for block-wise; per-channel uses a 1-wide placeholder).
-      static constexpr uint32_t W_DOWN_SCALE_COLS =
-          shm_down_scale_cols<Dims>::value;
-      S_element w_down_scale[2][2][W_DOWN_SCALE_COLS];
-
-      // Down-projection weight scales (double-buffered) — same as TinyData.
-      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
-          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
-      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
-
-      // Up-projection weight scales.  Same as Stage-1: 2 row-blocks
-      // (gate + up) × K/128 col-blocks per slot.
-      //
-      // Why only 2 row-blocks even though the block now owns 128 M rows?
-      // Because `base_row_up` is always a multiple of 64, so both WGs'
-      // gate rows fall in the SAME 128-wide row-block, and both WGs' up
-      // rows fall in the SAME (different) 128-wide row-block.  Both WGs
-      // therefore share a single gate_ws and a single up_ws per K-step.
-      static constexpr uint32_t UP_SCALE_TILE_SIZE =
-          2 * shm_up_scale_cols<Dims>::value;
-      S_element up_scale[2][UP_SCALE_TILE_SIZE];
-
-      // Partial-result scratch — same union as TinyData, with a WGMMA
-      // output view.  The dual-WG WGMMA up-proj writes its 128×8 fp32
-      // D-matrix into `wgmma_out` (4 KB).
-      //
-      // Layout of wgmma_out[m][tok]:
-      //   rows [0..31]   = WG0 gate rows → output cols [0..31]   of this block
-      //   rows [32..63]  = WG0 up   rows → output cols [0..31]   of this block
-      //   rows [64..95]  = WG1 gate rows → output cols [32..63]  of this block
-      //   rows [96..127] = WG1 up   rows → output cols [32..63]  of this block
-      //
-      // The SiLU+writeback step reads gate = wgmma_out[col][tok] and
-      // up = wgmma_out[col+32][tok] for col in [0..31] (WG0 half), and
-      // gate = wgmma_out[col+64][tok], up = wgmma_out[col+96][tok] for
-      // col in [0..31] (WG1 half, mapping to out_col in [32..63]).
-      union {
-        T_element up[CoreDims::CALC_WARP_COUNT]
-                    [CoreDims::W_UP_TILE * CoreDims::T_TILE];
-        T_element
-            down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
-                [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
-        // Dual-WG WGMMA D-matrix: 128 M rows × 8 tokens.
-        //
-        // Reused by the WGMMA down-proj as `down_out[128][8]`:
-        //   * up-proj writes 128 M rows (gate/up interleaved) × 8 tokens
-        //     and the SiLU epilogue reads them back.
-        //   * down-proj writes 128 output cols × 8 tokens at the end of
-        //     each expert and the per-token accumulate step reads them
-        //     back into `out_accum[tok][col_in_block]`.
-        // Both views share the same byte layout (128 × 8 × 4 B = 4 KB).
-        T_element wgmma_out[128][CoreDims::T_TILE];
-        T_element down_out[CoreDims::DOWN_COL_TILE][CoreDims::T_TILE];
-      } partial_result;
-
-      // Per-block fp32 down-proj output accumulator.
-      //
-      // Scalar path sizing used `W_DOWN_TILE = HIDDEN_STATES / GRID_SIZE`
-      // cols per block (e.g. 16 for Qwen3.5-35B).  The WGMMA path owns
-      // 128 output cols per block (`DOWN_COL_TILE`), so the accumulator
-      // must be sized for the larger of the two — we pick the max and
-      // keep the same +1 column padding to spread per-token accesses
-      // across different SHM bank groups.
-      static constexpr uint32_t OUT_ACCUM_ROW_PAD = 1;
-      static constexpr uint32_t OUT_ACCUM_COLS =
-          CoreDims::W_DOWN_TILE > CoreDims::DOWN_COL_TILE
-              ? CoreDims::W_DOWN_TILE
-              : CoreDims::DOWN_COL_TILE;
-      T_element out_accum[Dims::BS][OUT_ACCUM_COLS + OUT_ACCUM_ROW_PAD];
-    } tiny_wgmma;
 
     // ── TinyDataWGMMA_TMA: SHM layout for the TMA+WGMMA up-proj path ──
     //
     // Used when `use_wgmma<Dims>::value && use_tma<Dims>::value` are both
-    // true (Stage-1 TMA-based activation & weight loading for the BS8
-    // WGMMA up-projection path).  This is a *variant* of `TinyDataWGMMA`
-    // that preserves every existing SHM field byte-for-byte and only
-    // *appends* two pairs of 64-bit mbarriers:
+    // true — the TMA-based activation & weight loading path for the BS8
+    // WGMMA up-projection.  Layout is identical to the pre-TMA streaming
+    // WGMMA SHM layout with two pairs of 64-bit mbarriers appended:
     //
     //   * bar_w[2]  — 16 B, one weight-tile barrier per double-buffer slot.
     //                 Armed by the TMA launcher with tx_bytes = 16384
@@ -785,31 +426,9 @@ struct MoE_SHM {
     //                 warps inside the streaming quantize step.
     //
     // Both barrier arrays are `alignas(16)` so their start addresses are
-    // 16-byte aligned as required by R11.4 / the SM90 mbarrier PTX ops.
-    // Total overhead vs `tiny_wgmma`: exactly 32 B (R11.1).
-    //
-    // Design choice (Option A vs Option B):
-    //   * Option A (chosen):  Add a brand-new `TinyDataWGMMA_TMA` struct
-    //     that duplicates every member of `TinyDataWGMMA` and appends the
-    //     mbarriers.  Non-TMA paths never name `tiny_wgmma_tma` and
-    //     therefore see zero SHM-layout delta (R7.4, R10.1).
-    //   * Option B (rejected): Add the mbarriers directly inside
-    //     `TinyDataWGMMA`.  Simpler diff, but makes the SHM layout of the
-    //     non-TMA WGMMA variant shift by 32 B, violating R7.4's "byte-
-    //     identical" clause for pre-feature variants.
-    //
-    // Selection at compile time will be layered in by task 8.2 (the
-    // `use_tma<Dims>` trait) and 7.1 (`if constexpr` dispatch).  For
-    // this task we just expose `tiny_wgmma_tma` as a sibling union
-    // member of `tiny_wgmma`; because `union U` sizes to its largest
-    // member, paths that never touch `tiny_wgmma_tma` pay zero runtime
-    // SHM cost above whatever the other members would have required.
-    //
-    // Every member below — except the two mbarrier arrays at the end —
-    // is copied verbatim from `TinyDataWGMMA` above to guarantee byte-
-    // for-byte layout parity (R11.2).
+    // 16-byte aligned as required by the SM90 mbarrier PTX ops.
     struct TinyDataWGMMA_TMA {
-      // ── Streaming activation pipeline (byte-identical to TinyDataWGMMA) ──
+      // ── Streaming activation pipeline ──────────────────────────────
       static constexpr uint32_t BF16_IN_K = CoreDims::K_STEP_WGMMA;  // 128
       A_element bf16_in[2][CoreDims::T_TILE][BF16_IN_K];
 
@@ -818,10 +437,25 @@ struct MoE_SHM {
           CoreDims::K_STEP_WGMMA / FP8_ACT_K_CHUNK;  // 128 / 16 = 8
 
       union {
-        AQ_element fp8_act[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                          [FP8_ACT_K_CHUNK];  // 2 KB — up-proj Phase 3
-        AQ_element a_down_wgmma[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                               [FP8_ACT_K_CHUNK];  // 2 KB — down-proj Phase 4
+        // 1024-byte alignment required by SWIZZLE_128B on the down-proj
+        // activation TMA: the XOR pattern uses low bits of the SHM
+        // address and only behaves consistently within 1024-B-aligned
+        // regions.  `fp8_act` and `a_down_wgmma` alias the same 2 KB
+        // region (one SWZ128 atom per slot), and the grid.sync between
+        // Phase 3 and Phase 4 serializes the two views so the reuse is
+        // safe.
+        //
+        // `fp8_act` keeps the canonical K-major [kc][tok][ki] view —
+        // the up-proj activation path stays on SWIZZLE_NONE with
+        // software quantize populating SHM.  `a_down_wgmma` uses the
+        // token-major [tok][kc][ki] view that matches the CUTLASS
+        // Major::K B128 layout after the TMA's SWZ128 XOR.
+        alignas(1024)
+            AQ_element fp8_act[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
+                              [FP8_ACT_K_CHUNK];  // 2 KB (up)
+        alignas(1024)
+            AQ_element a_down_wgmma[2][CoreDims::T_TILE][FP8_ACT_NUM_CHUNKS]
+                                   [FP8_ACT_K_CHUNK];  // 2 KB (down)
       };
 
       static constexpr uint32_t W_WGMMA_M = 128;  // M dim of weight tile
@@ -1044,23 +678,6 @@ __device__ __host__ constexpr size_t get_moe_shmem_size() {
 }
 
 constexpr size_t get_moe_max_shmem_size() { return sizeof(MoE_SHM<Dims_Max>); }
-
-/**
- * @brief Returns the amount of global scratchpad memory necessary to run
- * moe_kernel() with template parameter @p Dims
- */
-template <typename Dims>
-__device__ __host__ constexpr size_t get_moe_scratchpad_size() {
-  static_assert(Dims::M <= Dims_Max::M,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::N <= Dims_Max::N,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::K <= Dims_Max::K,
-                "Dimension larger than the maximum supported dimension.");
-  static_assert(Dims::NUM_EXPERTS <= Dims_Max::NUM_EXPERTS,
-                "Dimension larger than the maximum supported dimension.");
-  return sizeof(MoEGemmSpec<Dims>);
-}
 
 constexpr size_t get_moe_max_scratchpad_size() {
   return sizeof(MoEGemmSpec<Dims_Max>);

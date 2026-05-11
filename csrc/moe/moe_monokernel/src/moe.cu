@@ -30,7 +30,9 @@ namespace moe_monokernel {
  * up- and down-projections.
  *
  * Pipeline:
- *   Phase 1: routing + topK (prefetch warps idle)
+ *   Phase 1: routing + topK (running in parallel with a greedy TMA
+ *            prefetch of the k_start=0 bf16 activation tile on every
+ *            block — activations are expert-independent)
  *   Phase 2: no-op (streaming WGMMA up-proj does its own priming)
  *   Phase 3: up-proj — streaming WGMMA with on-the-fly bf16→fp8
  *            quantize → SiLU → write bf16 to spec->temp_bf16
@@ -63,16 +65,52 @@ __device__ void moe_kernel_topk_BS8(
   static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
-  // ── Phase 1: routing (topK) — no prefetch needed ────────────────────────
+  // ── Phase 1: routing (topK) + greedy activation prefetch ───────────────
   // Phase 1 runs routing (topK / prepare_moe_topk) which writes
   // shmem->experts and shmem->topk_ids_flat that later phases depend on.
   //
-  // The WGMMA streaming pipeline reads bf16 activations directly from
-  // global memory one K=128 tile at a time (see Phase 3), so no
-  // prefetch into SHM is needed here. Prefetch warps idle during Phase 1.
+  // In parallel with routing, the launcher thread greedily fires the
+  // bf16 activation TMA for k_start=0.  Activations are expert-independent
+  // (the descriptor covers all tokens × all K), so every block can start
+  // fetching immediately — without waiting for routing to determine
+  // expert_count.  Blocks that later turn out to be outside the feasible
+  // range (up_group >= shmem->expert_count) simply leave their 2 KB tile
+  // unused and bar_a[0] sits at parity 1; no hang, no corruption, just
+  // one wasted 2 KB fetch that L2 coalesces across SMs.
+  //
+  // Correctness requirements:
+  //   * mbarriers must be initialized before any `arrive_expect_tx`.
+  //     The init and the arm run on the same launcher thread, so
+  //     program order guarantees local visibility.  The
+  //     `fence_mbarrier_init_release_cluster()` between them (and the
+  //     block-wide `__syncthreads()` below) publishes the init to every
+  //     consumer warp before it waits on `bar_a[0]`.
+  //   * The hoisted Step A handles the e==expert_start iteration only;
+  //     the up-proj helper is called with `external_priming = true` and
+  //     never issues its own bf16_in[0] TMA.  For experts 1..N inside
+  //     a group, Step A is issued at the tail of the previous expert's
+  //     iteration (in parallel with SiLU writeback) — see the end of
+  //     `moe_up_projection_BS8_allexperts_wgmma_tma`'s expert loop.
+  auto* u_tma = &shmem->u.tiny_wgmma_tma;
+  if (is_tma_launcher_thread<Dims>()) {
+    mbarrier_init(&u_tma->bar_w[0], 1u);
+    mbarrier_init(&u_tma->bar_w[1], 1u);
+    mbarrier_init(&u_tma->bar_a[0], 1u);
+    mbarrier_init(&u_tma->bar_a[1], 1u);
+    fence_mbarrier_init_release_cluster();
+
+    // Greedy Step A: activations are expert-independent, so fire the
+    // k_start=0 TMA now — in parallel with routing — instead of waiting
+    // for Phase 2.  The arm happens on the same thread that just did the
+    // init, so no fence is required between them.
+    mbarrier_arrive_expect_tx(&u_tma->bar_a[0], /*tx_bytes=*/2048u);
+    tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
+                             &u_tma->bf16_in[0][0][0], &u_tma->bar_a[0]);
+  }
   if (is_prefetch_warp<Dims>()) {
-    // WGMMA path: prefetch warps have nothing to do here. The streaming
-    // pipeline's first bf16 prefetch is issued inside Phase 3 priming.
+    // WGMMA path: prefetch warps are idle here.  The streaming pipeline's
+    // first bf16 tile is already in flight (greedy TMA above) and the
+    // rest of priming runs inside the up-proj helper.
   } else {
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
                    shmem);
@@ -115,11 +153,14 @@ __device__ void moe_kernel_topk_BS8(
 
   // Phase 2 is a no-op for the v1 streaming WGMMA pipeline.  Phase 3's
   // moe_up_projection_BS8_allexperts_wgmma_tma does its own priming:
-  //   (1) prefetch bf16_in[0] from global
+  //   (1) bf16_in[0] from global (HOISTED to Phase 1 above — fired
+  //       greedily on every block in parallel with routing; the helper
+  //       skips its internal first-expert Step A because we pass
+  //       external_priming=true).
   //   (2) prefetch w[0] and bf16_in[1] || quantize bf16_in[0] → fp8[0]
-  // and then the streaming K-loop alternates WGMMA + bf16 prefetch with
-  // quantize + weight prefetch.
-  __syncthreads();
+  // No __syncthreads() here: the Phase-1 sync above already published
+  // both the barrier init and shmem->expert_count, and computing
+  // up_group / up_block_idx / in_up is pure register work.
 
   // ── Phase 3: Up-projection — expert groups in parallel ────────────────
   // Group `g` (blocks [g*UP_GRID, (g+1)*UP_GRID)) iterates experts starting
@@ -136,7 +177,8 @@ __device__ void moe_kernel_topk_BS8(
         activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
         spec, shmem, up_weights_desc, activations_desc, up_block_idx,
         /*expert_start=*/up_group,
-        /*expert_stride=*/UP_GROUPS);
+        /*expert_stride=*/UP_GROUPS,
+        /*external_priming=*/true);
   }
 
   // ── Single grid.sync — all blocks finish writing spec->temp_bf16 ──────
