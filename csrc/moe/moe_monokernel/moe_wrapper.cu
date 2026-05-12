@@ -9,6 +9,48 @@
 
 #include "src/moe.cu"
 
+// ── TEMP_FP8_OFFSET regression anchor (spec R13.3) ─────────────────────────
+//
+// The host-side down-activation TMA descriptor factory below computes the
+// device pointer to `spec->temp_fp8` as
+//   `scratchpad_ptr + MoEGemmSpec<Dims>::TEMP_FP8_OFFSET`
+// so `TEMP_FP8_OFFSET` MUST stay byte-identical to
+// `offsetof(MoEGemmSpec<Dims>, temp_fp8)` for every instantiated `Dims`
+// variant.  This is exactly the invariant that the software-grid-sync
+// spec (R13.3) relies on when appending new barrier-counter fields to
+// the tail of `MoEGemmSpec<Dims>`: as long as every new field lands
+// AFTER `temp_fp8` (grid_barrier / partial_barrier belong at the tail),
+// the offset stays fixed and the TMA descriptor continues to address
+// the right bytes.  A future refactor that silently reorders the struct
+// layout would otherwise be caught only at runtime by corrupted TMA
+// fetches — the static_asserts below make it a compile-time error.
+//
+// Covers both Dims variants instantiated by this TU (see the two
+// `MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION` macro invocations at the
+// bottom of this file).
+static_assert(
+    offsetof(moe_monokernel::MoEGemmSpec<
+                 moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
+             temp_fp8) ==
+        moe_monokernel::MoEGemmSpec<
+            moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::
+            TEMP_FP8_OFFSET,
+    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
+    "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
+    "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
+    "MoEGemmSpec<Dims> (spec R13.3).");
+static_assert(
+    offsetof(moe_monokernel::MoEGemmSpec<
+                 moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>,
+             temp_fp8) ==
+        moe_monokernel::MoEGemmSpec<
+            moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>::
+            TEMP_FP8_OFFSET,
+    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
+    "Dims_BS64_E256_Qwen3_5_35B_BlockFP8. Do not insert fields before "
+    "temp_fp8; grid_barrier / partial_barrier belong at the tail of "
+    "MoEGemmSpec<Dims> (spec R13.3).");
+
 /**
  * @brief Macro that expands to a kernel call wrapper for moe_kernel_topk with
  * specified @p dims and configurable top_k, scoring_func, and renormalize.
@@ -156,12 +198,67 @@
                 dims::KernelConfig::BLOCK_SIZE, shmem_size, fa.numRegs,        \
                 fa.sharedSizeBytes, max_blocks_per_sm, sm_count,               \
                 max_blocks_per_sm * sm_count, smem_opt_in);                    \
+        /* Hard co-residency assertions for the software grid barrier          \
+           (spec R4.1, R4.2, R4.3 / Design Component C "Co-residency           \
+           assertions").  The seed-atomicAdd-spin-on-high-bit protocol         \
+           in src/moe_grid_barrier.h is only deadlock-free when every          \
+           participating block is co-resident on the GPU for the full          \
+           lifetime of the kernel: (1) grid_size <= SM count so every          \
+           block gets a slot, and (2) max_active_blocks_per_SM == 1 so         \
+           no block is ever waiting on a block that has not yet been           \
+           scheduled.  GRID_SIZE is a compile-time constexpr and SM            \
+           count / occupancy are device-property-time static, so gating        \
+           under `_diag_printed` keeps the check one-shot per process          \
+           and off the hot path. */                                            \
+        TORCH_CHECK(                                                           \
+            dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count),  \
+            "moe_monokernel requires GRID_SIZE (=",                            \
+            dims::KernelConfig::GRID_SIZE, ") <= SM count (=", sm_count,       \
+            ") for software grid barrier co-residency invariant "              \
+            "(spec R4.1).");                                                   \
+        TORCH_CHECK(max_blocks_per_sm == 1,                                    \
+                    "moe_monokernel requires max_active_blocks_per_SM == 1 "   \
+                    "(observed ",                                              \
+                    max_blocks_per_sm,                                         \
+                    ") for co-residency invariant (spec R4.2). See "           \
+                    "__launch_bounds__(BLOCK_SIZE, 1) and the SHM budget "     \
+                    "requirement.");                                           \
         _diag_printed = true;                                                  \
       }                                                                        \
     }                                                                          \
-    CUDA_CHECK(cudaLaunchCooperativeKernel(                                    \
-        moe_kernel_topk<dims>, dims::KernelConfig::GRID_SIZE,                  \
-        dims::KernelConfig::BLOCK_SIZE, kernel_args, shmem_size, stream));     \
+    /* One-shot scratchpad zero-init (spec R13.2 / Design Component C          \
+       "Scratchpad barrier counter zero-initialization").  The software        \
+       Grid_Barrier / Partial_Barrier counters live at the tail of             \
+       MoEGemmSpec<Dims> inside the scratchpad, and the                        \
+       seed-atomicAdd-spin-on-high-bit protocol requires the barrier slots     \
+       to start at 0 so the first Seed_Thread write commits the                \
+       `0x80000000u - (arrival_count - 1)` seed value cleanly.  The            \
+       ping-pong reset discipline keeps the slots self-maintaining across      \
+       subsequent kernel invocations (see MoEGemmSpec<Dims> block comment      \
+       on grid_barrier and partial_barrier), so we only pay the zero-init      \
+       cost once per process on the first launch.  Zeroing the full            \
+       scratchpad (rather than just the counter region) is simpler and         \
+       the cost is a few hundred microseconds one-time on H200 — trivial     \
+       next to per-decode kernel launches. */                                  \
+    {                                                                          \
+      static bool _zeroed = false;                                             \
+      if (!_zeroed) {                                                          \
+        CUDA_CHECK(                                                            \
+            cudaMemsetAsync(scratchpad_ptr, 0, scratchpad_size, stream));      \
+        _zeroed = true;                                                        \
+      }                                                                        \
+    }                                                                          \
+    /* Standard (non-cooperative) launch.  The kernel reaches grid-wide        \
+       happens-before via the software Grid_Barrier / Partial_Barrier          \
+       primitives in `src/moe_grid_barrier.h` (spec R1.1, R5.1, Design         \
+       Component C "Launch form") rather than                                  \
+       `cooperative_groups::this_grid().sync()`.  Using standard               \
+       `cudaLaunchKernel` is what lets the migrated kernel be captured         \
+       into a CUDA Graph. */                                                   \
+    CUDA_CHECK(cudaLaunchKernel((const void*)moe_kernel_topk<dims>,            \
+                                dim3(dims::KernelConfig::GRID_SIZE, 1, 1),     \
+                                dim3(dims::KernelConfig::BLOCK_SIZE, 1, 1),    \
+                                kernel_args, shmem_size, stream));             \
   }
 
 // Qwen3.5-35B FP8 block-wise (128×128) quantization (E=256, K=2048, N=512,

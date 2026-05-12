@@ -47,6 +47,40 @@ struct ExpertRef {
   std::uint32_t id;
 };
 
+// ── WGMMA / TMA opt-in detection (forward declarations) ────────────────────
+// These SFINAE helpers let `MoEGemmSpec<Dims>` pick the variant-dependent
+// `DOWN_COL_TILE` below (128 normally, 256 for the BS8 TMA+WGMMA variant
+// after Phase 2a layout alignment).  Full definitions (with detailed
+// comments) live further down the file; the forward declarations here only
+// need to expose `::value` so compile-time expressions can use them.
+template <typename Dims>
+struct use_wgmma {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::USE_WGMMA, bool()) {
+    return D::KernelConfig::USE_WGMMA;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
+template <typename Dims>
+struct use_tma {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::USE_TMA, bool()) {
+    return D::KernelConfig::USE_TMA;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
 /**
  * @brief Scratchpad memory for use within the monokernel.
  *
@@ -142,7 +176,23 @@ struct MoEGemmSpec {
   // later in this file) so MoEGemmSpec stays self-contained.  The
   // canonical definition lives in MoECoreDims; the two MUST match —
   // MoECoreDims contains a static_assert that cross-checks.
-  static constexpr uint32_t DOWN_COL_TILE = 128;
+  //
+  // Phase 2a layout alignment (software-grid-sync spec):
+  //   For the BS8 TMA+WGMMA variant (`use_tma<Dims>::value == true` and
+  //   Dims::BS <= 8), `DOWN_COL_TILE` is bumped from 128 to 256.  This
+  //   halves `DOWN_GRID` (2048/256 = 8) and doubles `DOWN_GROUPS`
+  //   (128/8 = 16), so `DOWN_GROUPS == UP_GROUPS = 16` and the 8 blocks
+  //   `[g*8, g*8+7]` form both `up_group = g` and `down_group = g` for
+  //   the same expert set — the prerequisite for the Phase-2b
+  //   Expert_Barrier at site #2.  All other variants (BS64, non-TMA)
+  //   keep `DOWN_COL_TILE = 128` so their block layout, `down_partial_out`
+  //   size, and WGMMA pipeline are unchanged.
+  //
+  //   BS8 TMA+WGMMA post Phase 2a:
+  //     DOWN_COL_TILE = 256, DOWN_GRID = 8, DOWN_GROUPS = 16
+  //     down_partial_out = 16 × 8 × 2048 × 4 B = 1 MB (up from 512 KB).
+  static constexpr uint32_t DOWN_COL_TILE =
+      (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
   static constexpr uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
@@ -155,6 +205,79 @@ struct MoEGemmSpec {
   static constexpr uint32_t ACT_SCALE_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
   float act_scale[Dims::BS][ACT_SCALE_BLOCKS];
+
+  // ── Software barrier counters (Req 13.3, 2.8, 8.5) ────────────────────
+  //
+  // Placed at the TAIL of `MoEGemmSpec<Dims>`, AFTER `act_scale`, so
+  // `TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8)` stays
+  // byte-identical to its pre-migration value.  The host-side TMA
+  // descriptor factory in `moe_wrapper.cu` derives the device pointer
+  // to `spec->temp_fp8` from that compile-time constant (spec R13.3,
+  // Design "Byte-offset check"), so inserting any new field BEFORE
+  // `temp_fp8` would silently break the down-activation TMA path.
+  //
+  // Lifetime / initialization (Req 13.1, 13.2):
+  //   * Host zero-initializes the whole scratchpad (including these
+  //     counters) once per process via `cudaMemsetAsync` on the first
+  //     launch (Design Component C "Scratchpad barrier counter
+  //     zero-initialization").
+  //   * Subsequent launches inherit the counter state from the
+  //     previous kernel's exit: the ping-pong discipline is
+  //     self-maintaining — each barrier call's seed `atomicExch`
+  //     overwrites the prior-call `0x80000000` on the same slot in its
+  //     atomic step, and any arrivals that landed on the slot between
+  //     calls are folded back in by the seed-thread's follow-up
+  //     `atomicAdd(c, prior)` (Design Component A "Seed correctness
+  //     argument" and "Ping-pong reset").  No host re-zero is required
+  //     across kernel invocations.
+  //
+  // Call-site mapping (Design "Site #1"…"Site #5"):
+  //   * `grid_barrier.slot[2]` — the Phase-1 full-grid ping-pong pair.
+  //     Used by:
+  //       - Site #1 (BS64 only) — top-of-kernel output zero-out
+  //         publishes to Phase 1. Eliminated for BS8 under
+  //         `if constexpr (Dims::BS > 8)` because the BS8 Phase-5
+  //         reduction `=`-writes every output element (Req 3.4, 3.5).
+  //       - Sites #2, #3 (BS8) — Phase 3→4 and Phase 4→5. These are
+  //         Grid_Barrier in Phase 1 and get downgraded to
+  //         Expert_Barrier / ColStripe_Barrier (below) in Phase 2b.
+  //       - Site #4 (BS64) — up→down projection boundary.
+  //       - Site #5 (BS64) — `moe_scale_activation_BSx` publishes
+  //         `spec->act_scale` to every downstream reader.
+  //     All BS64 sites share the same ping-pong pair because every
+  //     block calls them in the same static order, and the phase
+  //     counter is threaded through the one `grid_phase` register.
+  //
+  //   * `partial_barrier.expert_slot[NUM_EXPERTS][2]` — Phase-2b
+  //     Expert_Barrier counter region, one Counter_Pair per expert
+  //     group id (== up_group).  Used at site #2 only, BS8 only.
+  //     Arrival count = UP_GRID (8 blocks per expert group after
+  //     Phase-2a layout alignment, `DOWN_COL_TILE = 256`).
+  //
+  //   * `partial_barrier.colstripe_slot[DOWN_GRID][2]` — Phase-2b
+  //     ColStripe_Barrier counter region, one Counter_Pair per
+  //     output col stripe id (== `blockIdx.x % DOWN_GRID`).  Used at
+  //     site #3 only, BS8 only.  Arrival count = DOWN_GROUPS
+  //     (16 blocks per col stripe after Phase-2a alignment).
+  //
+  // Uses the local `DOWN_GRID` (declared above on this struct) rather
+  // than `MoECoreDims<Dims>::DOWN_GRID` because `MoECoreDims` is
+  // defined LATER in this file than `MoEGemmSpec`, making the
+  // qualified name an incomplete-type forward reference here.  The
+  // two must match, and `MoECoreDims` carries a `static_assert` that
+  // cross-checks (see the DOWN_GROUPS cross-check further down).
+  //
+  // Sizing (Design "Sizing"): for NUM_EXPERTS=256, DOWN_GRID=16
+  // (Phase-1) or 8 (post Phase-2a), the barrier counters total
+  // 2 × 4 + 256 × 2 × 4 + DOWN_GRID × 2 × 4 B ≤ 2120 B — negligible
+  // vs. the MB-scale scratchpad.
+  struct {
+    uint32_t slot[2];
+  } grid_barrier;
+  struct {
+    uint32_t expert_slot[Dims::NUM_EXPERTS][2];
+    uint32_t colstripe_slot[DOWN_GRID][2];
+  } partial_barrier;
 };
 
   // Maximum supported dimensions for shared memory and scratchpad allocation
@@ -212,37 +335,20 @@ struct shm_down_scale_cols<Dims, true> {
 // `Dims::KernelConfig::USE_WGMMA` is optional; default to false for all
 // existing Dims variants so the current mma.sync path stays in use.
 // Only the new Dims_BS8_..._WGMMA variant sets USE_WGMMA=true.
-template <typename Dims>
-struct use_wgmma {
-  template <typename D>
-  static constexpr auto test(int)
-      -> decltype(D::KernelConfig::USE_WGMMA, bool()) {
-    return D::KernelConfig::USE_WGMMA;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
+//
+// NOTE: The primary definition lives near the top of this file (before
+// `MoEGemmSpec<Dims>`) so `MoEGemmSpec` can use `use_wgmma<Dims>::value`
+// to select the variant-dependent `DOWN_COL_TILE` for Phase 2a.  The
+// block comment below documents the same detection scheme for readers
+// who land on the later usage sites first.
 
 // ── TMA opt-in detection ────────────────────────────────────────────────
 // `Dims::KernelConfig::USE_TMA` is optional; default to false for all
 // existing Dims variants so the current cp.async WGMMA path stays in use.
 // Only the new Dims_BS8_..._WGMMA_TMA variant sets USE_TMA=true.
-template <typename Dims>
-struct use_tma {
-  template <typename D>
-  static constexpr auto test(int)
-      -> decltype(D::KernelConfig::USE_TMA, bool()) {
-    return D::KernelConfig::USE_TMA;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
+//
+// NOTE: The primary definition lives near the top of this file (before
+// `MoEGemmSpec<Dims>`) — see the comment on `use_wgmma` above.
 
 /**
  * @brief contains various constants used within the MoE monokernel.
@@ -315,20 +421,32 @@ struct MoECoreDims {
       use_wgmma<Dims>::value ? W_UP_TILE_WGMMA : W_UP_TILE;
 
   // ── WGMMA down-projection grid layout ────────────────────────────────
-  // Each down-block owns 128 output cols within Dims::HIDDEN_STATES, so
-  // DOWN_GRID = HIDDEN_STATES / 128 blocks cover one expert's full output.
-  // The remaining grid blocks process DIFFERENT experts in parallel:
+  // Each down-block owns DOWN_COL_TILE output cols within
+  // Dims::HIDDEN_STATES, so DOWN_GRID = HIDDEN_STATES / DOWN_COL_TILE
+  // blocks cover one expert's full output.  The remaining grid blocks
+  // process DIFFERENT experts in parallel:
   // DOWN_GROUPS = GRID_SIZE / DOWN_GRID expert groups each write a
   // partial sum into spec->down_partial_out[DOWN_GROUPS][BS][HIDDEN_STATES],
   // then a reduction phase sums the partials into activations_out.
   //
-  // For Qwen3.5-35B (HIDDEN_STATES=2048, GRID_SIZE=128):
-  //   DOWN_GRID   = 2048 / 128 = 16 blocks per expert
-  //   DOWN_GROUPS = 128  / 16  = 8 expert groups running in parallel
+  // Default (BS64, non-TMA): DOWN_COL_TILE = 128.
+  //   For Qwen3.5-35B (HIDDEN_STATES=2048, GRID_SIZE=128):
+  //     DOWN_GRID   = 2048 / 128 = 16 blocks per expert
+  //     DOWN_GROUPS = 128  / 16  = 8 expert groups running in parallel
   //
-  // DOWN_COL_TILE is fixed at 128 (=W_UP_TILE_WGMMA, matches the
-  // two-WG 64-col-per-WG output structure).
-  static constexpr std::uint32_t DOWN_COL_TILE = 128;
+  // BS8 TMA+WGMMA (Phase 2a layout alignment): DOWN_COL_TILE = 256.
+  //   DOWN_GRID   = 2048 / 256 = 8 blocks per expert
+  //   DOWN_GROUPS = 128  / 8   = 16 expert groups (== UP_GROUPS)
+  // This alignment makes the 8 blocks `[g*8, g*8+7]` form both
+  // `up_group = g` and `down_group = g` for the same expert set, so
+  // the producer-set of site #2 (Phase 3 → Phase 4) becomes identical
+  // to its consumer-set, enabling the Expert_Barrier in Phase 2b.
+  //
+  // The variant-dependent value MUST match
+  // `MoEGemmSpec<Dims>::DOWN_COL_TILE`; the static_assert further down
+  // cross-checks their derived DOWN_GROUPS.
+  static constexpr std::uint32_t DOWN_COL_TILE =
+      (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
   static constexpr std::uint32_t DOWN_GRID =
       Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr std::uint32_t DOWN_GROUPS =
@@ -336,8 +454,9 @@ struct MoECoreDims {
 
   static_assert(!use_wgmma<Dims>::value ||
                     Dims::HIDDEN_STATES % DOWN_COL_TILE == 0,
-                "HIDDEN_STATES must be a multiple of 128 for the WGMMA "
-                "down-projection (one down-block owns 128 output cols)");
+                "HIDDEN_STATES must be a multiple of DOWN_COL_TILE for the "
+                "WGMMA down-projection (one down-block owns DOWN_COL_TILE "
+                "output cols)");
   static_assert(!use_wgmma<Dims>::value ||
                     Dims::KernelConfig::GRID_SIZE % DOWN_GRID == 0,
                 "GRID_SIZE must be a multiple of DOWN_GRID for the WGMMA "
@@ -346,8 +465,15 @@ struct MoECoreDims {
                 "DOWN_GROUPS cannot exceed NUM_EXPERTS (each expert group "
                 "must process at least one expert)");
 
-  // Cross-check that MoEGemmSpec's mirror of DOWN_GROUPS (computed
-  // locally there to avoid a forward reference) matches this one.
+  // Cross-check that MoEGemmSpec's mirror of DOWN_COL_TILE / DOWN_GROUPS
+  // (computed locally there to avoid a forward reference) matches this
+  // one.  If they diverge, `down_partial_out` (sized in MoEGemmSpec) and
+  // the kernel's per-block col-stripe ownership (sized in MoECoreDims)
+  // would disagree, silently corrupting Phase-5 reductions.
+  static_assert(MoEGemmSpec<Dims>::DOWN_COL_TILE == DOWN_COL_TILE,
+                "MoEGemmSpec::DOWN_COL_TILE must match "
+                "MoECoreDims::DOWN_COL_TILE — check the variant-dependent "
+                "DOWN_COL_TILE definition in both places.");
   static_assert(MoEGemmSpec<Dims>::DOWN_GROUPS == DOWN_GROUPS,
                 "MoEGemmSpec::DOWN_GROUPS must match MoECoreDims::DOWN_GROUPS "
                 "— check the DOWN_COL_TILE definition in both places.");
@@ -458,7 +584,14 @@ struct MoE_SHM {
                                    [FP8_ACT_K_CHUNK];  // 2 KB (down)
       };
 
-      static constexpr uint32_t W_WGMMA_M = 128;  // M dim of weight tile
+      static constexpr uint32_t W_WGMMA_M =
+          128;  // M dim of weight tile (up-proj)
+      // Down-proj tile M dim tracks DOWN_COL_TILE (Phase 2a): 128 for the
+      // BS64 / non-TMA path, 256 for the BS8 TMA+WGMMA variant after the
+      // Phase-2a layout alignment (DOWN_COL_TILE = 256).  Must stay a
+      // multiple of 128 so the SWIZZLE_128B core-matrix atoms still tile
+      // the outer M axis cleanly.
+      static constexpr uint32_t W_DOWN_WGMMA_M = CoreDims::DOWN_COL_TILE;
       static constexpr uint32_t W_WGMMA_K = CoreDims::K_STEP_WGMMA;  // 128
       union {
         // 1024-byte alignment required by SWIZZLE_128B: the XOR
@@ -466,10 +599,19 @@ struct MoE_SHM {
         // consistently within 1024-byte-aligned regions. Both
         // `w_wgmma` and `w_down_wgmma` alias the same SHM bytes, so
         // the alignas applies to both views.
+        //
+        // Pre Phase 2a: `w_wgmma` and `w_down_wgmma` are both
+        //   [2][128][128] = 32 KB total.
+        // Post Phase 2a (BS8 TMA+WGMMA only): `w_down_wgmma` grows to
+        //   [2][256][128] = 64 KB; the union therefore expands to 64 KB.
+        //   `w_wgmma` only consumes 32 KB of that (up-proj still uses a
+        //   128-row tile), which is fine — the up-proj view just
+        //   leaves the tail 32 KB untouched during Phase 3.
         alignas(1024)
             W_element w_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (up-proj)
         alignas(1024) W_element
-            w_down_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (down-proj)
+            w_down_wgmma[2][W_DOWN_WGMMA_M]
+                        [W_WGMMA_K];  // 32 KB (pre) / 64 KB (post Phase 2a)
       };
 
       union {

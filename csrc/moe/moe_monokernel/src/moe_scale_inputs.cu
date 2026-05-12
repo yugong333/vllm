@@ -12,10 +12,10 @@
 
   #include <cuda/pipeline>
   #include <cuda_bf16.h>
-  #include <cooperative_groups.h>
 
   #include "moe_interface.h"
   #include "moe_internal.h"
+  #include "moe_grid_barrier.h"
   #include "ptx_utils.h"
   #include "moe_debug.h"
 
@@ -551,7 +551,8 @@ __device__ static void moe_scale_activation_BSx_chunk(
 template <typename Dims>
 __device__ void moe_scale_activation_BSx(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
-    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem) {
+    MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
+    uint32_t* __restrict__ grid_counters, uint32_t& grid_phase) {
   static_assert(Dims::BS > 8,
                 "BS=8 is handled by its own kernel. Do not use "
                 "moe_scale_inputs for BS<=8");
@@ -583,7 +584,10 @@ __device__ void moe_scale_activation_BSx(
   }
 
   // spec->act_scale is written by different blocks — make visible to all
-  cooperative_groups::this_grid().sync();
+  // via the software grid barrier (formerly cooperative_groups::
+  // this_grid().sync()).  See Requirement 3.1/3.3 and Design Site #5.
+  moe_monokernel::grid_barrier<Dims::KernelConfig::GRID_SIZE>(grid_counters,
+                                                              grid_phase);
 
   // copy per-block act_scale into shmem for fast per-token access
   for (uint32_t i = threadIdx.x; i < token_count * NUM_ACT_BLOCKS;
