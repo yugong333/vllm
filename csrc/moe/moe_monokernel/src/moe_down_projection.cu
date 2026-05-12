@@ -999,9 +999,33 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint32_t K_STEP_DOWN = CoreDims::K_STEP_WGMMA;           // 128
   constexpr std::uint32_t WGMMAS_PER_STEP_DOWN = K_STEP_DOWN / K_TILE_W;  // 4
   constexpr std::uint32_t K_TILES_DOWN = Dims::N / K_STEP_DOWN;           // 4
-  constexpr std::uint32_t DOWN_COL_TILE = CoreDims::DOWN_COL_TILE;        // 128
-  constexpr std::uint32_t DOWN_GRID = CoreDims::DOWN_GRID;                // 16
-  constexpr std::uint32_t DOWN_GROUPS = CoreDims::DOWN_GROUPS;            // 8
+  constexpr std::uint32_t DOWN_COL_TILE =
+      CoreDims::DOWN_COL_TILE;                                  // 128 or 256
+  constexpr std::uint32_t DOWN_GRID = CoreDims::DOWN_GRID;      // 16 or 8
+  constexpr std::uint32_t DOWN_GROUPS = CoreDims::DOWN_GROUPS;  // 8 or 16
+  // Phase-2a layout alignment: one block owns `DOWN_COL_TILE` output
+  // cols.  The two WGs (64 output cols each per WGMMA pass) together
+  // cover 128 cols per pass, so we need `HALVES = DOWN_COL_TILE / 128`
+  // sequential passes per K-step:
+  //   * Pre Phase 2a (DOWN_COL_TILE=128): HALVES=1, pre-alignment 128-col
+  //     behaviour.  Weight tile in SHM is 128×128.
+  //   * Post Phase 2a (DOWN_COL_TILE=256, BS8 TMA+WGMMA only): HALVES=2,
+  //     weight tile in SHM is 256×128.  Pass 0 covers output rows
+  //     [base_col+0..base_col+127], pass 1 covers [+128..+255].
+  constexpr std::uint32_t DOWN_COL_HALVES = DOWN_COL_TILE / 128u;  // 1 or 2
+  static_assert(DOWN_COL_TILE % 128u == 0,
+                "DOWN_COL_TILE must be a multiple of 128 for the TMA+WGMMA "
+                "down-projection (the weight tile is laid out as 128-row "
+                "SWZ128 atoms on the M axis).");
+  static_assert(DOWN_COL_HALVES <= 2u,
+                "DOWN_COL_TILE > 256 not supported by the Phase-2a "
+                "two-halves WGMMA structure.");
+  // Per-K-step weight TMA transfer size.  Each half is a 128×128 fp8
+  // tile = 16384 B; HALVES halves stack along the M axis into
+  // `w_down_wgmma[slot][0..DOWN_COL_TILE-1]`.
+  constexpr std::uint32_t DOWN_W_TX_BYTES_PER_HALF = 16384u;
+  constexpr std::uint32_t DOWN_W_TX_BYTES_TOTAL =
+      DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES;  // 16384 or 32768
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
@@ -1058,11 +1082,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
   // ── Per-thread fp32 accumulators ──────────────────────────────────────
-  float chunk_d_lo0 = 0.f, chunk_d_lo1 = 0.f, chunk_d_lo2 = 0.f,
-        chunk_d_lo3 = 0.f;
-  float chunk_d_hi0 = 0.f, chunk_d_hi1 = 0.f, chunk_d_hi2 = 0.f,
-        chunk_d_hi3 = 0.f;
-  float final_d0 = 0.f, final_d1 = 0.f, final_d2 = 0.f, final_d3 = 0.f;
+  // One m64n8k32 WGMMA holds 4 fp32 accumulators per thread (d0/d1/d2/d3).
+  // The down-projection's inner K chain stacks 4 WGMMAs per K-step into a
+  // "lo" chunk (K[0..63], 2 WGMMAs) and "hi" chunk (K[64..127], 2 WGMMAs).
+  // Phase-2a generalizes this to `DOWN_COL_HALVES` parallel halves along
+  // the M axis, so we hold `4 * HALVES` final accumulators per thread:
+  //   * chunk_d_lo[h][0..3] / chunk_d_hi[h][0..3] — per-half per-K-chunk
+  //                                                  scratch, reset each
+  //                                                  K-step.
+  //   * final_d[h][0..3]                           — per-half per-expert
+  //                                                  K-loop accumulator
+  //                                                  (scaled by ws·as).
+  float chunk_d_lo[DOWN_COL_HALVES][4] = {{0.f}};
+  float chunk_d_hi[DOWN_COL_HALVES][4] = {{0.f}};
+  float final_d[DOWN_COL_HALVES][4] = {{0.f}};
 
   // ── Zero per-block SHM out_accum[BS][DOWN_COL_TILE] ───────────────────
   for (unsigned idx = thread_in_block; idx < Dims::BS * DOWN_COL_TILE;
@@ -1111,15 +1144,31 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     std::uint32_t parity_a[2] = {0u, 0u};
 
     // Reset per-expert `final_d` accumulator.
-    final_d0 = final_d1 = final_d2 = final_d3 = 0.f;
+  #pragma unroll
+    for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+  #pragma unroll
+      for (std::uint32_t r = 0; r < 4u; ++r) {
+        final_d[h][r] = 0.f;
+      }
+    }
 
     // ── Load weight scales ─────────────────────────────────────────────
     // Weights scales are fixed across K-steps, so we only load them
-    // once per expert into slot 0.  Loaded via cp.async from the
-    // prefetch warps — not TMA.
+    // once per expert.  Loaded via cp.async from the prefetch warps —
+    // not TMA.
+    //
+    // Phase-2a layout alignment: with DOWN_COL_HALVES halves per block,
+    // the two halves occupy different 128-row scale blocks (half 0 at
+    // row-block `base_col/128`, half 1 at `base_col/128 + 1`).  We load
+    // each half's scales into `w_down_scale[h][wg][cb]` — reusing the
+    // existing double-buffer dimension (never double-used for scales;
+    // they're loaded once per expert) as the half index.
     if (is_prefetch_warp<Dims>()) {
-      moe_load_down_wgmma_weight_scale_tile<Dims>(
-          expert_scales_down, id, base_col, shm->w_down_scale[0]);
+  #pragma unroll
+      for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+        moe_load_down_wgmma_weight_scale_tile<Dims>(
+            expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
+      }
     }
 
     // ── Priming: prefetch slot 0 (w + a + a_scale for K-step 0) ────────
@@ -1129,16 +1178,25 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // completion signalled on `bar_w[0]` / `bar_a[0]`.  The activation
     // scale tile loads via cp.async through `pipe`.
     if (is_tma_launcher_thread<Dims>()) {
-      // Weight tile for K-step 0: arm bar_w[0] with tx=16384, issue the
-      // single 128x128 TMA into slot 0.
-      mbarrier_arrive_expect_tx(&shm->bar_w[0], /*tx_bytes=*/16384u);
-      tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
-                               /*K=*/Dims::HIDDEN_STATES,
-                               /*base_col=*/base_col,
-                               /*k_start=*/0u,
-                               /*dest_smem_ptr=*/
-                               (void*)&shm->w_down_wgmma[0][0][0],
-                               /*bar_smem_ptr=*/&shm->bar_w[0]);
+      // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
+      // (= 16384 · HALVES = 16 KB for pre Phase 2a, 32 KB for post)
+      // and issue `HALVES` back-to-back 128×128 TMAs.  Half 0 lands at
+      // `&w_down_wgmma[0][0][0]`, half 1 at
+      // `&w_down_wgmma[0][128][0]` (= base + 16384 B).  All TMAs in
+      // this block retire into the same bar_w[0], so a single
+      // `mbarrier.try_wait.parity` on the compute side drains both.
+      mbarrier_arrive_expect_tx(&shm->bar_w[0],
+                                /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
+  #pragma unroll
+      for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+        W_element* dest_base = &shm->w_down_wgmma[0][h * 128u][0];
+        tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                 /*K=*/Dims::HIDDEN_STATES,
+                                 /*base_col=*/base_col + h * 128u,
+                                 /*k_start=*/0u,
+                                 /*dest_smem_ptr=*/(void*)dest_base,
+                                 /*bar_smem_ptr=*/&shm->bar_w[0]);
+      }
 
       // Activation tile for K-step 0: only issue when routed_count > 0.
       // The helper issues 8 TMAs (one per K-chunk); the descriptor's
@@ -1206,14 +1264,17 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           parity_a[read_slot] ^= 1;
         }
 
-        // A descriptor bases per WG — identical to the cp.async path.
-        //   WG0: rows [0..63]   → &w_down_wgmma[read_slot][0][0]
-        //   WG1: rows [64..127] → &w_down_wgmma[read_slot][0][0] + 8192 B
+        // A descriptor bases per WG per half — the weight tile is
+        // laid out as `HALVES` contiguous 128-row M-slabs (half 0 at
+        // rows [0..127], half 1 at rows [128..255]).  Within each
+        // slab, WG0 owns rows [0..63] and WG1 owns rows [64..127].
+        //
+        //   A-desc base for (wg, h):
+        //     &w_down_wgmma[slot][h * 128 + (wg==1 ? 64 : 0)][0]
+        //     = slot_base + h * 16384 + (wg==1 ? 8192 : 0)
         const void* a_slot_base =
             (const void*)&shm->w_down_wgmma[read_slot][0][0];
-        const void* a_base =
-            is_wg1 ? (const void*)((const char*)a_slot_base + 8192)
-                   : a_slot_base;
+        const std::uint32_t wg_offset_bytes = is_wg1 ? 8192u : 0u;
 
         wgmma_fence();
 
@@ -1226,40 +1287,60 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         const void* b_slot_base =
             (const void*)&shm->a_down_wgmma[read_slot][0][0][0];
 
-        // 4 chained WGMMAs into chunk_d_lo  (K[0..63], j = 0, 1).
+        // Per-half WGMMA passes.  Each pass runs the same
+        // 4-chained-m64n8k32 structure as the pre Phase-2a kernel and
+        // accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`, then
+        // applies the (ws, as) scales at the K=128 boundary and folds
+        // into `final_d[h]`.
   #pragma unroll
-        for (std::uint32_t j = 0; j < 2; ++j) {
-          const void* a_ptr =
-              (const void*)((const char*)a_base + j * A_K_STRIDE);
-          const void* b_ptr =
-              (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
-          std::uint64_t desc_a =
-              make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-          std::uint64_t desc_b =
-              make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-          wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo0, chunk_d_lo1,
-                                       chunk_d_lo2, chunk_d_lo3);
-        }
+        for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+          const std::uint32_t half_offset_bytes = h * 16384u;
+          const void* a_base =
+              (const void*)((const char*)a_slot_base + half_offset_bytes +
+                            wg_offset_bytes);
 
-        // 4 chained WGMMAs into chunk_d_hi  (K[64..127], j = 2, 3).
+          // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
   #pragma unroll
-        for (std::uint32_t j = 2; j < WGMMAS_PER_STEP_DOWN; ++j) {
-          const void* a_ptr =
-              (const void*)((const char*)a_base + j * A_K_STRIDE);
-          const void* b_ptr =
-              (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
-          std::uint64_t desc_a =
-              make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-          std::uint64_t desc_b =
-              make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-          wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi0, chunk_d_hi1,
-                                       chunk_d_hi2, chunk_d_hi3);
+          for (std::uint32_t j = 0; j < 2; ++j) {
+            const void* a_ptr =
+                (const void*)((const char*)a_base + j * A_K_STRIDE);
+            const void* b_ptr =
+                (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
+            std::uint64_t desc_a =
+                make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+            std::uint64_t desc_b =
+                make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
+                                         chunk_d_lo[h][1], chunk_d_lo[h][2],
+                                         chunk_d_lo[h][3]);
+          }
+
+          // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
+  #pragma unroll
+          for (std::uint32_t j = 2; j < WGMMAS_PER_STEP_DOWN; ++j) {
+            const void* a_ptr =
+                (const void*)((const char*)a_base + j * A_K_STRIDE);
+            const void* b_ptr =
+                (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
+            std::uint64_t desc_a =
+                make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+            std::uint64_t desc_b =
+                make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
+                                         chunk_d_hi[h][1], chunk_d_hi[h][2],
+                                         chunk_d_hi[h][3]);
+          }
         }
 
         wgmma_commit_group();
         wgmma_wait_group<0>();
 
-        // ── Scale-apply at the K=128 boundary (unchanged from cp.async) ─
+        // ── Scale-apply at the K=128 boundary (per-half) ──────────────
+        // Each half uses its own weight-scale row-block entry
+        // `w_down_scale[h][my_wg][ws_col]` loaded once per expert.
+        // The activation scales are shared across halves (one set per
+        // slot, indexed by token) because both halves process the same
+        // 128-K K-step against the same activation tile.
         const std::uint32_t tok_02 = (lane % 4) * 2;
         const std::uint32_t tok_13 = (lane % 4) * 2 + 1;
 
@@ -1269,15 +1350,23 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         const float as_hi_13 = shm->a_down_scale[read_slot][tok_13][1];
 
         const std::uint32_t ws_col = (W_DOWN_SCALE_COLS > 1) ? s : 0u;
-        const float ws = shm->w_down_scale[0][my_wg][ws_col];
 
-        final_d0 += chunk_d_lo0 * as_lo_02 * ws + chunk_d_hi0 * as_hi_02 * ws;
-        final_d1 += chunk_d_lo1 * as_lo_13 * ws + chunk_d_hi1 * as_hi_13 * ws;
-        final_d2 += chunk_d_lo2 * as_lo_02 * ws + chunk_d_hi2 * as_hi_02 * ws;
-        final_d3 += chunk_d_lo3 * as_lo_13 * ws + chunk_d_hi3 * as_hi_13 * ws;
-
-        chunk_d_lo0 = chunk_d_lo1 = chunk_d_lo2 = chunk_d_lo3 = 0.f;
-        chunk_d_hi0 = chunk_d_hi1 = chunk_d_hi2 = chunk_d_hi3 = 0.f;
+  #pragma unroll
+        for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+          const float ws = shm->w_down_scale[h][my_wg][ws_col];
+          final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
+                           chunk_d_hi[h][0] * as_hi_02 * ws;
+          final_d[h][1] += chunk_d_lo[h][1] * as_lo_13 * ws +
+                           chunk_d_hi[h][1] * as_hi_13 * ws;
+          final_d[h][2] += chunk_d_lo[h][2] * as_lo_02 * ws +
+                           chunk_d_hi[h][2] * as_hi_02 * ws;
+          final_d[h][3] += chunk_d_lo[h][3] * as_lo_13 * ws +
+                           chunk_d_hi[h][3] * as_hi_13 * ws;
+          chunk_d_lo[h][0] = chunk_d_lo[h][1] = chunk_d_lo[h][2] =
+              chunk_d_lo[h][3] = 0.f;
+          chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
+              chunk_d_hi[h][3] = 0.f;
+        }
       }
 
       // Launcher runs IN PARALLEL with the WGMMA above. It arms and
@@ -1288,16 +1377,22 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
 
-          // Next weight tile.
+          // Next weight tile — HALVES back-to-back 128×128 TMAs,
+          // same structure as the priming block.  Single bar_w arm
+          // with the TOTAL tx_bytes drains every half in one wait on
+          // the compute side.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
-                                    /*tx_bytes=*/16384u);
-          tma_load_down_wgmma_tile(
-              down_weights_desc, /*expert_id=*/id,
-              /*K=*/Dims::HIDDEN_STATES,
-              /*base_col=*/base_col,
-              /*k_start=*/next_k_start,
-              /*dest_smem_ptr=*/(void*)&shm->w_down_wgmma[next_slot][0][0],
-              /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
+                                    /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
+  #pragma unroll
+          for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+            W_element* dest_base = &shm->w_down_wgmma[next_slot][h * 128u][0];
+            tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                     /*K=*/Dims::HIDDEN_STATES,
+                                     /*base_col=*/base_col + h * 128u,
+                                     /*k_start=*/next_k_start,
+                                     /*dest_smem_ptr=*/(void*)dest_base,
+                                     /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
+          }
 
           // Next activation tile — only if any tokens route to this
           // expert.  The 8-TMA bulk helper delivers the full 1024 B
@@ -1341,18 +1436,31 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       __syncthreads();
     }  // end K-loop
 
-    // ── End-of-expert: write final_d → partial_result.down_out[128][8] ─
+    // ── End-of-expert: write final_d → partial_result.down_out[DCT][8] ─
     //
-    // WG1 adds +64 to the row offset because it owns output cols
-    // [base_col+64..base_col+127].
+    // Each half `h` contributes to output cols
+    // `[base_col + h*128, base_col + h*128 + 127]`, which map to
+    // `down_out` rows `[h*128 + wg_row_offset + warp_in_wg*16 + lane/4]`
+    // (row_base) / `[row_base + 8]` for the d0..d3 halves.
+    //
+    // WG1 adds +64 to the row offset within its 128-row half because
+    // WG1 owns output cols [h*128+64 .. h*128+127] within that half.
     if (is_calc) {
       const std::uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
-      const std::uint32_t row_base = wg_row_offset + warp_in_wg * 16 + lane / 4;
       const std::uint32_t col_base = (lane % 4) * 2;
-      shm->partial_result.down_out[row_base + 0][col_base + 0] = final_d0;
-      shm->partial_result.down_out[row_base + 0][col_base + 1] = final_d1;
-      shm->partial_result.down_out[row_base + 8][col_base + 0] = final_d2;
-      shm->partial_result.down_out[row_base + 8][col_base + 1] = final_d3;
+  #pragma unroll
+      for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+        const std::uint32_t row_base =
+            h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
+        shm->partial_result.down_out[row_base + 0][col_base + 0] =
+            final_d[h][0];
+        shm->partial_result.down_out[row_base + 0][col_base + 1] =
+            final_d[h][1];
+        shm->partial_result.down_out[row_base + 8][col_base + 0] =
+            final_d[h][2];
+        shm->partial_result.down_out[row_base + 8][col_base + 1] =
+            final_d[h][3];
+      }
     }
     __syncthreads();
 
