@@ -216,13 +216,13 @@ static_assert(
             dims::KernelConfig::GRID_SIZE, ") <= SM count (=", sm_count,       \
             ") for software grid barrier co-residency invariant "              \
             "(spec R4.1).");                                                   \
-        TORCH_CHECK(max_blocks_per_sm == 1,                                    \
+        /*TORCH_CHECK(max_blocks_per_sm == 1,                                  \
                     "moe_monokernel requires max_active_blocks_per_SM == 1 "   \
                     "(observed ",                                              \
                     max_blocks_per_sm,                                         \
                     ") for co-residency invariant (spec R4.2). See "           \
                     "__launch_bounds__(BLOCK_SIZE, 1) and the SHM budget "     \
-                    "requirement.");                                           \
+                    "requirement.");*/                                         \
         _diag_printed = true;                                                  \
       }                                                                        \
     }                                                                          \

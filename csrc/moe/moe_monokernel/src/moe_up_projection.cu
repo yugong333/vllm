@@ -1046,7 +1046,12 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // For subsequent experts inside the same helper invocation, the
   // previous expert's K-loop stitch (at s=K_TILES-1 COMPUTE) arms
   // bar_w[0] + TMAs w[0] of the next expert.  No pre-loop work there.
+  //
+  // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching calc-
+  // warp wait on bar_w[0] inside the K-loop is also compiled out so
+  // there is no spin-forever deadlock.
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
     const uint32_t first_id = shmem->experts[expert_start].id;
     mbarrier_arrive_expect_tx(&shm->bar_w[0], /*tx_bytes=*/16384u);
     tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/first_id,
@@ -1055,6 +1060,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                            /*k_start=*/0u,
                            /*dest_slot=*/&shm->w_wgmma[0][0][0],
                            /*bar=*/&shm->bar_w[0]);
+  #endif
   }
 
   // ── Phase-3 expert loop ───────────────────────────────────────────────
@@ -1082,8 +1088,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // Synchronous SHM write (32 elements) by prefetch warp 0; the
     // iter-0 QUANT→COMPUTE sync below publishes it to calc warps.
     if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       moe_request_up_scale_for_row<Dims>(expert_scales_up, id, base_row_up,
                                          shm->up_scale[0]);
+  #endif
     }
 
     // ── Main K-loop (Stage A: QUANT-first, mbarrier-only sync) ─────────
@@ -1119,11 +1127,20 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
       // ───── QUANT half ───────────────────────────────────────────────
       if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
+        // Wait on activation tile arrival. Gated by SKIP_PREFETCH (not
+        // SKIP_CALC) because the launcher below also skips the matching
+        // `arrive_expect_tx` when SKIP_PREFETCH is defined; skipping
+        // the wait on the calc side avoids a spin-forever deadlock.
+        // Under SKIP_CALC (launcher still issues TMAs) the wait stays
+        // so traces capture the full barrier-stall cost.
         while (!mbarrier_try_wait_parity(&shm->bar_a[cur_slot],
                                          parity_a[cur_slot])) {
         }
         parity_a[cur_slot] ^= 1;
+  #endif
 
+  #ifndef MONO_PROFILE_SKIP_CALC
         // Each calc warp `w ∈ {0..7}` quantizes token `w`; warps
         // whose `tok >= batch_size` get zero-filled `fp8_act` and
         // `act_scale = 1.0` inside `moe_streaming_quantize_k128`
@@ -1133,17 +1150,24 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         moe_streaming_quantize_k128<Dims>(
             shm->bf16_in[cur_slot], shm->fp8_act[cur_slot], tok, batch_size,
             &shmem->act_scale[tok][s]);
+  #endif
       }
 
       __syncthreads();
 
       // ───── COMPUTE half ─────────────────────────────────────────────
       if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
+        // Wait on weight tile arrival.  Same gating rationale as the
+        // bar_a wait above — compiled in/out together with the
+        // launcher's arm.
         while (!mbarrier_try_wait_parity(&shm->bar_w[cur_slot],
                                          parity_w[cur_slot])) {
         }
         parity_w[cur_slot] ^= 1;
+  #endif
 
+  #ifndef MONO_PROFILE_SKIP_CALC
         // WGMMA descriptor bases per WG.
         // WG0: rows [0..63]  → &w_wgmma[slot][0][0]
         // WG1: rows [64..127] → &w_wgmma[slot][0][0] + 64*128 (= 8192 B)
@@ -1157,7 +1181,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         // Chain 4 WGMMAs, each consuming K=32 (= 2 consecutive K-chunks
         // of 16 from the fp8 activation tile).
         constexpr uint32_t A_K_STRIDE = 2u * static_cast<uint32_t>(A_LBO);
-  #pragma unroll
+    #pragma unroll
         for (uint32_t j = 0; j < WGMMAS_PER_STEP; ++j) {
           const void* a_ptr =
               (const void*)((const char*)a_base + j * A_K_STRIDE);
@@ -1172,20 +1196,64 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         wgmma_wait_group<0>();
 
         // ── Scale-apply at the K=128 boundary (once per step) ──────────
-        const float gate_ws = shm->up_scale[0][s];
-        const float up_ws = shm->up_scale[0][UP_SCALE_COLS + s];
-        const float ws = is_gate_half ? gate_ws : up_ws;
+        //
+        // HOT-PATH BRANCH HYGIENE (ptxas C7520 fix).  The chain of 4
+        // `wgmma.mma_async` above, and the one that will fire on the
+        // next K-step, must not be separated by any *within-warp*
+        // divergent control flow.  When they are, ptxas inserts a
+        // WG.AR (warp-group arrive-release) fence into the divergent
+        // path and emits:
+        //
+        //   (C7520) Potential Performance Loss: wgmma.mma_async
+        //   instructions are serialized due to program dependence on
+        //   compiler-inserted WG.AR in divergent path in the
+        //   function '..._moe_kernel_topk...'
+        //
+        // The two former offenders lived right here:
+        //
+        //   (1) `(tok_{02,13} < batch_size) ? act_scale[...][s] : 0.f`
+        //       `tok_02 = (lane % 4) * 2` and `tok_13 = tok_02 + 1`
+        //       give `{0,2,4,6}` and `{1,3,5,7}` across the 32 lanes
+        //       of each calc warp, so whenever `batch_size < 8`
+        //       different lanes of the SAME warp take different sides
+        //       of the predicate — a classic in-warp divergent load.
+        //   (2) `is_gate_half ? gate_ws : up_ws` issued two SHM loads
+        //       plus a `selp`; uniform-per-warp but still two
+        //       predicated loads sitting between successive WGMMA
+        //       chains.
+        //
+        // Both are safe to make UNCONDITIONAL:
+        //
+        //   * `moe_streaming_quantize_k128` already writes
+        //     `act_scale[tok][s] = 1.0f` AND zero-fills
+        //     `fp8_act[kc][tok][ki]` for every `tok >= batch_size`.
+        //     The WGMMA therefore sees a zero B-operand for those
+        //     lanes, so `chunk_d{0..3}` is 0 regardless of the
+        //     scaling value — the predicate was purely defensive and
+        //     contributed no numerical change.
+        //   * `tok_02, tok_13 ∈ [0, 8)` and `Dims::BS == 8`, so the
+        //     index into `act_scale[BS][...]` is statically safe
+        //     without a guard.
+        //   * The gate/up scale is a single SHM load with a computed
+        //     offset; the offset is warp-uniform, so ptxas folds it
+        //     into a single `ld.shared.f32` without any predicate.
+        //
+        // With both branches gone, the scale-apply is pure
+        // straight-line FMA over six per-lane registers — WG.AR no
+        // longer has to be stitched in between K-steps and the four
+        // chained WGMMAs can overlap as intended.
+        const uint32_t ws_off = is_gate_half ? 0u : UP_SCALE_COLS;
+        const float ws = shm->up_scale[0][s + ws_off];
         const uint32_t tok_02 = (lane % 4) * 2;
-        const uint32_t tok_13 = (lane % 4) * 2 + 1;
-        const float as_02 =
-            (tok_02 < batch_size) ? shmem->act_scale[tok_02][s] : 0.f;
-        const float as_13 =
-            (tok_13 < batch_size) ? shmem->act_scale[tok_13][s] : 0.f;
+        const uint32_t tok_13 = tok_02 + 1;
+        const float as_02 = shmem->act_scale[tok_02][s];
+        const float as_13 = shmem->act_scale[tok_13][s];
         final_d0 += chunk_d0 * ws * as_02;
         final_d1 += chunk_d1 * ws * as_13;
         final_d2 += chunk_d2 * ws * as_02;
         final_d3 += chunk_d3 * ws * as_13;
         chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
+  #endif
       }
 
       // Launcher runs IN PARALLEL with the WGMMA above.  Both weight
@@ -1194,7 +1262,12 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // guarantees the calc warp's wait on bar_w[cur_slot] from the
       // previous iteration has completed before the launcher arms
       // bar_w[next_slot] for the next iteration.
+      //
+      // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching
+      // calc-warp waits on bar_{w,a}[next_slot] in the next iteration
+      // are also compiled out so there is no spin-forever deadlock.
       if (is_tma_launcher_thread<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         if (has_next_s) {
           // Intra-expert: fetch (s+1) tiles of the CURRENT expert.
           const uint32_t next_k_start = (s + 1) * K_STEP;
@@ -1230,7 +1303,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                                    &shm->bf16_in[next_slot][0][0],
                                    &shm->bar_a[next_slot]);
         }
-        // Else: last expert's last iteration — leave barriers idle.
+          // Else: last expert's last iteration — leave barriers idle.
+  #endif
       }
 
       // NO trailing __syncthreads() — the next iter's QUANT/COMPUTE
@@ -1248,6 +1322,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     //   d[3]: row = warp_in_wg*16 + lane/4 + 8,  col = (lane%4)*2 + 1
     // For WG1, rows shift by +64 in the full 128-row output tile.
     if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_CALC
       const uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const uint32_t row_base = wg_row_offset + warp_in_wg * 16 + lane / 4;
       const uint32_t col_base = (lane % 4) * 2;
@@ -1255,6 +1330,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       shm->partial_result.wgmma_out[row_base + 0][col_base + 1] = final_d1;
       shm->partial_result.wgmma_out[row_base + 8][col_base + 0] = final_d2;
       shm->partial_result.wgmma_out[row_base + 8][col_base + 1] = final_d3;
+  #endif
     }
     __syncthreads();
 
@@ -1299,6 +1375,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // NOTE: no write to spec->temp_bf16 on the WGMMA path — the scalar
     // path retains that behavior unchanged elsewhere.
     if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_CALC
       // `tok` from warp id, `col_in_half` from lane id.
       const uint32_t tok = warp;          // 0..7, one per calc warp
       const uint32_t col_in_half = lane;  // 0..31
@@ -1384,6 +1461,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
               block_scale;
         }
       }
+  #endif
     }
 
     // ── Tail of expert loop ──

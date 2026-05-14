@@ -68,6 +68,8 @@ __device__ void moe_kernel_topk_BS8(
   static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
+  MONO_PHASE_TIMESTAMP(t_start);
+
   // ── Phase 1: routing (topK) + greedy activation prefetch ───────────────
   // Phase 1 runs routing (topK / prepare_moe_topk) which writes
   // shmem->experts and shmem->topk_ids_flat that later phases depend on.
@@ -96,31 +98,55 @@ __device__ void moe_kernel_topk_BS8(
   //     `moe_up_projection_BS8_allexperts_wgmma_tma`'s expert loop.
   auto* u_tma = &shmem->u.tiny_wgmma_tma;
   if (is_tma_launcher_thread<Dims>()) {
+    // mbarrier inits are kept regardless of the profile flags: they are
+    // cheap SHM writes and make the SHM state well-defined even when
+    // SKIP_PREFETCH elides every arrive/TMA below.  The K-loop waits
+    // inside the up-proj helper are themselves gated on SKIP_PREFETCH,
+    // so a consumer will never block on an uninitialized parity.
     mbarrier_init(&u_tma->bar_w[0], 1u);
     mbarrier_init(&u_tma->bar_w[1], 1u);
     mbarrier_init(&u_tma->bar_a[0], 1u);
     mbarrier_init(&u_tma->bar_a[1], 1u);
     fence_mbarrier_init_release_cluster();
 
+#ifndef MONO_PROFILE_SKIP_PREFETCH
     // Greedy Step A: activations are expert-independent, so fire the
     // k_start=0 TMA now — in parallel with routing — instead of waiting
     // for Phase 2.  The arm happens on the same thread that just did the
     // init, so no fence is required between them.
+    //
+    // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching calc-
+    // warp wait on bar_a[0] inside the up-proj helper is also compiled
+    // out so there is no spin-forever deadlock.  The calc warps read
+    // garbage from the still-uninitialized `bf16_in[0]` slot and the
+    // kernel produces junk output — useful only for timing.
     mbarrier_arrive_expect_tx(&u_tma->bar_a[0], /*tx_bytes=*/2048u);
     tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
                              &u_tma->bf16_in[0][0][0], &u_tma->bar_a[0]);
+#endif
   }
   if (is_prefetch_warp<Dims>()) {
     // WGMMA path: prefetch warps are idle here.  The streaming pipeline's
     // first bf16 tile is already in flight (greedy TMA above) and the
     // rest of priming runs inside the up-proj helper.
   } else {
+    // Routing is intentionally NOT guarded by MONO_PROFILE_SKIP_CALC:
+    // `shmem->expert_count` / `shmem->experts[e].id` drive the helper's
+    // expert loop bounds and an uninitialized expert_count could be
+    // anything from 0 to 2^32 (runaway loop).  The BS64 path handles
+    // MONO_PROFILE_SKIP_CALC the same way — `topK_BS64` and
+    // `prepare_moe_topk_BSx_Ey` run regardless; only the per-expert
+    // QUANT / WGMMA / writeback work is compiled out.
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
                    shmem);
+    MONO_PHASE_TIMESTAMP(t_after_topk);
     sync_calc_threads<Dims>();
-    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem);
+    MONO_PHASE_TIMESTAMP(t_after_sync_calc);
+    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
   }
   __syncthreads();
+
+  MONO_PHASE_TIMESTAMP(t_after_routing);
 
   // ── Phase 2: setup up-projection group mapping ──────────────────────────
   // GRID=128 design, expert-group parallelism (WGMMA path):
@@ -184,6 +210,8 @@ __device__ void moe_kernel_topk_BS8(
         /*external_priming=*/true);
   }
 
+  MONO_PHASE_TIMESTAMP(t_after_up);
+
   // ── Site #2 — Expert-local barrier (Phase 2b) ────────────────────────
   //
   // Phase 2a aligned `DOWN_GROUPS == UP_GROUPS` so the producer-set
@@ -209,6 +237,8 @@ __device__ void moe_kernel_topk_BS8(
                                    expert_phase);
   }
 
+  MONO_PHASE_TIMESTAMP(t_after_barrier2);
+
   // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
   // Each block owns DOWN_COL_TILE=128 output cols; blocks partition
   // into DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Each group
@@ -224,6 +254,8 @@ __device__ void moe_kernel_topk_BS8(
   moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
       expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
       down_weights_desc, down_activations_desc);
+
+  MONO_PHASE_TIMESTAMP(t_after_down);
 
   // ── Site #3 — Col-stripe-local barrier (Phase 2b) ────────────────────
   //
@@ -249,6 +281,8 @@ __device__ void moe_kernel_topk_BS8(
         /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
         /*seed_blockidx=*/col_stripe_id, colstripe_phase);
   }
+
+  MONO_PHASE_TIMESTAMP(t_after_barrier3);
 
   // ── Phase 5 (WGMMA): reduction + writeback ─────────────────────────
   // Each block reads its own DOWN_COL_TILE output cols ×
@@ -316,6 +350,8 @@ __device__ void moe_kernel_topk_BS8(
       activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
     }
   }
+
+  MONO_PHASE_TIMESTAMP(t_after_phase5);
 }
 
 /**

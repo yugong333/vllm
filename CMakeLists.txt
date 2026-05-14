@@ -1139,6 +1139,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC")
     # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH")
+    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   PROPERTIES COMPILE_DEFINITIONS
+    #     "MONO_PROFILE_SKIP_CALC;MONO_PROFILE_SKIP_PREFETCH")
+
+    # Phase-timing instrumentation — uncomment to enable per-phase
+    # clock64() timestamps written by block 0, thread 0.  Read back
+    # from Python via the scratchpad's `phase_timestamps` struct at the
+    # tail of MoEGemmSpec.  Kernel output is CORRECT (no skip flags);
+    # overhead is negligible (7 clock64 reads + 7 GM stores total).
+    #
+    set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+      PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
