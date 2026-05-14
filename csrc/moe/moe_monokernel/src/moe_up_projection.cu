@@ -1064,6 +1064,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   }
 
   // ── Phase-3 expert loop ───────────────────────────────────────────────
+  MONO_PHASE_TIMESTAMP(t_up_after_preloop);
   for (uint32_t e = expert_start; e < expert_count; e += expert_stride) {
     const uint32_t id = shmem->experts[e].id;
     const bool has_next_e = (e + expert_stride < expert_count);
@@ -1314,6 +1315,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // fp8_act).
     }  // end K-loop
 
+    MONO_PHASE_TIMESTAMP_IF(t_up_after_expert0_kloop, e == expert_start);
+
     // ── End-of-expert: write final_d to partial_result.wgmma_out[128][8] ──
     // Canonical WGMMA D-matrix layout per thread (m64n8k32):
     //   d[0]: row = warp_in_wg*16 + lane/4 + 0,  col = (lane%4)*2 + 0
@@ -1480,6 +1483,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // stitch-triggered mbarrier arm for expert e+2 before expert e+1's
     // iter-0 QUANT wait has consumed the stitch arrival for expert e+1.
     __syncthreads();
+
+    MONO_PHASE_TIMESTAMP_IF(t_up_after_expert0_writeback, e == expert_start);
   }  // end expert loop
 }
 
