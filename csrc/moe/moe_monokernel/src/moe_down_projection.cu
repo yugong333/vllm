@@ -1097,23 +1097,40 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   float chunk_d_hi[DOWN_COL_HALVES][4] = {{0.f}};
   float final_d[DOWN_COL_HALVES][4] = {{0.f}};
 
-  // ── Zero per-block SHM out_accum[BS][DOWN_COL_TILE] ───────────────────
+  // ── Zero out_accum + Phase-4 mbarrier (re-)initialization ────────────
+  //
+  // Two independent SHM publishes happen here, merged behind a single
+  // block-wide sync:
+  //
+  //   (1) Zero per-block SHM `out_accum[BS][DOWN_COL_TILE]`.  `out_accum`
+  //       is not read until the per-expert accumulate loop below, which
+  //       follows several additional `__syncthreads()` (priming drain +
+  //       per-K-iter syncs).  A single trailing sync here is sufficient.
+  //
+  //   (2) Re-initialize the 4 TMA mbarriers (R4.1, R4.9).  The Phase-3→4
+  //       `grid.sync()` guarantees the barriers are idle at entry; we
+  //       reset them to `arrival_count = 1` on the launcher thread and
+  //       publish with `fence.mbarrier_init.release.cluster`.  They are
+  //       not armed or waited on until inside the expert loop, strictly
+  //       after this sync.
+  //
+  // Both targets (`out_accum`, `bar_w/bar_a`) are disjoint SHM regions
+  // so the two operations race-freely run in parallel; only one sync is
+  // needed to publish both.
+  //
+  // The `out_accum` zero-fill is unconditional — its cost is negligible
+  // (1 KB per block with 384 threads) and keeping it well-defined
+  // simplifies reasoning under either profile flag.  The mbarrier inits
+  // are also unconditional: they cost only 4 SHM stores + 1 fence and
+  // leave the barriers in a known-idle state.  The K-loop
+  // waits/arms are themselves gated on SKIP_PREFETCH, so uninit'd
+  // barriers are never a concern.
   for (unsigned idx = thread_in_block; idx < Dims::BS * DOWN_COL_TILE;
        idx += blockDim.x) {
     const unsigned tok = idx / DOWN_COL_TILE;
     const unsigned col = idx % DOWN_COL_TILE;
     shm->out_accum[tok][col] = 0.f;
   }
-  __syncthreads();
-
-  // ── Phase-4 mbarrier (re-)initialization (R4.1, R4.9) ─────────────────
-  //
-  // The `grid.sync()` between Phase 3 and Phase 4 guarantees that every
-  // Phase-3 consumer has completed its waits on `bar_w[2]` and `bar_a[2]`,
-  // so those barriers are idle at this point.  We re-initialize all four
-  // with `arrival_count = 1` (the TMA-completion contract) and publish
-  // the init with `fence.mbarrier_init.release.cluster` before the outer
-  // expert loop begins issuing any Phase-4 TMA.
   if (is_tma_launcher_thread<Dims>()) {
     mbarrier_init(&shm->bar_w[0], 1u);
     mbarrier_init(&shm->bar_w[1], 1u);
@@ -1164,11 +1181,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // existing double-buffer dimension (never double-used for scales;
     // they're loaded once per expert) as the half index.
     if (is_prefetch_warp<Dims>()) {
-  #pragma unroll
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
+    #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         moe_load_down_wgmma_weight_scale_tile<Dims>(
             expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
       }
+  #endif
     }
 
     // ── Priming: prefetch slot 0 (w + a + a_scale for K-step 0) ────────
@@ -1177,7 +1196,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // `cp.async.bulk.tensor.2d` issued by the launcher thread, with
     // completion signalled on `bar_w[0]` / `bar_a[0]`.  The activation
     // scale tile loads via cp.async through `pipe`.
+    //
+    // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching
+    // compute-side `mbarrier_try_wait_parity` on bar_{w,a}[0] inside
+    // the K-loop below is also compiled out so there is no
+    // spin-forever deadlock.
     if (is_tma_launcher_thread<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
       // (= 16384 · HALVES = 16 KB for pre Phase 2a, 32 KB for post)
       // and issue `HALVES` back-to-back 128×128 TMAs.  Half 0 lands at
@@ -1187,7 +1212,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // `mbarrier.try_wait.parity` on the compute side drains both.
       mbarrier_arrive_expect_tx(&shm->bar_w[0],
                                 /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-  #pragma unroll
+    #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         W_element* dest_base = &shm->w_down_wgmma[0][h * 128u][0];
         tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
@@ -1210,25 +1235,37 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             /*dest_smem_ptr=*/&shm->a_down_wgmma[0][0][0][0],
             /*bar_smem_ptr=*/&shm->bar_a[0]);
       }
+  #endif
     }
     // Zero-fill the unused tail of slot 0. Warp 8 lanes 1..31 do the
     // work; lane 0 is gated out internally so it can issue the TMA in
-    // parallel.
+    // parallel.  Also gated by SKIP_PREFETCH because the slot only
+    // exists (and only matters) when prefetches are live.
     if (warp == 8u && routed_count < 8u) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       zero_fill_unused_down_act_slots<Dims>(routed_count,
                                             &shm->a_down_wgmma[0][0][0][0]);
+  #endif
     }
 
     // Prefetch warps load the per-token activation scale for K-step 0
     // via cp.async (rank-indexed into the expert-sorted layout).
     if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
       moe_load_down_wgmma_activation_tile<Dims>(
           spec, shmem, id, top_k, batch_size,
           /*k_start=*/0u, /*s=*/0u, shm->a_down_wgmma[0], shm->a_down_scale[0],
           pipe);
+  #endif
     }
     // Drain the scale cp.asyncs and publish the zero-fill across the
     // block before the WGMMA consumers wait on bar_w[0] / bar_a[0].
+    //
+    // The pipe drain is a no-op when no `producer_commit` has happened
+    // (SKIP_PREFETCH elides the only producers above), so it's safe to
+    // keep it unconditional.  The `__syncthreads()` must stay
+    // regardless to publish the unconditional out_accum zero-fill and
+    // mbarrier init from the prologue.
     cuda::pipeline_consumer_wait_prior<0>(pipe);
     __syncthreads();
 
@@ -1243,10 +1280,16 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
       // ── COMPUTE half: WGMMA + scale-apply || TMA prefetch step s+1 ──
       if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         // Wait for this step's weight tile to be fully in SHM.  The
         // launcher pre-armed bar_w[read_slot] with tx=16384 before
         // issuing the 128x128 weight TMA (priming for s=0, previous
         // compute-half for s>0).
+        //
+        // Tied to SKIP_PREFETCH so the wait and the launcher's arm are
+        // compiled in/out together — skipping only one of them would
+        // either spin forever (skip arm) or fire without a consumer
+        // (skip wait).
         while (!mbarrier_try_wait_parity(&shm->bar_w[read_slot],
                                          parity_w[read_slot])) {
         }
@@ -1263,7 +1306,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           }
           parity_a[read_slot] ^= 1;
         }
+  #endif
 
+  #ifndef MONO_PROFILE_SKIP_CALC
         // A descriptor bases per WG per half — the weight tile is
         // laid out as `HALVES` contiguous 128-row M-slabs (half 0 at
         // rows [0..127], half 1 at rows [128..255]).  Within each
@@ -1287,20 +1332,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         const void* b_slot_base =
             (const void*)&shm->a_down_wgmma[read_slot][0][0][0];
 
-        // Per-half WGMMA passes.  Each pass runs the same
-        // 4-chained-m64n8k32 structure as the pre Phase-2a kernel and
-        // accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`, then
-        // applies the (ws, as) scales at the K=128 boundary and folds
-        // into `final_d[h]`.
-  #pragma unroll
+          // Per-half WGMMA passes.  Each pass runs the same
+          // 4-chained-m64n8k32 structure as the pre Phase-2a kernel and
+          // accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`, then
+          // applies the (ws, as) scales at the K=128 boundary and folds
+          // into `final_d[h]`.
+    #pragma unroll
         for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
           const std::uint32_t half_offset_bytes = h * 16384u;
           const void* a_base =
               (const void*)((const char*)a_slot_base + half_offset_bytes +
                             wg_offset_bytes);
 
-          // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
-  #pragma unroll
+            // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
+    #pragma unroll
           for (std::uint32_t j = 0; j < 2; ++j) {
             const void* a_ptr =
                 (const void*)((const char*)a_base + j * A_K_STRIDE);
@@ -1315,8 +1360,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                                          chunk_d_lo[h][3]);
           }
 
-          // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
-  #pragma unroll
+            // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
+    #pragma unroll
           for (std::uint32_t j = 2; j < WGMMAS_PER_STEP_DOWN; ++j) {
             const void* a_ptr =
                 (const void*)((const char*)a_base + j * A_K_STRIDE);
@@ -1351,7 +1396,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
         const std::uint32_t ws_col = (W_DOWN_SCALE_COLS > 1) ? s : 0u;
 
-  #pragma unroll
+    #pragma unroll
         for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
           const float ws = shm->w_down_scale[h][my_wg][ws_col];
           final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
@@ -1367,12 +1412,19 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
               chunk_d_hi[h][3] = 0.f;
         }
+  #endif
       }
 
       // Launcher runs IN PARALLEL with the WGMMA above. It arms and
       // issues TMA for step s+1 into the OTHER slot ((s+1)%2),
       // following the same pattern as the priming block.
+      //
+      // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching
+      // compute-side waits on bar_{w,a}[next_slot] in the next
+      // iteration are also compiled out so there is no spin-forever
+      // deadlock.
       if (is_tma_launcher_thread<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         if (s + 1 < K_TILES_DOWN) {
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
@@ -1383,7 +1435,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           // the compute side.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-  #pragma unroll
+    #pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             W_element* dest_base = &shm->w_down_wgmma[next_slot][h * 128u][0];
             tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
@@ -1407,19 +1459,23 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
           }
         }
+  #endif
       }
       // Warp 8 (all lanes including the launcher): zero-fill the unused
       // tail of the NEXT slot when routed_count < 8. Lane 0 is gated
       // out inside the helper so TMA issue on lane 0 is not delayed.
       if (warp == 8u && s + 1 < K_TILES_DOWN && routed_count < 8u) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         const std::uint32_t next_slot = (s + 1) & 1;
         zero_fill_unused_down_act_slots<Dims>(
             routed_count, &shm->a_down_wgmma[next_slot][0][0][0]);
+  #endif
       }
 
       // Prefetch warps load the per-token activation scale for step
       // s+1 via cp.async (rank-indexed into the expert-sorted layout).
       if (is_prefetch_warp<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH
         if (s + 1 < K_TILES_DOWN) {
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_s = s + 1;
@@ -1428,10 +1484,14 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               spec, shmem, id, top_k, batch_size, next_k_start, next_s,
               shm->a_down_wgmma[next_slot], shm->a_down_scale[next_slot], pipe);
         }
+  #endif
       }
 
       // Drain the scale cp.asyncs and make the zero-fill visible before
-      // the next iteration's WGMMA reads the new slot.
+      // the next iteration's WGMMA reads the new slot.  Safe to keep
+      // unconditional: the pipe drain is a no-op when SKIP_PREFETCH
+      // has elided every `producer_commit`, and the __syncthreads() is
+      // still needed to keep all warps aligned per iteration.
       cuda::pipeline_consumer_wait_prior<0>(pipe);
       __syncthreads();
     }  // end K-loop
@@ -1446,9 +1506,10 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // WG1 adds +64 to the row offset within its 128-row half because
     // WG1 owns output cols [h*128+64 .. h*128+127] within that half.
     if (is_calc) {
+  #ifndef MONO_PROFILE_SKIP_CALC
       const std::uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const std::uint32_t col_base = (lane % 4) * 2;
-  #pragma unroll
+    #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         const std::uint32_t row_base =
             h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
@@ -1461,6 +1522,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         shm->partial_result.down_out[row_base + 8][col_base + 1] =
             final_d[h][3];
       }
+  #endif
     }
     __syncthreads();
 
@@ -1478,6 +1540,11 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // Iterating up to `batch_size * DOWN_COL_TILE` (not `Dims::BS *
     // DOWN_COL_TILE`) is safe: tokens >= batch_size are never written
     // in the final GM writeback below.
+    //
+    // Compiled out under MONO_PROFILE_SKIP_CALC: out_accum stays at
+    // its prologue zero-fill, so Phase 5 reads zeros and produces
+    // garbage output — matches the SKIP_CALC contract.
+  #ifndef MONO_PROFILE_SKIP_CALC
     for (unsigned tok_col = thread_in_block;
          tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
       const unsigned tok = tok_col / DOWN_COL_TILE;
@@ -1494,6 +1561,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
       shm->out_accum[tok][col] += contrib;
     }
+  #endif
     __syncthreads();
   }  // end expert loop
 

@@ -25,6 +25,30 @@
 // Branch bodies in the kernel are wrapped with the corresponding
 // #ifndef guards — see the is_prefetch_warp / !is_prefetch_warp sites.
 
+// ── Phase-timing instrumentation ───────────────────────────────────────────
+// Define MONO_PROFILE_PHASE_TIMING to enable per-phase clock64() timestamps
+// written by block 0, thread 0 at each phase boundary.  The timestamps are
+// stored in a small GM struct at the tail of MoEGemmSpec and can be read
+// back from Python to compute per-phase wall-clock breakdowns.
+//
+// The overhead is negligible (one clock64() read + one GM store per phase
+// boundary, on a single thread) and does NOT affect kernel correctness.
+//
+// Enable via CMake:
+//   set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+//     PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
+
+  #ifdef MONO_PROFILE_PHASE_TIMING
+    #define MONO_PHASE_TIMESTAMP(field)             \
+      do {                                          \
+        if (blockIdx.x == 0 && threadIdx.x == 0) {  \
+          spec->phase_timestamps.field = clock64(); \
+        }                                           \
+      } while (0)
+  #else
+    #define MONO_PHASE_TIMESTAMP(field) ((void)0)
+  #endif
+
 namespace moe_monokernel {
 
 using T_element =
@@ -278,6 +302,44 @@ struct MoEGemmSpec {
     uint32_t expert_slot[Dims::NUM_EXPERTS][2];
     uint32_t colstripe_slot[DOWN_GRID][2];
   } partial_barrier;
+
+  // ── Phase-timing instrumentation (MONO_PROFILE_PHASE_TIMING) ───────────
+  // Per-phase clock64() timestamps written by block 0, thread 0.
+  // Only meaningful when MONO_PROFILE_PHASE_TIMING is defined; otherwise
+  // the struct is still present (keeps layout stable) but never written.
+  //
+  // Phases (BS8 path):
+  //   t_start          : kernel entry
+  //   t_after_routing  : after topK + prepare_moe_topk + __syncthreads()
+  //   t_after_up       : after moe_up_projection_BS8_allexperts_wgmma_tma
+  //   t_after_barrier2 : after expert_barrier (site #2)
+  //   t_after_down     : after moe_down_projection_BS8_allexperts_wgmma_tma
+  //   t_after_barrier3 : after colstripe_barrier (site #3)
+  //   t_after_phase5   : after Phase 5 reduction + writeback
+  //
+  // Routing sub-phases (filled by topK_BS8 / prepare_moe_topk_BS8):
+  //   t_after_topk             : after topK_BS8 (warps return)
+  //   t_after_sync_calc        : after sync_calc_threads<>() helper
+  //   t_after_prepare_pass1    : after Pass 1 of prepare (bitset + ids)
+  //   t_after_prepare_pass2    : after Pass 2 (zero counts + prefix sum)
+  //   t_after_prepare_pass3    : after Pass 3 (slot assignment)
+  //   t_after_prepare_sync     : after the trailing __syncthreads()
+  struct {
+    int64_t t_start;
+    int64_t t_after_topk;
+    int64_t t_after_sync_calc;
+    int64_t t_after_prepare_pass1a;
+    int64_t t_after_prepare_pass1b;
+    int64_t t_after_prepare_pass1;
+    int64_t t_after_prepare_pass2;
+    int64_t t_after_prepare_pass3;
+    int64_t t_after_routing;
+    int64_t t_after_up;
+    int64_t t_after_barrier2;
+    int64_t t_after_down;
+    int64_t t_after_barrier3;
+    int64_t t_after_phase5;
+  } phase_timestamps;
 };
 
   // Maximum supported dimensions for shared memory and scratchpad allocation
@@ -613,11 +675,6 @@ struct MoE_SHM {
             w_down_wgmma[2][W_DOWN_WGMMA_M]
                         [W_WGMMA_K];  // 32 KB (pre) / 64 KB (post Phase 2a)
       };
-
-      union {
-        A_element orig[CoreDims::T_TILE][CoreDims::K_DIM_PADDED_A];
-        A_element bf16_buf[CoreDims::T_TILE][Dims::N];
-      } w[2];
 
       S_element a_down_scale[2][CoreDims::T_TILE][2];
 
