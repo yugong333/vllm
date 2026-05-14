@@ -1140,6 +1140,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   }
   __syncthreads();
 
+  MONO_PHASE_TIMESTAMP(t_down_after_prologue);
+
   const std::uint32_t expert_count = shmem->expert_count;
 
   // ── Per-expert loop (expert_start = down_group, stride = DOWN_GROUPS) ─
@@ -1496,6 +1498,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       __syncthreads();
     }  // end K-loop
 
+    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_kloop, e == down_group);
+
     // ── End-of-expert: write final_d → partial_result.down_out[DCT][8] ─
     //
     // Each half `h` contributes to output cols
@@ -1533,9 +1537,15 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // slab of `temp_fp8`), NOT for the natural logical token id.  We
     // therefore walk the (tok, k_in_topk) grid in `topk_ids_flat`,
     // filter by the current expert id, and derive the intra-expert
-    // rank as `rank = sorted_slot[pair] - expert_start`.  Every thread
-    // matches at most one `k_in_topk` per (tok, col) position (break
-    // on match), so the inner search is O(top_k=8) per position.
+    // rank as `rank = sorted_slot[pair] - expert_start`.  This rank
+    // is THE SAME across all DOWN_COL_TILE columns of a given token,
+    // so we hoist the 8-iter top-K scan out of the (tok, col) inner
+    // loop and cache `rank_for_tok[tok]` once per expert in SHM.
+    //
+    // 8 threads (one per token) compute the rank in parallel; the
+    // remaining 376 threads idle for the same number of cycles they
+    // were already spending on the redundant inner scan, so the
+    // hoist is pure win.
     //
     // Iterating up to `batch_size * DOWN_COL_TILE` (not `Dims::BS *
     // DOWN_COL_TILE`) is safe: tokens >= batch_size are never written
@@ -1545,25 +1555,40 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // its prologue zero-fill, so Phase 5 reads zeros and produces
     // garbage output — matches the SKIP_CALC contract.
   #ifndef MONO_PROFILE_SKIP_CALC
+    // Pre-compute rank for each token once.  Sentinel 0xFF means this
+    // token does not route through the current expert (no contribution).
+    if (thread_in_block < batch_size) {
+      const unsigned tok = thread_in_block;
+      uint8_t rank_val = 0xFFu;
+      for (std::uint32_t k = 0; k < top_k; ++k) {
+        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
+          const std::uint32_t pair = tok * top_k + k;
+          rank_val = static_cast<uint8_t>(
+              static_cast<std::uint32_t>(shm->sorted_slot[pair]) -
+              expert_start);
+          break;
+        }
+      }
+      shm->rank_for_tok[tok] = rank_val;
+    }
+    __syncthreads();
+
     for (unsigned tok_col = thread_in_block;
          tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
       const unsigned tok = tok_col / DOWN_COL_TILE;
       const unsigned col = tok_col % DOWN_COL_TILE;
-      float contrib = 0.f;
-      for (std::uint32_t k = 0; k < top_k; ++k) {
-        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
-          const std::uint32_t pair = tok * top_k + k;
-          const std::uint32_t rank =
-              static_cast<std::uint32_t>(shm->sorted_slot[pair]) - expert_start;
-          contrib = shm->partial_result.down_out[col][rank];
-          break;
-        }
+      const uint8_t rank_u8 = shm->rank_for_tok[tok];
+      if (rank_u8 != 0xFFu) {
+        shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank_u8];
       }
-      shm->out_accum[tok][col] += contrib;
     }
   #endif
     __syncthreads();
+
+    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
   }  // end expert loop
+
+  MONO_PHASE_TIMESTAMP(t_down_after_all_experts);
 
   // ── After all experts in this group: write out_accum → GM partial_out ─
   const std::uint32_t group_stride = Dims::BS * Dims::HIDDEN_STATES;

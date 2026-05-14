@@ -324,17 +324,31 @@ __device__ void moe_kernel_topk_BS8(
 
     // Sum the DOWN_GROUPS partials for tokens in [0, batch_size) and
     // write bf16 to activations_out.
+    //
+    // Loading into a register array first (then summing) gives the
+    // compiler license to issue all `DOWN_GROUPS` loads as
+    // independent instructions, exposing parallelism the hardware can
+    // exploit even though each load has high HBM latency.  Without
+    // this, naive `sum += a[...]` introduces a sum-dependency chain
+    // that serialises the loads at the back-end.
     for (std::uint32_t flat = threadIdx.x;
          flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
       const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
       const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
       const std::uint32_t col = base_col_r + col_in_block;
+      const float* base_ptr =
+          spec->down_partial_out + tok * Dims::HIDDEN_STATES + col;
+
+      float vals[DOWN_GROUPS_LOCAL];
+#pragma unroll
+      for (std::uint32_t g = 0; g < DOWN_GROUPS_LOCAL; ++g) {
+        vals[g] = base_ptr[g * group_stride_r];
+      }
 
       float sum = 0.f;
 #pragma unroll
       for (std::uint32_t g = 0; g < DOWN_GROUPS_LOCAL; ++g) {
-        sum += spec->down_partial_out[g * group_stride_r +
-                                      tok * Dims::HIDDEN_STATES + col];
+        sum += vals[g];
       }
       activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)sum;
     }

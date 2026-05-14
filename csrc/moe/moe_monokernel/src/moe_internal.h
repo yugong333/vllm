@@ -45,8 +45,18 @@
           spec->phase_timestamps.field = clock64(); \
         }                                           \
       } while (0)
+    // Like MONO_PHASE_TIMESTAMP but additionally gated on a runtime
+    // condition.  Use to record a timestamp on only the first iteration
+    // of a loop without overwriting on subsequent iterations.
+    #define MONO_PHASE_TIMESTAMP_IF(field, cond)             \
+      do {                                                   \
+        if ((cond) && blockIdx.x == 0 && threadIdx.x == 0) { \
+          spec->phase_timestamps.field = clock64();          \
+        }                                                    \
+      } while (0)
   #else
     #define MONO_PHASE_TIMESTAMP(field) ((void)0)
+    #define MONO_PHASE_TIMESTAMP_IF(field, cond) ((void)0)
   #endif
 
 namespace moe_monokernel {
@@ -334,8 +344,38 @@ struct MoEGemmSpec {
     int64_t t_after_prepare_pass2;
     int64_t t_after_prepare_pass3;
     int64_t t_after_routing;
+    // Up-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
+    //   t_up_after_preloop : after the pre-loop bar_w[0] arm + first
+    //                        weight TMA, before the expert loop.
+    //   t_up_after_expert0_kloop : after the K-loop completes for the
+    //                              FIRST expert this block processes
+    //                              (e == expert_start).  Excludes the
+    //                              wgmma_out → __syncthreads write.
+    //   t_up_after_expert0_writeback : after the FIRST expert's SiLU +
+    //                                  fp8 writeback + tail
+    //                                  __syncthreads.
+    int64_t t_up_after_preloop;
+    int64_t t_up_after_expert0_kloop;
+    int64_t t_up_after_expert0_writeback;
     int64_t t_after_up;
     int64_t t_after_barrier2;
+    // Down-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
+    //   t_down_after_prologue          : after zero out_accum + mbarrier
+    //                                    init + block-wide __syncthreads
+    //                                    that publishes both.
+    //   t_down_after_expert0_kloop     : after the FIRST expert's K-loop
+    //                                    (4 K-steps for Qwen3.5).
+    //   t_down_after_expert0_accum     : after the FIRST expert's
+    //                                    accumulate loop + tail
+    //                                    __syncthreads.
+    //   t_after_down                   : after the GM writeback of
+    //                                    out_accum → down_partial_out
+    //                                    (kept as the existing
+    //                                    Phase-4-end timestamp).
+    int64_t t_down_after_prologue;
+    int64_t t_down_after_expert0_kloop;
+    int64_t t_down_after_expert0_accum;
+    int64_t t_down_after_all_experts;
     int64_t t_after_down;
     int64_t t_after_barrier3;
     int64_t t_after_phase5;
@@ -773,6 +813,15 @@ struct MoE_SHM {
       uint16_t expert_slot_start[Dims::NUM_EXPERTS];
       uint8_t expert_routed_count[Dims::NUM_EXPERTS];
       uint8_t sorted_slot[MAX_PAIRS];
+      // Per-expert per-token cached rank used by the down-proj
+      // accumulate loop (Phase 4 epilogue).  Rebuilt at the top of each
+      // expert iteration by 8 threads (one per token) so the inner
+      // (tok, col) loop can do a single SHM lookup instead of an
+      // 8-iter inner scan over `topk_ids_flat`.  Sentinel 0xFF means
+      // "this token does not route to the current expert; skip the
+      // contribution".  Sized to `Dims::BS = 8` bytes — negligible
+      // SHM overhead.
+      uint8_t rank_for_tok[Dims::BS];
     } tiny_wgmma_tma;
 
     // BS64 path: holds weight tiles and partial results for down-projection
