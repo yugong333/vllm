@@ -139,22 +139,15 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
 
   // ── Fast path: softmax+renormalize=True OR sigmoid (any renorm) ────────
   //
-  // Selection is done on raw `(x - row_max)` (softmax) or `x` (sigmoid).
+  // Selection is done on raw logits for both softmax and sigmoid.
   // Both functions are monotonically increasing, so the top-k IDs are
   // identical under either the raw-logit or post-activation ordering.
   //
-  // For numerical safety on softmax we subtract `row_max` so the
-  // post-selection `expf` always sees non-positive arguments.  For
-  // sigmoid the raw `x` is fine (sigmoid is anchored at 0.5 and saturates
-  // smoothly in both directions).
-  if (scoring_func == ScoringFunc::SOFTMAX) {
-    float local_max = -FLT_MAX;
-    for (uint32_t i = 0; i < num_local; i++)
-      local_max = fmaxf(local_max, scores[i]);
-    float row_max = warp_reduce_max_float(local_max);
-    for (uint32_t i = 0; i < num_local; i++) scores[i] -= row_max;
-  }
-  // (For sigmoid we leave scores at raw x; ordering is preserved.)
+  // For softmax numerical safety we defer the row_max subtraction to the
+  // post-selection step: the k=0 winner IS the row maximum, so we
+  // subtract topk_scores[0] when computing expf — only K values instead
+  // of all NUM_EXPERTS.  This eliminates a full warp reduction + N
+  // subtractions from the critical path.
 
   // ── Top-k selection over the (now-shifted-or-raw) logits ──────────────
   // Track each selected slot's `score_for_choice` (used for ordering) and
@@ -191,10 +184,12 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     if (scoring_func == ScoringFunc::SOFTMAX) {
       // Softmax + renormalize=True (the renormalize=False case returned
       // earlier).  weight_k = exp(x_k - max) / sum_topk_exp.
+      // topk_scores[0] is the row maximum (k=0 finds the global max).
+      float row_max = topk_scores[0];
       float exp_vals[MoE_SHM<Dims>::MAX_TOPK];
       float sum_exp = 0.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        exp_vals[k] = __expf(topk_scores[k]);
+        exp_vals[k] = __expf(topk_scores[k] - row_max);
         sum_exp += exp_vals[k];
       }
       float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 1.0f;
@@ -376,371 +371,289 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                                      MoE_SHM<Dims>* __restrict__ shm,
                                      MoEGemmSpec<Dims>* __restrict__ spec) {
   static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
+  static_assert(use_tma<Dims>::value,
+                "BS8 prepare path is TMA-only after the 3-phase rewrite. "
+                "All instantiated BS8 variants set USE_TMA=true and the "
+                "kernel asserts use_tma in moe_kernel_topk_BS8 — the "
+                "non-TMA branch is unreachable.");
   // `spec` is only used for MONO_PROFILE_PHASE_TIMING; suppress unused-
   // parameter warnings under non-instrumented builds.
   (void)spec;
 
   // Only warp 0 (threads 0–31) participates; the other calc threads exit
-  // early and block on the caller's `__syncthreads()`.  This is a
-  // refinement of the previous "thread 0 does everything" structure that
-  // keeps the serial bitset / prefix-sum passes on thread 0 but lets the
-  // final slot-assignment pass run warp-parallel — see the comment on
-  // Pass 3 below for the motivation (NCU flagged the serial LDL/STL
-  // `write_head[]` loop as the kernel's hottest stall source).
+  // early and block on the caller's `__syncthreads()`.
   if (threadIdx.x >= 32) return;
 
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
+  // ────────────────────────────────────────────────────────────────────────
+  //  3-phase prepare for the BS8 TMA+WGMMA path
+  // ────────────────────────────────────────────────────────────────────────
+  // Replaces the previous 6 sub-passes (1a/1b/1c + 2a/2b/2c + 3) with three
+  // phases.  Two structural simplifications drive the speedup:
+  //
+  //   1. The 256-bit active-expert bitset (old 1a + 1b) is gone.  The
+  //      `expert_routed_count[]` we have to write anyway already encodes
+  //      the same information: `expert_routed_count[eid] > 0` IS the
+  //      active-expert mask.  Eliminates 8×reg-OR builds, 8×5 SHFL.B32
+  //      butterfly OR-reduce, and the lane-0..7 popcount/scan pair.
+  //
+  //   2. Each lane caches its (up to 2) routed eids in registers across
+  //      Phases A and C — Phase C's two `load_eid` SHM reads (≤ 64 SHM
+  //      loads warp-wide, on the post-syncthreads critical path) become
+  //      register reads.
+  //
+  // Phase A — Tally + cache eids   (folds 1a + 2a + 2b)
+  //   * Each lane loads its 1–2 pair eids (eid0, eid1) and keeps them
+  //     in registers.
+  //   * Cooperative zero of `expert_routed_count[256]` (each lane
+  //     writes BLK = 8 contiguous u8 entries).
+  //   * Tally via __match_any_sync — peers sharing an eid form a
+  //     warp peer group; the lowest-id lane writes the popcount.
+  //
+  // Phase B — Fused prefix sum + active-expert enumeration  (folds 1c + 2c)
+  //   * Each lane sweeps its 8 contiguous expert_routed_count[] entries
+  //     in one 8-iter loop, computing two per-lane locals:
+  //         lane_total   = Σ counts            (drives expert_slot_start)
+  //         lane_actives = Σ (count > 0)       (drives experts[].id)
+  //     plus the two exclusive-prefix arrays count_prefix[8],
+  //     active_prefix[8] in registers.
+  //   * Single dual-value warp scan: 5-step butterfly carries both
+  //     totals through the same shuffle traffic.
+  //   * Each lane writes back 8 entries:
+  //         expert_slot_start[eid]  = slot_offset + count_prefix[i]
+  //     and for every active eid (count > 0) appends to experts[]:
+  //         experts[active_offset + active_prefix[i]].id = eid
+  //   * Lane 0 reads back the first ≤ 8 active eids and packs them into
+  //     `path.bs8.expert_ids` (8 SHM reads on lane 0 only — negligible).
+  //
+  // Phase C — Slot assignment      (Pass 3, register-fed)
+  //   * Identical math: __match_any_sync intra-chunk rank + cross-chunk
+  //     ballot-shfl carry → sorted_slot[pair].  The two `load_eid` calls
+  //     are gone; eid0/eid1 are already in registers from Phase A.
+  //
+  // Ordering invariants preserved end-to-end:
+  //   * `experts[].id`              monotonically increasing in eid
+  //                                 (lanes process in ascending tid; within
+  //                                  a lane, the 8 entries are in ascending
+  //                                  eid order).
+  //   * `sorted_slot[pair]`         strictly ascending within each expert
+  //                                 when pairs are enumerated in lex order
+  //                                 — byte-identical to the v3/v1 semantics.
 
-  // ── Pass 1: warp-parallel bitset build + ordered enumeration ────────
-  // Replaces the previous thread-0-only bitset+enumeration loop, which
-  // dominated Pass-1 wall clock at BS=8 (≤ 64 sequential SHM stores
-  // for `shm->experts[].id` writes plus 64 SHM reads of `topk_ids_flat`
-  // for bitset construction).
-  //
-  // Strategy:
-  //   (a) Build the 256-bit bitset as 8 × uint32 in registers, each lane
-  //       holding its own partial bitset.  32 lanes × 2 pairs each
-  //       (n_pairs ≤ 64) — lanes set bits independently, then a
-  //       butterfly OR-reduce gives every lane the full bitset.
-  //   (b) Enumerate set bits in ascending order: lanes 0..7 each own
-  //       one bitset word.  popcount → warp exclusive prefix sum gives
-  //       each owning lane its output offset; each owning lane scans
-  //       its word's bits with __ffs (yields ascending order) and
-  //       writes `experts[out].id` directly.
-  //   (c) `total = lane7.offset + lane7.count` (broadcast via shfl).
-  //   (d) Lane 0 reads back the first ≤ 8 expert ids (after a
-  //       __syncwarp() to publish the writes from lanes 0..7) to build
-  //       the packed `expert_ids` uint64.
-  //
-  // Ordering invariant preserved: ascending lane index → ascending word
-  // index → ascending base eid; within a lane __ffs walks bits low →
-  // high, so the global enumeration is monotonically increasing in eid.
+  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
   constexpr uint32_t MAX_PAIRS = Dims::BS * MAX_TOPK;  // ≤ 64 for BS=8
+  constexpr uint32_t BLK = Dims::NUM_EXPERTS / 32;     // 8 for E=256
+  static_assert(Dims::NUM_EXPERTS % 32 == 0,
+                "NUM_EXPERTS must be a multiple of 32 for warp blocking of "
+                "expert_routed_count[] / expert_slot_start[].");
+  static_assert(MAX_PAIRS <= 64,
+                "Phase A caches up to 2 pair-eids per lane (BS·top_k ≤ 64).");
+
   const uint32_t tid = threadIdx.x;
   const uint32_t n_pairs = batch_size * top_k;
+  auto* tma_shm = &shm->u.tiny_wgmma_tma;
 
-  uint32_t my_bs[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
-  // 32 lanes × 2 pairs cover up to 64 pairs.  Loop covers any n_pairs
-  // up to 32 × ⌈MAX_PAIRS/32⌉ — for MAX_PAIRS = 64 the loop runs ≤ 2
-  // iterations per lane.
-  for (uint32_t p = tid; p < MAX_PAIRS; p += 32) {
-    if (p >= n_pairs) break;
-    const uint32_t tok = p / top_k;
-    const uint32_t kk = p % top_k;
-    const uint32_t eid = shm->topk_ids_flat[tok * MAX_TOPK + kk];
-    if (eid < Dims::NUM_EXPERTS) {  // skips the 0xFFFF sentinel
-      my_bs[eid >> 5] |= (1u << (eid & 31));
+  // ───────────────── Phase A — Tally + cache eids ─────────────────────────
+
+  // Cache eid0 / eid1 in registers — reused in Phase A tally AND Phase C
+  // ranking.  Out-of-range pairs hold the 0xFFFF sentinel.
+  const uint32_t p0 = tid;        // chunk-0 pair index (lane → pair)
+  const uint32_t p1 = tid + 32u;  // chunk-1 pair index
+  auto load_pair_eid = [&](uint32_t pair) -> uint16_t {
+    if (pair >= n_pairs) return (uint16_t)0xFFFF;
+    const uint32_t tok = pair / top_k;
+    const uint32_t k = pair % top_k;
+    return shm->topk_ids_flat[tok * MAX_TOPK + k];
+  };
+  const uint16_t eid0 = load_pair_eid(p0);
+  const uint16_t eid1 = load_pair_eid(p1);
+
+  // Cooperative zero of expert_routed_count[NUM_EXPERTS].  Each lane owns
+  // BLK = 8 contiguous u8 entries; issue as one STS.64 per lane (32 lanes
+  // × 8 B = 256 B → 2 SHM transactions) instead of eight STS.U8 (8
+  // transactions).  `expert_routed_count` follows `alignas(16) bar_a[2]`
+  // so the per-lane base `tid * BLK` is always 8-byte aligned for BLK=8.
+  static_assert(BLK == 8u,
+                "Vectorized zero assumes BLK = 8 (one uint64 per lane). "
+                "Update the cast width if NUM_EXPERTS / 32 ever changes.");
+  *reinterpret_cast<uint64_t*>(&tma_shm->expert_routed_count[tid * BLK]) = 0ull;
+  __syncwarp();
+
+  // Tally via __match_any_sync.  For each pair-slot, peers sharing an eid
+  // form a warp peer group; the lowest-id lane writes the popcount-sized
+  // increment.  Sentinel lanes form their own peer group, but the
+  // `eid < NUM_EXPERTS` guard suppresses the write.  __syncwarp() between
+  // slots serializes slot-1's RMW against slot-0's stores.
+  {
+    const uint32_t key = static_cast<uint32_t>(eid0);
+    const uint32_t match = __match_any_sync(FULL_MASK, key);
+    const uint32_t count = __popc(match);
+    const uint32_t lowest = __ffs(match) - 1u;
+    if (eid0 < Dims::NUM_EXPERTS && tid == lowest) {
+      tma_shm->expert_routed_count[eid0] += static_cast<uint8_t>(count);
     }
+    __syncwarp();
+  }
+  if constexpr (MAX_PAIRS > 32u) {
+    const uint32_t key = static_cast<uint32_t>(eid1);
+    const uint32_t match = __match_any_sync(FULL_MASK, key);
+    const uint32_t count = __popc(match);
+    const uint32_t lowest = __ffs(match) - 1u;
+    if (eid1 < Dims::NUM_EXPERTS && tid == lowest) {
+      tma_shm->expert_routed_count[eid1] += static_cast<uint8_t>(count);
+    }
+    __syncwarp();
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_pass1a);
+  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseA);
 
-  // Warp-OR reduce: every lane ends up with the full 256-bit bitset.
-  // 5 butterfly steps × 8 words = 40 SHFL.B32 + 40 LOP3.OR pairs.
+  // ────────── Phase B — Fused prefix sum + active-expert enum ─────────────
+
+  // Per-lane sweep over the 8 owned entries.  Builds local counts +
+  // exclusive prefixes for both totals (count and active flag) in one
+  // pass.  `local_counts[i]` is cached so the eid emit pass below
+  // doesn't re-read SHM.
+  //
+  // Bulk-load all 8 u8 counts as a single uint64 (8 B, lane-aligned)
+  // instead of 8 separate LDS.U8 — one SHM transaction per lane.
+  uint32_t local_counts[BLK];
+  uint32_t count_prefix[BLK];   // exclusive prefix of counts within block
+  uint32_t active_prefix[BLK];  // exclusive prefix of (count > 0) within block
+  uint32_t lane_total = 0;
+  uint32_t lane_actives = 0;
+  const uint64_t packed_counts = *reinterpret_cast<const uint64_t*>(
+      &tma_shm->expert_routed_count[tid * BLK]);
   #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-  #pragma unroll
-    for (int off = 16; off >= 1; off /= 2) {
-      my_bs[i] |= __shfl_xor_sync(FULL_MASK, my_bs[i], off, 32);
-    }
+  for (uint32_t i = 0; i < BLK; ++i) {
+    const uint32_t v =
+        static_cast<uint32_t>((packed_counts >> (i * 8u)) & 0xFFu);
+    local_counts[i] = v;
+    count_prefix[i] = lane_total;
+    active_prefix[i] = lane_actives;
+    lane_total += v;
+    lane_actives += (v > 0u) ? 1u : 0u;
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_pass1b);
-
-  // Enumerate set bits in ascending order.  Lanes 0..7 each own one
-  // bitset word; lanes 8..31 contribute popcount = 0 and write nothing.
-  uint32_t my_word = (tid < 8u) ? my_bs[tid] : 0u;
-  const uint32_t my_count = __popc(my_word);
-
-  // Warp-wide exclusive prefix sum of `my_count` → per-lane output
-  // offset into `experts[]`.
-  uint32_t v = my_count;
+  // Dual-value warp inclusive scan: both totals share the same 5-step
+  // butterfly traffic.  Sequential dependency is on the `if (tid >= off)`
+  // accumulator only — the two add chains are independent.
+  uint32_t scan_total = lane_total;
+  uint32_t scan_active = lane_actives;
   #pragma unroll
   for (int off = 1; off <= 16; off *= 2) {
-    const uint32_t t = __shfl_up_sync(FULL_MASK, v, off, 32);
-    if (static_cast<int>(tid) >= off) v += t;
-  }
-  const uint32_t my_offset = v - my_count;
-  const uint32_t total = __shfl_sync(FULL_MASK, my_offset + my_count, 7);
-
-  // Lanes 0..7 enumerate their word's set bits and write to experts[].
-  // Higher lanes have my_count = 0 and skip the loop entirely.
-  //
-  // Only `experts[].id` is written.  `first_token` / `last_token` are
-  // unused on the BS8 path (see `prepare_moe_topk_BS8` docstring) — the
-  // BS64 path is the only consumer.  Skipping those two stores cuts
-  // ~50% off the per-iteration cost of this loop (3 stores → 1 store
-  // per set bit) and is what previously dominated Pass 1.
-  //
-  // Lane 0 also accumulates the packed `expert_ids` uint64 in a
-  // register during enumeration — this avoids a follow-up
-  // `__syncwarp()` + 8 SHM reads to rebuild it, which previously
-  // dominated Pass 1c wall clock.
-  uint32_t out = my_offset;
-  uint64_t packed = 0;
-  while (my_word) {
-    const uint32_t bit = __ffs(my_word) - 1;  // 0..31
-    const uint32_t eid = (tid << 5) + bit;    // tid*32 + bit
-    shm->experts[out].id = eid;
-    if (tid == 0u && out < 8u) {
-      packed |= static_cast<uint64_t>(eid) << (out * 8);
+    const uint32_t t_total = __shfl_up_sync(FULL_MASK, scan_total, off, 32);
+    const uint32_t t_active = __shfl_up_sync(FULL_MASK, scan_active, off, 32);
+    if (static_cast<int>(tid) >= off) {
+      scan_total += t_total;
+      scan_active += t_active;
     }
-    ++out;
-    my_word &= my_word - 1;
   }
+  const uint32_t lane_slot_offset = scan_total - lane_total;       // exclusive
+  const uint32_t lane_active_offset = scan_active - lane_actives;  // exclusive
+  // Total active expert count comes from lane 31's inclusive scan.
+  const uint32_t expert_count = __shfl_sync(FULL_MASK, scan_active, 31);
 
+  // Combined writeback: every lane writes its 8 expert_slot_start entries
+  // in ascending eid order, and emits an experts[].id entry for each
+  // active eid.  Since lanes process in ascending tid and within a lane
+  // entries are in ascending eid, the global experts[] enumeration is
+  // monotonically increasing in eid — same invariant as the old bitset
+  // path (R11.2).
+  //
+  // The 8 expert_slot_start writes are packed into one STS.128 per lane:
+  // `expert_slot_start` is u16, BLK = 8, so each lane's slice is exactly
+  // 16 B and lane base `tid * BLK * 2 = tid * 16` is naturally 16-B
+  // aligned.  Values are bounded by `n_pairs <= 64`, so casting through
+  // u16 is safe.  Sparse `experts[].id` writes stay scalar — their
+  // targets are non-contiguous across lanes.
+  uint4 packed_starts;
+  {
+    uint32_t lo[8];
+  #pragma unroll
+    for (uint32_t i = 0; i < BLK; ++i) {
+      lo[i] = lane_slot_offset + count_prefix[i];
+    }
+    // Pack 8 u16 lanes into a uint4 (4 × u32 = 8 × u16).
+    packed_starts.x = lo[0] | (lo[1] << 16);
+    packed_starts.y = lo[2] | (lo[3] << 16);
+    packed_starts.z = lo[4] | (lo[5] << 16);
+    packed_starts.w = lo[6] | (lo[7] << 16);
+  }
+  *reinterpret_cast<uint4*>(&tma_shm->expert_slot_start[tid * BLK]) =
+      packed_starts;
+  #pragma unroll
+  for (uint32_t i = 0; i < BLK; ++i) {
+    const uint32_t eid = tid * BLK + i;
+    const uint32_t v = local_counts[i];
+    if (v > 0u) {
+      const uint32_t out = lane_active_offset + active_prefix[i];
+      shm->experts[out].id = eid;
+    }
+  }
+  __syncwarp();
+
+  // Lane 0 packs the first ≤ 8 active eids into path.bs8.expert_ids and
+  // publishes expert_count.  Reading back from `experts[]` after the
+  // __syncwarp() captures the global first-8 (not just lane-0's block),
+  // for 8 SHM loads on a single lane — negligible relative to the 64+
+  // SHM loads the old 1a/1c passes used to issue.
   if (tid == 0) {
+    const uint32_t pack_n = (expert_count < 8u) ? expert_count : 8u;
+    uint64_t packed = 0;
+    for (uint32_t k = 0; k < pack_n; ++k) {
+      packed |= static_cast<uint64_t>(shm->experts[k].id) << (k * 8);
+    }
     shm->path.bs8.expert_ids = packed;
-    shm->expert_count = total;
+    shm->expert_count = expert_count;
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_pass1);
+  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseB);
 
-  // ── TMA-only: build the three per-expert reorganization tables ──────────
-  // expert_routed_count[eid] = # of routed (tok, k_in_topk) pairs selecting eid
-  // expert_slot_start[eid]   = exclusive prefix sum over expert_routed_count
-  // sorted_slot[pair]        = destination row in spec->temp_fp8 for the
-  //                            up-proj SiLU+fp8 writeback, where
-  //                            pair = tok * top_k + k_in_topk.  Equal to
-  //                            expert_slot_start[eid] + intra-expert rank.
-  //
-  // Iterating (t, k) in ascending order guarantees the intra-expert rank is
-  // lexicographic in (tok, k_in_topk), so the layout is deterministic (R11.2).
-  // Sentinel topk_ids_flat == 0xFFFF (unrouted slot) is skipped.
-  if constexpr (use_tma<Dims>::value) {
-    auto* tma_shm = &shm->u.tiny_wgmma_tma;
+  // ───────────────── Phase C — Slot assignment ────────────────────────────
+  // Identical math to the v3 Pass 3 — see the long comment block in git
+  // history for the evolution from v1 (single-threaded write_head) to v2
+  // (warp-parallel inner serial scan) to v3 (__match_any_sync).  The
+  // only change here is that eid0 / eid1 are register-resident from
+  // Phase A, eliminating the two `load_eid` SHM reads per lane (≤ 64
+  // SHM loads warp-wide on the critical path).
 
-    // ── Pass 2: warp-parallel zero + tally + prefix sum ──────────────
-    //
-    // Old design: thread 0 zeroed 256 entries, tallied 64 pairs, then
-    // ran a 256-step exclusive prefix sum.  This was ~7.5 µs of the
-    // ~19 µs routing budget at BS=8 — entirely sequential SHM I/O on
-    // one thread while the other 383 threads idled at the trailing
-    // __syncthreads().
-    //
-    // New design: 32-lane warp cooperates on all three steps.
-    //   (2a) Warp-parallel zero of `expert_routed_count[256]`:
-    //        each lane writes 8 entries (256 / 32).  Single STG.E.U8
-    //        per write, fully coalesced.
-    //   (2b) Warp-parallel tally via __match_any_sync.  Each lane
-    //        handles up to 2 pairs; peers sharing the same eid form a
-    //        warp peer group, and the lowest-id lane in each group
-    //        writes the popcount-sized increment.  Eliminates the
-    //        previous serial 64-iter loop on thread 0.
-    //   (2c) Warp-parallel exclusive prefix sum over 256 entries:
-    //        each lane reads 8 entries → local exclusive prefix sum
-    //        (7 adds) → warp shuffle scan over the lane sums (5
-    //        butterfly steps) → write back 8 entries with the lane
-    //        offset added.  Total: ~50 cycles vs. the old ~256 cycle
-    //        serial scan.
+  const uint32_t lane_mask = (1u << tid) - 1u;
 
-    // (2a) Warp-parallel zero.  Each lane owns 8 contiguous entries.
-    constexpr uint32_t ZERO_PER_LANE = Dims::NUM_EXPERTS / 32;
-    static_assert(Dims::NUM_EXPERTS % 32 == 0,
-                  "NUM_EXPERTS must be a multiple of 32 for warp-zero of "
-                  "expert_routed_count[]");
+  // Chunk-0 intra-chunk rank.
+  const uint32_t match0 =
+      __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid0));
+  const uint32_t rank0 = __popc(match0 & lane_mask);
+
+  // Chunk-1 intra-chunk rank.
+  const uint32_t match1 =
+      __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid1));
+  const uint32_t rank1_intra = __popc(match1 & lane_mask);
+
+  // Chunk-1 cross-chunk carry: for each lane's eid1, count how many
+  // chunk-0 pairs share that eid.  Rotate eid1 through the warp via 32
+  // shfl+ballot+popc rounds.  Skipped when n_pairs ≤ 32 (no chunk-1
+  // pairs to rank).
+  uint32_t rank1_carry = 0;
+  if (n_pairs > 32) {
   #pragma unroll
-    for (uint32_t i = 0; i < ZERO_PER_LANE; ++i) {
-      tma_shm->expert_routed_count[tid * ZERO_PER_LANE + i] = 0;
-    }
-    __syncwarp();
-
-    // (2b) Warp-parallel tally via __match_any_sync.
-    //
-    // Each lane handles up to 2 pairs (pair_slot ∈ {0, 1}; lane `tid`
-    // handles pair `tid + slot*32`).  For each pair-slot:
-    //   * Load the routed eid (or 0xFFFF sentinel for out-of-range
-    //     / unrouted lanes).
-    //   * `__match_any_sync(FULL_MASK, eid)` returns a bitmask whose
-    //     bit `j` is set iff lane `j` in this warp holds the same
-    //     eid.  Lanes that share an eid form a peer group.
-    //   * Within each peer group, the lowest-bit-set lane is the
-    //     "leader" and writes `expert_routed_count[eid] += popcount`
-    //     for the whole group — a single uint8 RMW on SHM, no atomic
-    //     needed because the leader is unique within the warp.
-    //   * `__syncwarp()` between pair_slots serialises the writes so
-    //     pair_slot 1's RMW sees pair_slot 0's contribution.
-    //
-    // Sentinel handling: `eid == 0xFFFF` lanes form their own peer
-    // group, but the `eid < Dims::NUM_EXPERTS` guard skips the write,
-    // so the sentinel write never lands.
-    //
-    // Costs vs. the previous serial tally (BS=8, top_k=8 → 64 pairs):
-    //   * Old: 64 SHM reads + 64 dependent uint8 RMWs on thread 0
-    //          ≈ 1900 cycles (~1 µs).
-    //   * New: 2 × (1 __match_any_sync + 1 popc + 1 ffs + 1 SHM RMW
-    //          on the leader lane) + 1 __syncwarp.  ≈ 50 cycles
-    //          (~0.025 µs).
-    constexpr uint32_t MAX_TALLY_SLOTS = (MAX_PAIRS + 31u) / 32u;  // 2 for BS=8
-  #pragma unroll
-    for (uint32_t slot = 0; slot < MAX_TALLY_SLOTS; ++slot) {
-      const uint32_t p = tid + slot * 32u;
-      const uint16_t eid =
-          (p < n_pairs) ? shm->topk_ids_flat[p] : (uint16_t)0xFFFF;
-      const uint32_t key = static_cast<uint32_t>(eid);
-
-      const uint32_t match = __match_any_sync(FULL_MASK, key);
-      const uint32_t count = __popc(match);
-      const uint32_t lowest = __ffs(match) - 1u;  // 0..31
-
-      if (eid < Dims::NUM_EXPERTS && tid == lowest) {
-        // Read-modify-write on uint8 SHM.  Safe within a single warp:
-        // exactly one lane (the leader) per unique eid runs this path,
-        // and the __syncwarp() between slots serialises with the
-        // previous slot's writes.
-        tma_shm->expert_routed_count[eid] += static_cast<uint8_t>(count);
-      }
-      __syncwarp();
-    }
-
-    // (2c) Warp-parallel exclusive prefix sum over `expert_routed_count`.
-    // Each lane handles a contiguous block of `BLK = 256/32 = 8`
-    // entries.
-    //
-    // Step 1: per-lane local exclusive prefix sum into registers.
-    constexpr uint32_t BLK = Dims::NUM_EXPERTS / 32;  // 8 for E=256
-    uint32_t lane_vals[BLK];
-    uint32_t lane_sum = 0;
-  #pragma unroll
-    for (uint32_t i = 0; i < BLK; ++i) {
-      const uint32_t v = tma_shm->expert_routed_count[tid * BLK + i];
-      lane_vals[i] = lane_sum;  // exclusive: pre-add value
-      lane_sum += v;
-    }
-    // `lane_sum` is now the total count for this lane's 8-entry block.
-
-    // Step 2: warp-wide exclusive prefix sum of `lane_sum` →
-    //         `lane_offset` = sum of all earlier lanes' totals.
-    uint32_t scan = lane_sum;
-  #pragma unroll
-    for (int off = 1; off <= 16; off *= 2) {
-      const uint32_t t = __shfl_up_sync(FULL_MASK, scan, off, 32);
-      if (static_cast<int>(tid) >= off) scan += t;
-    }
-    const uint32_t lane_offset = scan - lane_sum;
-
-    // Step 3: write back lane_offset + lane_vals[i] to expert_slot_start.
-  #pragma unroll
-    for (uint32_t i = 0; i < BLK; ++i) {
-      tma_shm->expert_slot_start[tid * BLK + i] =
-          static_cast<uint16_t>(lane_offset + lane_vals[i]);
-    }
-    __syncwarp();
-
-    MONO_PHASE_TIMESTAMP(t_after_prepare_pass2);
-
-    // ── Pass 3: warp-cooperative slot assignment ─────────────────────────
-    //
-    // Evolution of this pass:
-    //
-    //   v1 (single-threaded).  Stateful `write_head[eid]++` local-memory
-    //   counter, 64 sequential LDL/STL round-trips on thread 0.  NCU
-    //   flagged the trailing `__syncthreads()` as the kernel's hottest
-    //   stall source.
-    //
-    //   v2 (warp-parallel, inner serial scan).  Warp 0 with each lane
-    //   computing its rank as "count of earlier pairs with the same
-    //   eid" via a serial SHM scan.  Moved the hot spot down by ~10 us
-    //   but thread 31 on pair 63 still did 63 sequential SHM reads
-    //   (~1200-cycle critical path), and NCU again flagged the next
-    //   `__syncthreads()`.
-    //
-    //   v3 (this code — warp-cooperative via __match_any_sync).  Within
-    //   a warp chunk of 32 lanes, `__match_any_sync(FULL_MASK, eid)`
-    //   returns a per-lane bitmask whose bit `j` is set iff lane `j`
-    //   holds the same eid as the caller.  The intra-chunk rank is
-    //   then `popc(match & lane_mask_below_self)` — a single warp
-    //   instruction in place of the inner 32-iteration scan.  For
-    //   `n_pairs > 32` we add a cross-chunk carry that rotates each
-    //   thread's `eid1` through the warp and accumulates matches
-    //   against `eid0`; 32 shfl+ballot rounds replace 32 SHM loads
-    //   per thread on the longest path.
-    //
-    // Ordering invariant preserved (R11.2, Q-prep-3):
-    //   * `popc(match & lane_mask)` counts strictly EARLIER lanes, so
-    //     within a chunk the sorted_slot values are monotonic in the
-    //     lane index (== pair index).
-    //   * The cross-chunk carry adds `|{chunk-0 pairs with same eid}|`
-    //     to chunk-1 intra-ranks, so chunk-1 slots pick up exactly
-    //     where chunk 0 left off.
-    //   Result: for any expert, `sorted_slot` is strictly ascending
-    //   when pairs are enumerated in lex order — byte-identical to the
-    //   v1 write-head semantics.
-    //
-    // Sentinel handling: lanes with eid == 0xFFFF participate in the
-    // warp intrinsics (all 32 lanes are converged and must call the
-    // _sync primitives), but their computed rank is discarded
-    // because the `sorted_slot` write is gated on `eid != 0xFFFF`.
-    // Worst-case sentinel clustering (many pairs all unrouted) gives
-    // meaningless rank values for exactly those pairs — same as v1/v2.
-    //
-    // `FULL_MASK` (= 0xFFFFFFFFu) is defined as a preprocessor macro at
-    // the top of `moe_prepare.cu`, which `moe.cu` includes before
-    // `moe_routing.cu`, so it's visible here.  Reusing that macro also
-    // avoids naming a local `constexpr FULL_MASK` that would collide
-    // with the macro at substitution time.
-    const uint32_t tid = threadIdx.x;
-    const uint32_t n_pairs = batch_size * top_k;  // ≤ MAX_PAIRS = 64
-
-    auto load_eid = [&](uint32_t pair) -> uint16_t {
-      if (pair >= n_pairs) return 0xFFFF;
-      const uint32_t tok = pair / top_k;
-      const uint32_t k = pair % top_k;
-      return shm->topk_ids_flat[tok * MAX_TOPK + k];
-    };
-
-    const uint32_t p0 = tid;       // chunk 0 pair index
-    const uint32_t p1 = tid + 32;  // chunk 1 pair index
-    const uint16_t eid0 = load_eid(p0);
-    const uint16_t eid1 = load_eid(p1);
-
-    // `lane_mask = (1 << tid) - 1` selects bits for lanes strictly
-    // below the caller.  `(1u << 0) - 1 == 0`, so lane 0 correctly
-    // gets rank 0.
-    const uint32_t lane_mask = (1u << tid) - 1u;
-
-    // Chunk-0 intra-chunk rank.
-    const uint32_t match0 =
-        __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid0));
-    const uint32_t rank0 = __popc(match0 & lane_mask);
-
-    // Chunk-1 intra-chunk rank.
-    const uint32_t match1 =
-        __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid1));
-    const uint32_t rank1_intra = __popc(match1 & lane_mask);
-
-    // Chunk-1 cross-chunk carry: for each lane's `eid1`, count how many
-    // chunk-0 pairs had the same expert id.  Rotate `eid1` through the
-    // warp; on iteration `src` every lane checks its `eid0` against
-    // lane `src`'s `eid1` via a single `__ballot_sync`, and lane `src`
-    // captures the popcount.  32 shfl+ballot+popc rounds — warp-wide
-    // pipelined, ~150 cycles vs. the v2 critical path of ~1260 cycles.
-    //
-    // Skipped entirely when n_pairs ≤ 32 (BS≤4 or top_k≤4): there are
-    // no chunk-1 pairs to rank.
-    uint32_t rank1_carry = 0;
-    if (n_pairs > 32) {
-  #pragma unroll
-      for (int src = 0; src < 32; ++src) {
-        const uint32_t q =
-            __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid1), src);
-        const uint32_t b =
-            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
-        if (static_cast<int>(tid) == src) rank1_carry = __popc(b);
-      }
-    }
-
-    if (p0 < n_pairs && eid0 != 0xFFFF) {
-      tma_shm->sorted_slot[p0] =
-          static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
-    }
-    if (p1 < n_pairs && eid1 != 0xFFFF) {
-      tma_shm->sorted_slot[p1] = static_cast<uint8_t>(
-          tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
+    for (int src = 0; src < 32; ++src) {
+      const uint32_t q =
+          __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid1), src);
+      const uint32_t b =
+          __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
+      if (static_cast<int>(tid) == src) rank1_carry = __popc(b);
     }
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_pass3);
+  if (p0 < n_pairs && eid0 != 0xFFFF) {
+    tma_shm->sorted_slot[p0] =
+        static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
+  }
+  if (p1 < n_pairs && eid1 != 0xFFFF) {
+    tma_shm->sorted_slot[p1] = static_cast<uint8_t>(
+        tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
+  }
+
+  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseC);
 }
 
 }  // namespace moe_monokernel

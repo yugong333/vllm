@@ -1220,8 +1220,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # tail of MoEGemmSpec.  Kernel output is CORRECT (no skip flags);
     # overhead is negligible (7 clock64 reads + 7 GM stores total).
     #
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
+    set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
+      PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
