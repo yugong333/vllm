@@ -330,19 +330,17 @@ struct MoEGemmSpec {
   // Routing sub-phases (filled by topK_BS8 / prepare_moe_topk_BS8):
   //   t_after_topk             : after topK_BS8 (warps return)
   //   t_after_sync_calc        : after sync_calc_threads<>() helper
-  //   t_after_prepare_pass1    : after Pass 1 of prepare (bitset + ids)
-  //   t_after_prepare_pass2    : after Pass 2 (zero counts + prefix sum)
-  //   t_after_prepare_pass3    : after Pass 3 (slot assignment)
-  //   t_after_prepare_sync     : after the trailing __syncthreads()
+  //   t_after_prepare_phaseA   : after Phase A (zero counts + tally + cache
+  //   eids) t_after_prepare_phaseB   : after Phase B (fused prefix sum +
+  //   experts[] enum) t_after_prepare_phaseC   : after Phase C (slot
+  //   assignment) t_after_prepare_sync     : after the trailing __syncthreads()
   struct {
     int64_t t_start;
     int64_t t_after_topk;
     int64_t t_after_sync_calc;
-    int64_t t_after_prepare_pass1a;
-    int64_t t_after_prepare_pass1b;
-    int64_t t_after_prepare_pass1;
-    int64_t t_after_prepare_pass2;
-    int64_t t_after_prepare_pass3;
+    int64_t t_after_prepare_phaseA;
+    int64_t t_after_prepare_phaseB;
+    int64_t t_after_prepare_phaseC;
     int64_t t_after_routing;
     // Up-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
     //   t_up_after_preloop : after the pre-loop bar_w[0] arm + first
