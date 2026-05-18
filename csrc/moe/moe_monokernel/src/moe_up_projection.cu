@@ -912,7 +912,16 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& up_weights_desc,
     CUtensorMap const& activations_desc,
     std::uint32_t up_block_idx = 0xffffffffu, std::uint32_t expert_start = 0,
-    std::uint32_t expert_stride = 1, bool external_priming = false) {
+    std::uint32_t expert_stride = 1, bool external_priming = false,
+    // ── Per-expert-fused mode (cluster path, design §2 / §7.2, R5.5) ──
+    // When `single_expert == true`, the helper iterates ONLY the single
+    // expert at index `single_expert_e` and disables cross-expert
+    // mbarrier stitching at the K-loop tail (R5.5).  `emit_prologue` /
+    // `emit_epilogue` are kept for API symmetry with the down-projection
+    // helper but are unused on the up-projection side (no GMEM
+    // writeback).
+    bool single_expert = false, std::uint32_t single_expert_e = 0u,
+    bool emit_prologue = true, bool emit_epilogue = true) {
   static_assert(Dims::BS <= 8);
   using CoreDims = MoECoreDims<Dims>;
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
@@ -923,6 +932,13 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // descriptors.
   (void)activations_in;
   (void)expert_weights_up;
+  // `emit_prologue` / `emit_epilogue` are only meaningful on the
+  // down-projection side (where `out_accum` zero-fill and the GMEM
+  // partial-out writeback are gated by them).  On the up-proj side
+  // there is no GMEM writeback, so both flags are accepted for API
+  // symmetry but ignored here.
+  (void)emit_prologue;
+  (void)emit_epilogue;
 
   // `external_priming = true` means the caller has already performed:
   //   * `mbarrier_init` on all 4 barriers + release-fence
@@ -982,6 +998,19 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   const bool is_gate_half = (warp_in_wg < 2);
   (void)thread_in_block;
   (void)is_wg0;
+
+  // Intra-cluster rank for the cluster variant.  On the non-cluster
+  // path (`use_cluster<Dims>::value == false`) `cluster_size<Dims>`'s
+  // SFINAE fallback returns 0 and this helper is unused, so we
+  // collapse the divisor to 1 there to keep the compile-time
+  // expression well-formed without any runtime cost (the result is
+  // ignored on the non-cluster code path).  On the cluster variant
+  // `cluster_size<Dims>::value == CLUSTER_SIZE == 8` per design §3.3.
+  constexpr uint32_t CLUSTER_DIV =
+      use_cluster<Dims>::value ? cluster_size<Dims>::value : 1u;
+  const uint32_t block_in_cluster =
+      use_cluster<Dims>::value ? (blockIdx.x % CLUSTER_DIV) : 0u;
+  (void)block_in_cluster;
 
   // TMA path uses the `tiny_wgmma_tma` union variant (byte-identical to
   // `tiny_wgmma` plus 32 B of mbarriers at the tail).
@@ -1064,12 +1093,28 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   }
 
   // ── Phase-3 expert loop ───────────────────────────────────────────────
+  //
+  // Per-expert-fused cluster path (`single_expert == true`): the loop
+  // collapses to ONE iteration over `e = single_expert_e`.  The caller
+  // (the per-cluster expert sequencer in `moe_kernel_topk_BS8`) walks
+  // the full per-cluster expert sequence externally, firing a
+  // `cluster_sync()` between each (Phase-3, Phase-4) pair (R5.5,
+  // R6.1, R6.2).  Bypassing the cross-expert mbarrier stitch on this
+  // path is correct because the helper is re-entered fresh for every
+  // assigned expert with `external_priming = first_iter` so the K-loop
+  // launcher's "next expert stitch" branch is silenced via
+  // `has_next_e == false`.
   MONO_PHASE_TIMESTAMP(t_up_after_preloop);
-  for (uint32_t e = expert_start; e < expert_count; e += expert_stride) {
+  const uint32_t loop_e_start = single_expert ? single_expert_e : expert_start;
+  const uint32_t loop_e_end =
+      single_expert ? (single_expert_e + 1u) : expert_count;
+  const uint32_t loop_e_stride = single_expert ? 1u : expert_stride;
+  for (uint32_t e = loop_e_start; e < loop_e_end; e += loop_e_stride) {
     const uint32_t id = shmem->experts[e].id;
-    const bool has_next_e = (e + expert_stride < expert_count);
+    const bool has_next_e =
+        single_expert ? false : (e + loop_e_stride < expert_count);
     const uint32_t next_id =
-        has_next_e ? shmem->experts[e + expert_stride].id : 0u;
+        has_next_e ? shmem->experts[e + loop_e_stride].id : 0u;
 
     // Per-expert parity state.  bar_{w,a}[0] are always pre-armed at the
     // start of each expert (by Phase-1 greedy / helper pre-loop / prior
@@ -1272,6 +1317,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         if (has_next_s) {
           // Intra-expert: fetch (s+1) tiles of the CURRENT expert.
           const uint32_t next_k_start = (s + 1) * K_STEP;
+          // Weight TMA stays per-block on both paths (R4.6, design §6.6):
+          // each up-block reads its own distinct 128-row stripe of the
+          // expert's weights; multicast would not save any bytes here.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/16384u);
           tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/id,
@@ -1280,12 +1328,39 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                                  /*k_start=*/next_k_start,
                                  /*dest_slot=*/&shm->w_wgmma[next_slot][0][0],
                                  /*bar=*/&shm->bar_w[next_slot]);
+          // bf16 activation TMA: every block in the cluster pre-arms its
+          // OWN bar_a[next_slot] with `expect_tx = 2048` (R4.3, design
+          // §6.3 step 1).  On the non-cluster path, the same launcher
+          // also issues a per-block unicast TMA into its own bf16_in
+          // slot (existing behaviour).  On the cluster path
+          // (use_cluster<Dims>::value == true), only block 0 of the
+          // cluster issues a multicast TMA (R4.2, R4.4) that lands the
+          // SAME 2 KB activation tile in every cluster member's
+          // bf16_in[next_slot]; blocks 1..7 skip the issue and rely on
+          // the multicast fan-out to satisfy their own arm/wait pair.
           mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
                                     /*tx_bytes=*/2048u);
-          tma_load_bf16_input_tile(activations_desc,
-                                   /*k_start=*/next_k_start,
-                                   &shm->bf16_in[next_slot][0][0],
-                                   &shm->bar_a[next_slot]);
+          if constexpr (use_cluster<Dims>::value) {
+            if (block_in_cluster == 0u) {
+              tma_load_bf16_input_tile_multicast(
+                  activations_desc, /*k_start=*/next_k_start,
+                  /*dest_smem_ptr=*/&shm->bf16_in[next_slot][0][0],
+                  /*bar_smem_ptr=*/&shm->bar_a[next_slot],
+                  /*cluster_mask=*/0xFFu);
+            }
+            // §12.2 / R13.2: capture timestamp on the very first
+            // multicast issue of this helper invocation only (first
+            // K-step of the first per-expert call).  Every cluster
+            // block walks the same launcher branch and the macro
+            // self-gates to (blockIdx.x == 0, threadIdx.x == 0).
+            MONO_PHASE_TIMESTAMP_IF(t_after_multicast_arm,
+                                    e == expert_start && s == 0u);
+          } else {
+            tma_load_bf16_input_tile(activations_desc,
+                                     /*k_start=*/next_k_start,
+                                     &shm->bf16_in[next_slot][0][0],
+                                     &shm->bar_a[next_slot]);
+          }
         } else if (has_next_e) {
           // End-of-expert stitch: fetch iter-0 tiles of the NEXT expert.
           // For K_TILES even, `next_slot == 0` — matches the next
@@ -1298,11 +1373,34 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                                  /*k_start=*/0u,
                                  /*dest_slot=*/&shm->w_wgmma[next_slot][0][0],
                                  /*bar=*/&shm->bar_w[next_slot]);
+          // Same activation-TMA pattern as the intra-expert branch above:
+          // every block arms; on the cluster path only block 0 issues
+          // the multicast (design §6.3, R4.2/R4.3/R4.4).
           mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
                                     /*tx_bytes=*/2048u);
-          tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
-                                   &shm->bf16_in[next_slot][0][0],
-                                   &shm->bar_a[next_slot]);
+          if constexpr (use_cluster<Dims>::value) {
+            if (block_in_cluster == 0u) {
+              tma_load_bf16_input_tile_multicast(
+                  activations_desc, /*k_start=*/0u,
+                  /*dest_smem_ptr=*/&shm->bf16_in[next_slot][0][0],
+                  /*bar_smem_ptr=*/&shm->bar_a[next_slot],
+                  /*cluster_mask=*/0xFFu);
+            }
+            // §12.2 / R13.2: capture timestamp on the very first
+            // multicast issue of this helper invocation only (first
+            // K-step of the first per-expert call).  The cross-expert
+            // stitch only runs once `s == K_TILES - 1`, so this site
+            // never matches `s == 0u` and the gate fires only via the
+            // intra-expert branch above for `e == expert_start`.  Kept
+            // here for symmetry so a future single-K helper variant
+            // does not lose the capture.
+            MONO_PHASE_TIMESTAMP_IF(t_after_multicast_arm,
+                                    e == expert_start && s == 0u);
+          } else {
+            tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
+                                     &shm->bf16_in[next_slot][0][0],
+                                     &shm->bar_a[next_slot]);
+          }
         }
           // Else: last expert's last iteration — leave barriers idle.
   #endif
@@ -1448,20 +1546,67 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         // (`tok * 128 + kc * 16 + ki`) once the down-proj TMA applies
         // the 8-row × 128-byte XOR swizzle at write time into SHM
         // `a_down_wgmma[tok][kc][ki]`.
-        if (write1) {
-          spec->temp_fp8[dest_row * Dims::N + out_col_1] = q1;
-        }
-        if (write2) {
-          spec->temp_fp8[dest_row * Dims::N + out_col_2] = q2;
-        }
-        // Lane 0 of each warp writes the per-(dest_row, up_block_idx)
-        // scale once.  All lanes in the warp hold the same block_scale
-        // after the warp-reduce, so picking lane 0 is arbitrary.
-        if (lane == 0) {
-          constexpr uint32_t SCALE_COLS =
-              MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
-          spec->temp_act_scale[dest_row * SCALE_COLS + effective_bid] =
-              block_scale;
+        if constexpr (use_cluster<Dims>::value) {
+          // ── Cluster path (design §7.1, R5.2, R5.4, R5.9) ──────────────
+          //
+          // The post-SiLU fp8 + per-token scale go into LOCAL SHM slabs
+          // instead of `spec->temp_fp8` / `spec->temp_act_scale`.  Each
+          // up-block of the cluster owns exactly one
+          // `[T_TILE = 8] × [W_UP_COLS_WGMMA = 64]` fp8 stripe of the
+          // current expert's `[BS][N = 512]` post-SiLU activation
+          // matrix and writes it WITHOUT inter-block stride: `tok` is
+          // the row index `t` (= warp), and the column index is the
+          // local 0..63 column offset within the block's 64-column
+          // stripe (= `col_in_half` for the WG0 half, `col_in_half + 32`
+          // for the WG1 half).  Peer down-blocks of the same cluster
+          // read the slab in Phase 4 via DSHM (R5.6); no HBM round-trip
+          // through `spec->temp_fp8` occurs (R5.9).
+          //
+          // The destination row collapses from `dest_row` (the
+          // expert-sorted row in the legacy `spec->temp_fp8`) to plain
+          // `tok` because the cluster path is PER-EXPERT-FUSED: only
+          // the current expert's tokens are live in the slab at any
+          // moment (single-buffered, R5.5).  The next expert's
+          // up-projection will overwrite the slab in place after the
+          // cluster sync at site #2 publishes this expert's results to
+          // peer down-blocks.
+          //
+          // The store-guard (`store && tok < batch_size`) is the same
+          // as the non-cluster path: only this expert's routed tokens
+          // are written; rows that are not in any token's top-K for
+          // this expert are left untouched (their corresponding
+          // down-projection lanes will multiply by zero in Phase 4).
+          auto* cl = &shmem->u.tiny_wgmma_tma.cluster_ext;
+          if (write1) {
+            cl->cluster_temp_fp8[tok][col_in_half] = q1;
+          }
+          if (write2) {
+            cl->cluster_temp_fp8[tok][col_in_half + 32u] = q2;
+          }
+          // One scale per (token, 64-column block); each up-block owns
+          // exactly one 64-column block per expert (R5.4).  Lane 0 of
+          // each warp writes the warp-reduced scale; all lanes in the
+          // warp hold the same `block_scale` after the warp-reduce.
+          if (lane == 0) {
+            cl->cluster_temp_act_scale[tok] = block_scale;
+          }
+        } else {
+          if (write1) {
+            spec->temp_fp8[dest_row * Dims::N + out_col_1] = q1;
+          }
+          if (write2) {
+            spec->temp_fp8[dest_row * Dims::N + out_col_2] = q2;
+          }
+          // Lane 0 of each warp writes the per-(dest_row, up_block_idx)
+          // scale once.  All lanes in the warp hold the same
+          // block_scale after the warp-reduce, so picking lane 0 is
+          // arbitrary.
+          if (lane == 0) {
+            constexpr uint32_t SCALE_COLS =
+                MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
+            spec->temp_act_scale[dest_row * SCALE_COLS + effective_bid] =
+                block_scale;
+          }
         }
       }
   #endif

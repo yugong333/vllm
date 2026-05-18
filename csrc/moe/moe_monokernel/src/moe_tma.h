@@ -313,6 +313,115 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(
               bar_smem_ptr);
 }
 
+/**
+ * @brief Issue one TMA-multicast load for the bf16 activation tile shared
+ *        by every block in a Hopper thread-block cluster.
+ *
+ * This is the cluster-variant counterpart of `tma_load_bf16_input_tile`
+ * above.  A single `cp.async.bulk.tensor.2d.shared::cluster.global.tile
+ * .mbarrier::complete_tx::bytes.multicast::cluster_mask` instruction
+ * fetches one 128-K × 8-token rectangular box (2048 B total: 8 tokens ×
+ * 128 K × 2 B per bf16) from the activation descriptor and lands the
+ * SAME bytes in the SHM of EVERY block whose intra-cluster rank bit is
+ * set in `cluster_mask` (R4.1, R4.4).  Each destination block's
+ * mbarrier (`bar_smem_ptr` on that block) is decremented once on
+ * arrival, so per-block transaction-bytes accounting is honored on
+ * every cluster member.
+ *
+ * Coordinate convention is identical to the unicast helper above:
+ * innermost axis = K, outer axis = token; tokens are always fetched
+ * starting at token 0.  Activations are expert-invariant (R15.2): the
+ * coordinates depend only on `k_start`.
+ *
+ * Caller contract (critical — R4.1, R4.2, R4.3, R4.4; design §6.2):
+ *   - Must be called by exactly ONE thread across the WHOLE CLUSTER —
+ *     the cluster-wide multicast launcher.  Concretely, the caller
+ *     gates with `block_in_cluster == 0 &&
+ *     is_tma_launcher_thread<Dims>()`.  All other blocks in the cluster
+ *     SHALL NOT issue a redundant activation TMA (R4.2); only the
+ *     launcher block / launcher lane emits this instruction.  The
+ *     wrapper itself does NOT gate on `threadIdx`; callers are
+ *     responsible for the gate.
+ *   - EVERY block in the cluster (not just the launcher) MUST have
+ *     pre-armed its OWN local `bar_smem_ptr` EXACTLY ONCE with
+ *     `mbarrier_arrive_expect_tx(bar_smem_ptr, 2048)` BEFORE the
+ *     multicast TMA targeting that slot is issued (R4.3).  This
+ *     ensures the hardware `complete_tx` decrement on each destination
+ *     block lands on a barrier that is waiting for 2048 transaction
+ *     bytes.  This wrapper itself does NOT call
+ *     `mbarrier_arrive_expect_tx`; it only emits the cp.async.bulk
+ *     instruction.
+ *   - `dest_smem_ptr` MUST be 16-B aligned and point at
+ *     `shm->bf16_in[slot][0][0]` (the 2048-B activation-tile slot) on
+ *     the LAUNCHER block.  The cluster-shared address space machinery
+ *     internal to the multicast instruction routes the bytes to the
+ *     SAME SHM offset on every other cluster member, so every block's
+ *     `bf16_in[slot]` slab MUST live at a matching offset (which is
+ *     guaranteed by all blocks sharing the same `MoE_SHM<Dims>`
+ *     layout).
+ *   - `bar_smem_ptr` is interpreted analogously: the multicast machinery
+ *     decrements the mbarrier at the SAME SHM offset on every cluster
+ *     member.  Callers pass the launcher block's `&shm->bar_a[slot]`.
+ *   - `cluster_mask` MUST be a 16-bit value whose set bits identify the
+ *     destination ranks; for the BS8 cluster variant this is the
+ *     hardcoded pattern `0xFFu` (all 8 blocks of the cluster, R4.4).
+ *     A future variant that needs a partial mask SHALL accept it as a
+ *     kernel parameter rather than hardcoding a different literal here
+ *     (R4.4).
+ *   - `desc` MUST be the descriptor produced by
+ *     `create_activations_tma_desc`, typically passed to the kernel as
+ *     a `__grid_constant__ CUtensorMap const` parameter.
+ *   - Valid inputs (R15.2): `0 ≤ k_start` with `k_start + 128 ≤ K_hidden`.
+ *
+ * SM90 gating: the multicast PTX is `sm_90a`-only.  The body is wrapped
+ * in `#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)`; on older
+ * arches we emit `trap;` (mirroring `tma_load_2d`).  The cluster-variant
+ * Dims is itself gated to Hopper at the host wrapper (R12.1, R12.3),
+ * so this device branch should never be reached at runtime on
+ * pre-Hopper devices.
+ *
+ * @param desc          Host-built activation TMA descriptor
+ *                      (`__grid_constant__`).
+ * @param k_start       Innermost-axis starting K column (multiple of 128).
+ * @param dest_smem_ptr 16-B aligned SHM destination pointer to
+ *                      `shm->bf16_in[slot][0][0]` (2048 B) on the
+ *                      launcher block.
+ * @param bar_smem_ptr  16-B aligned SHM mbarrier pre-armed by EVERY
+ *                      cluster member with `expect_tx = 2048`.
+ * @param cluster_mask  16-bit destination mask; bit `r` set ⇒ deliver
+ *                      to the block at intra-cluster rank `r`.  Pass
+ *                      `0xFFu` for the BS8 cluster variant (all 8
+ *                      blocks).
+ */
+__device__ __forceinline__ void tma_load_bf16_input_tile_multicast(
+    CUtensorMap const& desc, std::uint32_t k_start, void* dest_smem_ptr,
+    std::uint64_t* bar_smem_ptr, std::uint16_t cluster_mask) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  // Descriptor axis order (innermost first): coord0 = K, coord1 = token.
+  // We always fetch all 8 tokens starting at token 0 (R2.5, R15.2).
+  const std::uint32_t coord0 = k_start;
+  const std::uint32_t coord1 = 0u;
+  std::uint32_t dst_addr = cvta_to_shared_u32(dest_smem_ptr);
+  std::uint32_t bar_addr = cvta_to_shared_u32(bar_smem_ptr);
+  std::uint64_t desc_addr = reinterpret_cast<std::uint64_t>(&desc);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+      ".mbarrier::complete_tx::bytes.multicast::cluster"
+      " [%0], [%1, {%2, %3}], [%4], %5;\n"
+      :
+      : "r"(dst_addr), "l"(desc_addr), "r"(coord0), "r"(coord1), "r"(bar_addr),
+        "h"(cluster_mask)
+      : "memory");
+#else
+  (void)desc;
+  (void)k_start;
+  (void)dest_smem_ptr;
+  (void)bar_smem_ptr;
+  (void)cluster_mask;
+  asm volatile("trap;");
+#endif
+}
+
 // ─── Down-projection (Phase 4) TMA load helpers ──────────────────────────
 //
 // Mirror of the up-projection helpers above, specialized for the fp8

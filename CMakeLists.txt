@@ -1081,6 +1081,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set(SRCS
        "csrc/moe/moe_monokernel/moe_wrapper.cu"
        "csrc/moe/moe_monokernel/src/moe_tma.cu")
+    # NOTE: cluster variant requires `9.0a`; do not narrow the arch list
+    # -- see spec R12.1 (monokernel-cluster-multicast). The cluster-enabled
+    # BS8 kernel uses __cluster_dims__, distributed shared memory, and TMA
+    # multicast PTX, all of which require the sm_90a virtual arch. Removing
+    # 9.0a here will silently elide the cluster variant from the binary.
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "9.0a")

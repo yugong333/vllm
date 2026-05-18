@@ -156,6 +156,71 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   };
 };
 
+// ── BS8 WGMMA + TMA + CLUSTER variant (Hopper sm_90a only) ──────────────
+// Cluster-enabled sibling of `Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA`.
+//
+// Every algorithmic dimension (`HIDDEN_STATES`, `K`, `N`, `BS`, `M`,
+// `NUM_EXPERTS`, block-wise FP8 quantization, `BLOCK_SIZE`, `GRID_SIZE`)
+// is byte-identical to the non-cluster variant; only the inter-block
+// data movement and synchronization between Phase 3 (up-projection) and
+// Phase 4 (down-projection) are rewired (R1.2, R3.5, design §3.1).
+//
+// The new `KernelConfig::USE_CLUSTER = true` flag opts the BS8 path into
+// Hopper thread block clusters of size `CLUSTER_SIZE = 8`. With
+// `GRID_SIZE = 128` the grid contains `GRID_SIZE / CLUSTER_SIZE = 16`
+// clusters, each cluster covering exactly one up-group / down-group
+// (`UP_GRID = 2*N / W_UP_TILE_WGMMA = 8`).  Inside a cluster:
+//   - one TMA multicast issue per K-step delivers the bf16 activation
+//     tile to all 8 blocks' SHM (R4.1, R4.2);
+//   - the Phase 3 → Phase 4 handoff uses distributed shared memory
+//     (DSHM) instead of `spec->temp_fp8` global memory (R5.2, R5.9);
+//   - the Phase 3 → Phase 4 boundary is a hardware cluster barrier
+//     instead of the software `expert_barrier` (R6.1).
+//
+// The existing `Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA` and
+// `Dims_BS64_E256_Qwen3_5_35B_BlockFP8` paths remain byte-identical
+// (R1.4, R11.1).
+//
+// See design.md §3.1 for the full constant inventory and §3.4 for the
+// `__cluster_dims__` annotation strategy.
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    // Enables the TMA-based weight + activation load path in Phase 3 of
+    // the BS8 WGMMA up-projection kernel.
+    static constexpr bool USE_TMA = true;
+    // Opts the BS8 path into Hopper thread block clusters (sm_90a only).
+    // Selected at compile time by the `use_cluster<Dims>` SFINAE detector;
+    // gates cluster-launch path in `moe_wrapper.cu` and the DSHM /
+    // multicast / cluster-barrier rewiring in the kernel body
+    // (design §3.1, R1.1).
+    static constexpr bool USE_CLUSTER = true;
+    // Cluster extent. Must equal `UP_GRID = 2*N / W_UP_TILE_WGMMA = 8`
+    // and must divide `GRID_SIZE`; both invariants are enforced by
+    // `static_assert`s in `moe.cu` (R1.5, R1.6, design §3.3).
+    static constexpr std::uint32_t CLUSTER_SIZE = 8;
+  };
+};
+
 // Scoring function enum for routing
 enum class ScoringFunc : uint32_t {
   SIGMOID = 0,

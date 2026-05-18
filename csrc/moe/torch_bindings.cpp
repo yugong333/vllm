@@ -68,6 +68,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
          torch::kCUDA,
          &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
+
+  // Hopper cluster variant of the BS8 TMA+WGMMA kernel.  Same Python
+  // call signature as the TMA+WGMMA variant above; opts into thread
+  // block clusters via `KernelConfig::USE_CLUSTER = true`.  Requires
+  // sm_90a + CUDA 12.4+ (spec R1.1, R12.1, R12.2).  The wrapper raises
+  // `TORCH_CHECK` on pre-Hopper devices on first invocation (spec R2.3,
+  // R12.3).  Up-projection weights MUST be pre-interleaved via
+  // `interleave_for_tma_wgmma_up`, identical to the non-cluster
+  // TMA+WGMMA variant.
+  m.def(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster("
+      "Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster",
+      torch::kCUDA,
+      &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster_impl);
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

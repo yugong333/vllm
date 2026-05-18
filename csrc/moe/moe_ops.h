@@ -98,6 +98,20 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
     bool renormalize);
+// Hopper cluster variant of the BS8 TMA+WGMMA kernel.  Same shape as
+// the TMA+WGMMA variant above; opts into thread block clusters
+// (`__cluster_dims__(8, 1, 1)`), TMA multicast, and DSHM-based
+// Phase 3 → Phase 4 handoff (spec R1.1, R2.1, R2.2; design §3.1).
+// Requires sm_90a + CUDA 12.4+; the wrapper raises `TORCH_CHECK` on
+// pre-Hopper devices (spec R2.3, R12.3).
+void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
 #endif
 
 #ifndef USE_ROCM

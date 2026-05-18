@@ -115,6 +115,53 @@ struct use_tma {
   static constexpr bool value = test<Dims>(0);
 };
 
+// `Dims::KernelConfig::USE_CLUSTER` is optional; default to false for all
+// existing Dims variants so the current non-clustered launch path stays in
+// use.  Only the new Dims_BS8_..._WGMMA_TMA_Cluster variant sets
+// USE_CLUSTER=true, opting the BS8 path into Hopper thread block clusters
+// (`__cluster_dims__(8, 1, 1)`, sm_90a only) per design §3.1 / §3.2 (R1.3,
+// R1.4).
+template <typename Dims>
+struct use_cluster {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::USE_CLUSTER, bool()) {
+    return D::KernelConfig::USE_CLUSTER;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
+// `Dims::KernelConfig::CLUSTER_SIZE` is only defined on cluster-enabled
+// Dims variants (the ones that also set `USE_CLUSTER = true`).  Non-
+// cluster Dims (e.g. `Dims_BS64_..._BlockFP8`,
+// `Dims_BS8_..._WGMMA_TMA`) do not expose the member at all.
+//
+// `static_assert`s in `moe.cu` that combine `!use_cluster<Dims>::value`
+// with a check on `CLUSTER_SIZE` would still attempt to instantiate the
+// right-hand operand for non-cluster `Dims`, because `||` does not
+// short-circuit template-name lookup at constant-evaluation time.  This
+// SFINAE detector hides that name behind a fallback (0) so the
+// constant expression is well-formed for every `Dims` while staying
+// faithful to the cluster precondition checks (R1.5, R1.6, design
+// §3.3).  Mirrors the `use_cluster<Dims>` idiom directly above.
+template <typename Dims>
+struct cluster_size {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::CLUSTER_SIZE, std::uint32_t()) {
+    return D::KernelConfig::CLUSTER_SIZE;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return 0;
+  }
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
 /**
  * @brief Scratchpad memory for use within the monokernel.
  *
@@ -377,6 +424,40 @@ struct MoEGemmSpec {
     int64_t t_after_down;
     int64_t t_after_barrier3;
     int64_t t_after_phase5;
+    // ── Cluster-multicast variant timestamps (design §12.2, R13.2) ──
+    // Appended at the TAIL of `phase_timestamps` so the offset
+    // invariants of every preceding field (and of `temp_fp8`,
+    // `partial_barrier`, and the existing six BS8 timestamps) stay
+    // byte-identical for non-cluster builds (R11.3).  Both fields are
+    // only populated when `MONO_PROFILE_PHASE_TIMING` is defined AND
+    // the active `Dims` variant has `use_cluster<Dims>::value == true`;
+    // they remain zero-initialized on every other path.
+    //
+    //   t_after_cluster_init  : captured by the multicast launcher
+    //                           block (the cluster-rank-0 block, on
+    //                           the calc-warp-0 lane-0 thread)
+    //                           immediately after the cluster's
+    //                           mbarrier initialization and the
+    //                           `fence.mbarrier_init.release.cluster`
+    //                           (or its equivalent) that publishes
+    //                           the freshly-initialized barriers to
+    //                           peer blocks.  Captures cluster
+    //                           startup cost.  Populated from the
+    //                           cluster-init site added in Wave 10
+    //                           task 10.1 (in `moe.cu`).
+    //   t_after_multicast_arm : captured by the multicast launcher
+    //                           block on the same launcher thread
+    //                           immediately after the FIRST K-step's
+    //                           `tma_load_bf16_input_tile_multicast`
+    //                           issue (design §6.3).  Captures arm-
+    //                           to-issue latency.  Populated from
+    //                           the multicast-issue site added in
+    //                           Wave 10 task 10.1 (in
+    //                           `moe_up_projection.cu`); gated to
+    //                           fire once via
+    //                           `MONO_PHASE_TIMESTAMP_IF`.
+    int64_t t_after_cluster_init;
+    int64_t t_after_multicast_arm;
   } phase_timestamps;
 };
 
@@ -608,6 +689,98 @@ struct MoECoreDims {
   static constexpr unsigned K_DIM_HALF_PADDED_A = Dims::HIDDEN_STATES / 2;
 };
 
+// ── Cluster-only SHM extension (Hopper SM_90a, R5.x) ─────────────────────
+//
+// `cluster_shm_ext<Dims>` is the sub-struct of cluster-only fields embedded
+// inside `MoE_SHM<Dims>::TinyDataWGMMA_TMA`. It is empty (sizeof == 1 B due
+// to the C++17 unique-address rule) when `use_cluster<Dims>::value` is
+// false, so the non-cluster TMA+WGMMA variant pays no per-block SHM cost
+// beyond a single byte of tail padding (R11.1, R11.3). When the trait is
+// enabled, it materializes the four cluster-only slabs documented in
+// design §5.3 / §15.2 (~1.5 KiB total per block, R5.1).
+//
+// The fields hold the **current per-cluster expert's** Phase-3 output
+// (single-buffered: one expert in flight per cluster, R5.5) plus the
+// path-(b) staging buffers used to assemble the down-projection B-operand
+// (design §7.5). All fields are accessed across blocks of the same cluster
+// via the cluster-shared address space (PTX `mapa.shared::cluster.b64`,
+// R5.6) and obey a write-once-per-expert producer rule (R5.2): the
+// producing up-block writes its slab in Phase 3, the cluster barrier at
+// site #2 publishes the writes (R6.1, R6.2), peer down-blocks read from
+// DSHM in Phase 4, and the next per-cluster expert iteration overwrites
+// the slabs in place (R5.5, R5.9, R11.3).
+template <typename Dims, bool Enable = use_cluster<Dims>::value>
+struct cluster_shm_ext {
+  // Cluster path disabled — empty extension. C++17 forces sizeof >= 1 B
+  // since this is a member (not an EBO base), but no real bytes are
+  // claimed in the SHM layout for non-cluster variants.
+};
+
+template <typename Dims>
+struct cluster_shm_ext<Dims, true> {
+  using CoreDims = MoECoreDims<Dims>;
+
+  // ── Per-cluster current-expert post-SiLU activation tile ──────────────
+  // Shape: [T_TILE = 8 tokens] × [W_UP_COLS_WGMMA = 64 N-cols]
+  // Bytes: 8 * 64 * sizeof(fp8) = 512 B.
+  //
+  // Producer (R5.2): the up-block of intra-cluster rank `b` writes its
+  // contiguous 64-column N-stripe `[b * 64, (b + 1) * 64)` of the current
+  // expert's `[BS][N = 512]` post-SiLU activation matrix, with no
+  // inter-block stride — each up-block owns exactly one slab per expert.
+  // The Phase-3 epilogue writes this slab in place of the legacy
+  // `spec->temp_fp8` global-memory writeback (R5.9).
+  //
+  // Consumer (R5.3, R5.6): every down-block of the same cluster reads, at
+  // each Phase-4 K-step `kk ∈ [0, K_TILES_DOWN = 4)`, the slab of
+  // intra-cluster ranks `(2*kk, 2*kk + 1)` via DSHM (cluster-shared
+  // address space, translated by `mapa.shared::cluster.b64`); rank `2*kk`
+  // supplies the lower 64 K-cols and rank `2*kk + 1` the upper 64 K-cols
+  // of the K-step's `[BS = 8] × [128]` fp8 B-operand.
+  alignas(16)
+      AQ_element cluster_temp_fp8[CoreDims::T_TILE][CoreDims::W_UP_COLS_WGMMA];
+
+  // ── Per-cluster current-expert per-token activation scale slab ────────
+  // Shape: [T_TILE = 8 tokens]
+  // Bytes: 8 * sizeof(fp32) = 32 B.
+  //
+  // One fp32 scale per (token, 64-column block); each up-block owns
+  // exactly one 64-column block per expert (R5.4). The Phase-4
+  // down-projection fetches scales using the same `(2*kk, 2*kk + 1)`
+  // paired pattern as `cluster_temp_fp8` (R5.4): no scale is re-fetched
+  // from `spec->temp_act_scale` on the cluster path (R5.9).
+  alignas(16) S_element cluster_temp_act_scale[CoreDims::T_TILE];
+
+  // ── Path-(b) staging for the down-projection B-operand ────────────────
+  // Shape: [T_TILE = 8 tokens] × [K_STEP_WGMMA = 128 K-cols]
+  // Bytes: 8 * 128 * sizeof(fp8) = 1024 B.
+  //
+  // Each down-block, at each K-step, copies the two peer up-blocks'
+  // `cluster_temp_fp8` tiles (rank `2*kk` at column offset 0, rank
+  // `2*kk + 1` at column offset 64) into this local SHM slab via DSHM
+  // reads, then issues the WGMMA against the local slab (design §7.5,
+  // path b). This keeps the WGMMA descriptor encoding byte-identical to
+  // the existing TMA path — only the source pointer changes.
+  //
+  // Single-buffered: at most one K-step's B-operand is live per
+  // down-block at a time. Under-T_TILE producers are zero-filled in this
+  // staging area before the WGMMA (R5.7, R10.4), matching the semantics
+  // of the existing `zero_fill_unused_down_act_slots`.
+  alignas(16) AQ_element
+      cluster_down_b_staging[CoreDims::T_TILE][CoreDims::K_STEP_WGMMA];
+
+  // ── Path-(b) staged per-half scale slab for the down-projection ───────
+  // Shape: [2 halves] × [T_TILE = 8 tokens]
+  // Bytes: 2 * 8 * sizeof(fp32) = 64 B.
+  //
+  // Index 0 holds the lower-64-cols' scale half (from peer rank `2*kk`),
+  // index 1 the upper-64-cols' scale half (from peer rank `2*kk + 1`).
+  // Populated by the same DSHM-read-then-stage step as
+  // `cluster_down_b_staging`; consumed by the down-projection WGMMA
+  // dequant (R5.4).
+  alignas(16) S_element cluster_down_b_staging_scales[2][CoreDims::T_TILE];
+};
+
 // 1 tile per warp
 // 20 warps x 2 params x 1k = 20k pre-fetch
 template <typename Dims>
@@ -714,7 +887,18 @@ struct MoE_SHM {
                         [W_WGMMA_K];  // 32 KB (pre) / 64 KB (post Phase 2a)
       };
 
-      S_element a_down_scale[2][CoreDims::T_TILE][2];
+      S_element a_down_scale
+          [CoreDims::T_TILE]
+          [8];  // [tok][k_block_idx]
+                // Per-expert hoisted activation scales, indexed by
+                // `[tok][k_block_idx]` where `k_block_idx = s * 2 + half`
+                // (`s` ∈ [0, K_TILES_DOWN), `half` ∈ {0, 1} → K[0..63] vs
+                // K[64..127] of K-step `s`).  All scales for one expert are
+                // loaded in a single coalesced cp.async burst at the top of
+                // the expert loop, before the K-loop starts.  This replaces
+                // the previous per-K-step double-buffered load
+                // (`a_down_scale[2][T_TILE][2]`) which had the cp.async wait
+                // on the critical path of every K-step.
 
       static constexpr uint32_t W_DOWN_SCALE_COLS =
           shm_down_scale_cols<Dims>::value;
@@ -820,6 +1004,35 @@ struct MoE_SHM {
       // contribution".  Sized to `Dims::BS = 8` bytes — negligible
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
+
+      // ── Cluster-only SHM extension (R5.1, R5.2, R5.3, R5.4, R5.6, ──
+      //   R5.7, R5.9, R11.3; design §5.3 / §15.2)
+      //
+      // Lifetime  : single-buffered. Holds the current per-cluster
+      //             expert's Phase-3 output. The per-cluster expert loop
+      //             fully consumes one expert's slabs in Phase 4 (cluster
+      //             barrier at site #2, R6.1) before the next iteration
+      //             overwrites them, so one expert is in flight per
+      //             cluster at any instant (R5.5, R5.9).
+      // Visibility: peer-readable across the 8 blocks of one Hopper
+      //             thread block cluster via the cluster-shared address
+      //             space (PTX `mapa.shared::cluster.b64`, R5.6). The
+      //             owning block also sees the slab through the regular
+      //             shared state space view of the same physical SHM.
+      // Producer  : write-once-per-expert. The up-block of intra-cluster
+      //             rank `b` writes exactly one `[T_TILE]
+      //             [W_UP_COLS_WGMMA]` post-SiLU fp8 tile and one
+      //             `[T_TILE]` fp32 scale slab per expert (R5.2). The
+      //             cluster barrier at site #2 publishes the writes to
+      //             every peer down-block in the same cluster (R6.1,
+      //             R6.2). The down-projection epilogue / next-expert
+      //             iteration is the next legal writer for that block.
+      //
+      // For non-cluster TMA+WGMMA variants `use_cluster<Dims>::value`
+      // is false, this sub-struct is empty (sizeof == 1 B mandated by
+      // C++17 for embedded empty class members), so the existing layout
+      // is bytewise unaffected (R11.1, R11.3).
+      cluster_shm_ext<Dims> cluster_ext;
     } tiny_wgmma_tma;
 
     // BS64 path: holds weight tiles and partial results for down-projection

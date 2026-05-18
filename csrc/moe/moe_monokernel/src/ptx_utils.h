@@ -405,6 +405,109 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(
 #endif
 }
 
+// ── Hopper cluster-barrier helpers (sm_90a) ──────────────────────────────
+//
+// Thin PTX wrappers around the `barrier.cluster.*` family used to
+// rendezvous every block of a thread-block cluster (see
+// `__cluster_dims__(...)` launch annotation). The barrier has two
+// halves: an "arrive" issued by every block to mark its readiness, and
+// a "wait" that blocks until every block in the cluster has arrived.
+// Together they form a cluster-wide rendezvous, mirroring the
+// `cooperative_groups::cluster_group::sync()` semantics (design §8.2)
+// without pulling in `<cooperative_groups.h>`.
+//
+// Caller contract:
+//   - These helpers MUST be issued exactly once per block per call
+//     site (i.e. by every thread of every block executing this
+//     instruction; the `.aligned` PTX form requires uniform issue
+//     across the warp). Wrap call sites in code paths reached by the
+//     entire block.
+//   - The helpers are SM90+ only; on older targets the body collapses
+//     to `trap;` so misuse fails loudly rather than silently dropping
+//     the rendezvous.
+//   - The `"memory"` clobber prevents the compiler from reordering
+//     generic shared-memory loads/stores across the rendezvous, but
+//     does NOT establish proxy-async ordering for TMA / DSHM writes —
+//     callers that publish via the async-proxy path must sandwich the
+//     rendezvous with `fence.proxy.async.shared::cluster` (see
+//     design §7.2).
+//
+// References:
+//   - PTX ISA 8.5 §9.7.12.16 "barrier.cluster"
+//   - CUDA Hopper Tuning Guide §1.4.1.1 "Thread Block Clusters"
+
+/**
+ * @brief Cluster barrier — relaxed arrive (no SHM ordering).
+ *
+ * Emits: `barrier.cluster.arrive.relaxed.aligned;`
+ *
+ * Arrives at the cluster barrier WITHOUT publishing prior shared
+ * writes to peer blocks. Use only when the program has already
+ * issued an explicit `fence.proxy.async.shared::cluster` (or the
+ * cluster proxy is otherwise known to be in sync) and a "release
+ * arrive" would be redundant.
+ */
+__device__ static __forceinline__ void cluster_barrier_arrive_relaxed() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Cluster barrier — release arrive.
+ *
+ * Emits: `barrier.cluster.arrive.aligned;`
+ *
+ * Arrives at the cluster barrier with RELEASE semantics: prior
+ * generic shared-memory writes by THIS block are released to peer
+ * blocks observing them via cluster-shared addresses after their
+ * matching `cluster_barrier_wait()`. Use this on the producer side
+ * of site #2.
+ */
+__device__ static __forceinline__ void cluster_barrier_arrive() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.arrive.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Cluster barrier — acquire wait.
+ *
+ * Emits: `barrier.cluster.wait.aligned;`
+ *
+ * Waits for every block of the cluster to have issued a
+ * `cluster_barrier_arrive()` (or `cluster_barrier_arrive_relaxed()`).
+ * On exit, this block's subsequent loads from peer cluster-shared
+ * addresses observe peer writes that happened-before their
+ * `cluster_barrier_arrive()`. Use this on the consumer side of
+ * site #2.
+ */
+__device__ static __forceinline__ void cluster_barrier_wait() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Cluster sync (release-arrive then acquire-wait).
+ *
+ * Convenience wrapper matching `cooperative_groups::cluster_group::
+ * sync()` semantics (design §8.2). Used at site #2 between the
+ * Phase-3 producers and the Phase-4 consumers; see design §7.2 for
+ * the full fence sequence — this helper is the rendezvous in the
+ * middle of the fence sandwich.
+ */
+__device__ static __forceinline__ void cluster_sync() {
+  cluster_barrier_arrive();
+  cluster_barrier_wait();
+}
+
 // ── Hopper TMA bulk-tensor copy (sm_90a) ──────────────────────────────────
 //
 // Thin PTX wrapper around `cp.async.bulk.tensor.2d.shared::cta.global.tile.
@@ -485,6 +588,115 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc,
   (void)dst_smem;
   (void)bar_smem;
   asm volatile("trap;");
+#endif
+}
+
+// ── Hopper cluster-shared rank translation (sm_90a) ──────────────────────
+//
+// `map_shared_rank<T>` translates a generic pointer into a block-owned SHM
+// region into a generic pointer that aliases the **same offset** within a
+// peer block's SHM region — addressed through the *cluster-shared* state
+// space. This is the building block for distributed shared memory (DSHM)
+// reads/writes between blocks of a thread-block cluster.
+//
+// PTX semantics: the cluster-shared address space is a per-cluster view in
+// which every block's own SHM is mapped at a unique offset. The
+// `mapa.shared::cluster.u32` instruction takes a per-block shared u32 and
+// the destination block's intra-cluster rank, and returns the
+// cluster-shared u32 that aliases the same SHM offset on rank `r`.
+//
+// References:
+//   - PTX ISA 8.5 §9.7.13 "Asynchronous warpgroup ... cluster" (cluster
+//     shared address space, `mapa`).
+//   - CUDA C++ Programming Guide §10 "Thread Block Clusters", in particular
+//     `cooperative_groups::cluster_group::map_shared_rank`. The PTX
+//     wrapper here matches that API's signature so callers can swap one
+//     for the other without touching call sites; the local implementation
+//     keeps the kernel TU free of the `<cooperative_groups.h>` dependency.
+
+/**
+ * @brief Translate a local SHM pointer into a generic pointer that aliases
+ *        the SAME SHM offset on the peer block at intra-cluster rank
+ *        `rank`, addressed through the cluster-shared state space.
+ *
+ * Three-step PTX sequence (matches design §7.3 / §8.3):
+ *   1. `cvta.to.shared.u32`       — generic ptr → 32-bit shared-state-
+ *                                    space address (the per-block view of
+ *                                    the SHM offset).
+ *   2. `mapa.shared::cluster.u32` — block-shared u32 + rank → 32-bit
+ *                                    cluster-shared u32 that aliases the
+ *                                    same SHM offset on the peer block.
+ *   3. `cvta.shared.u64`          — cluster-shared u32 → generic 64-bit
+ *                                    pointer that ld/st instructions can
+ *                                    dereference directly.
+ *
+ * The returned pointer reads and writes through the cluster proxy — i.e.
+ * a load through it returns bytes in the peer block's SHM, and a store
+ * through it writes into the peer block's SHM. The HW cluster proxy is
+ * a separate proxy from the regular generic proxy, so callers MUST
+ * sandwich consumption of these reads with the
+ * `fence.proxy.async.shared::cluster` fence pair documented in design
+ * §7.2 (Wave 9), otherwise the writer's stores may not be visible to
+ * the reader.
+ *
+ * Calls into this helper are pure (no side effects) and may be hoisted
+ * out of inner loops by the compiler.
+ *
+ * Caller contract:
+ *   - `local` MUST point to SHM owned by the calling block (i.e. it
+ *     must be a valid generic pointer that `cvta.to.shared.u32`
+ *     resolves to a SHM offset). Pointers into global, constant, or
+ *     parameter state spaces produce undefined behavior (R5.6).
+ *   - `rank` MUST satisfy `rank ∈ [0, CLUSTER_SIZE)` for the launching
+ *     cluster (R5.6). `rank == own_block_rank` returns a pointer that
+ *     aliases the calling block's own SHM. `rank >= CLUSTER_SIZE` is
+ *     UNDEFINED BEHAVIOR per the PTX ISA spec for `mapa.shared::cluster`
+ *     and may produce a pointer that faults on dereference.
+ *   - Dereferencing the returned pointer is only well-defined while the
+ *     cluster is co-resident (i.e. between cluster launch and cluster
+ *     exit) AND while the SHM region addressed by `local` is live on
+ *     the peer block.
+ *
+ * @tparam T     Element type of the SHM region (e.g. `__nv_fp8_e4m3`,
+ *               `float`, `std::uint64_t`).
+ * @param local  Generic pointer to SHM owned by the calling block.
+ * @param rank   Intra-cluster rank of the destination block (0-based).
+ * @return       Generic pointer aliasing the peer block's SHM at the
+ *               same offset as `local` within its block.
+ */
+template <typename T>
+__device__ __forceinline__ T* map_shared_rank(T* local, std::uint32_t rank) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  // Step 1: generic ptr → 32-bit shared-state-space address.
+  // We reuse `cvta_to_shared_u32` (defined above): it issues
+  // `cvta.to.shared.u64` and truncates to u32 — the upper bits of any
+  // shared pointer are zero on SM90.  This avoids the non-existent
+  // `cvta.to.shared.u32` form that would otherwise fail PTXAS.
+  std::uint32_t local_addr = cvta_to_shared_u32(static_cast<void*>(local));
+  // Step 2: cluster-shared rank translation.  `mapa.shared::cluster.u32`
+  // takes a per-block shared u32 + the destination rank and returns the
+  // u32 cluster-shared address that aliases the same SHM offset on the
+  // peer block.
+  std::uint32_t cluster_addr;
+  asm("mapa.shared::cluster.u32 %0, %1, %2;\n"
+      : "=r"(cluster_addr)
+      : "r"(local_addr), "r"(rank));
+  // Step 3: cluster-shared u32 → generic 64-bit pointer.  PTX
+  // `cvta.shared.u64` operates on u64 register operands (despite shared
+  // addresses being only 32 bits wide), so we first zero-extend the
+  // cluster-shared u32 into a u64 via `cvt.u64.u32`, then issue
+  // `cvta.shared.u64`.  Using a u32 register as the source of
+  // `cvta.shared.u64` directly produces ptxas "Arguments mismatch".
+  std::uint64_t cluster_addr64;
+  asm("cvt.u64.u32 %0, %1;\n" : "=l"(cluster_addr64) : "r"(cluster_addr));
+  std::uint64_t peer_u64;
+  asm("cvta.shared.u64 %0, %1;\n" : "=l"(peer_u64) : "l"(cluster_addr64));
+  return reinterpret_cast<T*>(peer_u64);
+#else
+  (void)local;
+  (void)rank;
+  asm volatile("trap;");
+  return static_cast<T*>(nullptr);
 #endif
 }
 
