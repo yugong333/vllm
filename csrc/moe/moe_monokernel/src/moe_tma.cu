@@ -153,13 +153,26 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
 
 CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
                                         uint32_t num_experts, uint32_t K,
-                                        uint32_t N) {
+                                        uint32_t N, uint32_t row_box) {
   // SWIZZLE_128B down-weight descriptor.  The TMA hardware applies the
   // 8-row × 128-byte core-matrix XOR swizzle at write time, so the
   // caller MUST NOT pre-interleave the weight tensor — the raw
-  // row-major `[E, K, N]` fp8 tensor is expected.  `boxDim = (128, 128)`
-  // fetches one full 128×128 WGMMA weight tile in a single TMA issue
-  // (16 CUTLASS Major::K B128 atoms of 8×128 bytes each).
+  // row-major `[E, K, N]` fp8 tensor is expected.
+  //
+  // `row_box` controls how many output rows (= output cols of the
+  // down-proj) one TMA delivers:
+  //   * 128 — one 128×128 fp8 atom = 16 KB per TMA (legacy).
+  //   * 256 — two stacked 128×128 atoms = 32 KB per TMA (DOWN_COL_TILE
+  //     = 256 only).  Halves the issue count.
+  // The maximum legal value is 256 (TMA boxDim cap).  Both values
+  // produce the same canonical Major::K B128 SHM layout from the
+  // consumer's perspective; the WGMMA A descriptor still references a
+  // single 128-row sub-atom per WGMMA call.
+  TORCH_CHECK(row_box == 128u || row_box == 256u,
+              "create_down_weight_tma_desc: row_box must be 128 or 256, got ",
+              row_box);
+  TORCH_CHECK(K % row_box == 0, "create_down_weight_tma_desc: K=", K,
+              " must be a multiple of row_box=", row_box);
   //
   // Axis ordering: innermost = N (reduction), outer = flattened
   // `expert_id * K + output_row`.  This matches the down-proj GM
@@ -178,7 +191,7 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
   };
   uint32_t box_dim[kRank] = {
       /*N-inner*/ 128u,
-      /*rows   */ 128u,
+      /*rows   */ row_box,
   };
   uint32_t element_strides[kRank] = {1u, 1u};
 
@@ -193,7 +206,7 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
       res == CUDA_SUCCESS,
       "cuTensorMapEncodeTiled failed for down-projection weights: CUresult=",
       static_cast<int>(res), " (num_experts=", num_experts, ", K=", K,
-      ", N=", N, ")");
+      ", N=", N, ", row_box=", row_box, ")");
 
   return desc;
 }

@@ -37,11 +37,11 @@ namespace moe_monokernel {
  *   Phase 3: up-proj — streaming WGMMA with on-the-fly bf16→fp8
  *            quantize → SiLU → write bf16 to spec->temp_bf16
  *   grid.sync()
- *   Phase 4: down-proj — streaming WGMMA; each block writes a
- *            per-expert-group fp32 partial sum to
- *            spec->down_partial_out[group][tok][col]
+ *   Phase 4: down-proj — streaming WGMMA; each block atomicAdds
+ *            its fp32 partial sum into the single-buffer
+ *            spec->down_partial_out[tok][col]
  *   grid.sync()
- *   Phase 5: reduce across groups, write bf16 activations_out.
+ *   Phase 5: cast fp32 → bf16, write activations_out.
  *
  * 2 grid syncs total.
  */
@@ -69,6 +69,24 @@ __device__ void moe_kernel_topk_BS8(
   using CoreDims = MoECoreDims<Dims>;
 
   MONO_PHASE_TIMESTAMP(t_start);
+
+  // ── Zero-init the single-buffer `down_partial_out[BS][HIDDEN]` ─────
+  //
+  // Phase 4 atomicAdds into this buffer (one cell summed across 16
+  // blocks).  All 128 blocks zero a chunk in parallel; the up-proj
+  // expert_barrier (#2) acts as the cross-block visibility fence
+  // before any Phase-4 atomicAdd fires.
+  //
+  // The buffer was allocated with the legacy [DOWN_GROUPS][BS][HIDDEN]
+  // shape; we zero only the first `[BS][HIDDEN]` portion (= 64 KB)
+  // since that's all atomicAdd ever touches.
+  {
+    const uint32_t partial_n = Dims::BS * Dims::HIDDEN_STATES;
+    for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < partial_n;
+         i += blockDim.x * gridDim.x) {
+      spec->down_partial_out[i] = 0.f;
+    }
+  }
 
   // ── Phase 1: routing (topK) + greedy activation prefetch ───────────────
   // Phase 1 runs routing (topK / prepare_moe_topk) which writes
@@ -109,13 +127,13 @@ __device__ void moe_kernel_topk_BS8(
     mbarrier_init(&u_tma->bar_a[1], 1u);
     fence_mbarrier_init_release_cluster();
 
-#ifndef MONO_PROFILE_SKIP_PREFETCH
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     // Greedy Step A: activations are expert-independent, so fire the
     // k_start=0 TMA now — in parallel with routing — instead of waiting
     // for Phase 2.  The arm happens on the same thread that just did the
     // init, so no fence is required between them.
     //
-    // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching calc-
+    // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching calc-
     // warp wait on bar_a[0] inside the up-proj helper is also compiled
     // out so there is no spin-forever deadlock.  The calc warps read
     // garbage from the still-uninitialized `bf16_in[0]` slot and the
@@ -130,11 +148,11 @@ __device__ void moe_kernel_topk_BS8(
     // first bf16 tile is already in flight (greedy TMA above) and the
     // rest of priming runs inside the up-proj helper.
   } else {
-    // Routing is intentionally NOT guarded by MONO_PROFILE_SKIP_CALC:
+    // Routing is intentionally NOT guarded by MONO_PROFILE_SKIP_CALC_UP:
     // `shmem->expert_count` / `shmem->experts[e].id` drive the helper's
     // expert loop bounds and an uninitialized expert_count could be
     // anything from 0 to 2^32 (runaway loop).  The BS64 path handles
-    // MONO_PROFILE_SKIP_CALC the same way — `topK_BS64` and
+    // MONO_PROFILE_SKIP_CALC_{UP,DOWN} the same way — `topK_BS64` and
     // `prepare_moe_topk_BSx_Ey` run regardless; only the per-expert
     // QUANT / WGMMA / writeback work is compiled out.
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
@@ -240,10 +258,12 @@ __device__ void moe_kernel_topk_BS8(
   MONO_PHASE_TIMESTAMP(t_after_barrier2);
 
   // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
-  // Each block owns DOWN_COL_TILE=128 output cols; blocks partition
-  // into DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Each group
-  // writes a partial sum into spec->down_partial_out[group][tok][col];
-  // Phase 5 reduces across groups into activations_out (bf16).
+  // Each block owns DOWN_COL_TILE output cols; blocks partition into
+  // DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Every
+  // contributing block atomicAdds its partial sum into the SAME
+  // single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`; Phase 5
+  // reads each cell ONCE and casts to bf16 (no cross-group
+  // reduction).  The single-buffer is zero-initialized at kernel entry.
   //
   // The WGMMA down-projection function zeroes its own per-block
   // out_accum in SHM internally, so no pre-zero is needed here.
@@ -259,20 +279,20 @@ __device__ void moe_kernel_topk_BS8(
 
   // ── Site #3 — Col-stripe-local barrier (Phase 2b) ────────────────────
   //
-  // Phase 4 wrote `spec->down_partial_out[down_group_r][tok][col_stripe
-  // * DOWN_COL_TILE .. +DOWN_COL_TILE-1]`.  Phase 5 on block `b` reads
-  // every `down_group_r`'s partial at its own col stripe `b`, so its
-  // producer-set is exactly the `DOWN_GROUPS` blocks with
+  // Phase 4 atomicAdded into `spec->down_partial_out[tok][col_stripe *
+  // DOWN_COL_TILE .. +DOWN_COL_TILE-1]`.  Phase 5 on block `b` reads
+  // those cells at its own col stripe `b`, so its producer-set is
+  // exactly the `DOWN_GROUPS` blocks with
   // `blockIdx.x % DOWN_GRID == b`.  That sub-grid is also the arrival
   // set of `colstripe_barrier(col_stripe = b, arrival_count =
   // DOWN_GROUPS)`.  Every block (including those with
   // `down_group_r > 0` that don't enter Phase 5) calls the barrier to
-  // publish its Phase-4 write; the block with `blockIdx.x = b` is the
-  // Phase-5 writer and also the seed block (its ID == its col stripe).
+  // publish its Phase-4 atomicAdd; the block with `blockIdx.x = b` is
+  // the Phase-5 reader and also the seed block (its ID == its col
+  // stripe).
   //
   // Per-barrier atomic contention drops from 128 → 16; DOWN_GRID = 8
-  // independent col-stripe barriers run concurrently (Design "Site #3
-  // correctness argument", Requirements 9.7, 9.8).
+  // independent col-stripe barriers run concurrently.
   {
     const uint32_t col_stripe_id = blockIdx.x % MoECoreDims<Dims>::DOWN_GRID;
     moe_monokernel::colstripe_barrier(
@@ -284,10 +304,12 @@ __device__ void moe_kernel_topk_BS8(
 
   MONO_PHASE_TIMESTAMP(t_after_barrier3);
 
-  // ── Phase 5 (WGMMA): reduction + writeback ─────────────────────────
-  // Each block reads its own DOWN_COL_TILE output cols ×
-  // DOWN_GROUPS groups × Dims::BS tokens of fp32 partials from GM and
-  // sums across the DOWN_GROUPS dim into bf16 activations_out.
+  // ── Phase 5 (WGMMA): bf16 cast + writeback ─────────────────────────
+  // Each Phase-5 block reads its own DOWN_COL_TILE output cols ×
+  // Dims::BS tokens of fp32 sums (already accumulated by Phase 4
+  // atomicAdds across all DOWN_GROUPS contributing blocks) and casts
+  // them to bf16 in `activations_out`.  No cross-group reduction —
+  // the work is just a streaming load + cast + store.
   //
   // Block-to-col mapping mirrors Phase 4a: only blocks with
   // `blockIdx.x < DOWN_GRID` are responsible for writing (the first
@@ -296,61 +318,29 @@ __device__ void moe_kernel_topk_BS8(
   // `blockIdx.x % DOWN_GRID`, so we gate on the primary group
   // (down_group == 0) to avoid redundant writes.
   //
-  // Phase-2a layout alignment (software-grid-sync spec):
-  //   * Pre Phase 2a (BS8 TMA+WGMMA baseline): DOWN_COL_TILE=128,
-  //     DOWN_GRID=16, DOWN_GROUPS=8.  The inner `g` loop runs 8 times;
-  //     the primary-block col stripe covers 128 cols.
-  //   * Post Phase 2a (BS8 TMA+WGMMA only): DOWN_COL_TILE=256,
-  //     DOWN_GRID=8, DOWN_GROUPS=16.  The inner `g` loop now runs 16
-  //     times; the primary-block col stripe covers 256 cols.  Total
-  //     Phase-5 data read across all blocks is unchanged
-  //     (HIDDEN_STATES × BS tokens), but per-block runtime doubles —
-  //     compensated by halving the number of Phase-5 blocks.
-  //
-  //   Expressing the bounds via `CoreDims` (not hard-coded literals)
-  //   keeps BS64 / non-TMA variants on the 128-col layout.  The
-  //   `DOWN_GROUPS == UP_GROUPS` alignment is the prerequisite for the
-  //   Phase-2b Expert_Barrier at site #2 and the ColStripe_Barrier at
-  //   site #3 (replacing the two `grid_barrier` calls above).
+  // For the BS8 TMA+WGMMA path: DOWN_COL_TILE=256, DOWN_GRID=8,
+  // DOWN_GROUPS=16.  For BS64 / non-TMA: DOWN_COL_TILE=128,
+  // DOWN_GRID=16, DOWN_GROUPS=8.  Bounds expressed via `CoreDims` so
+  // both variants share this code.
   constexpr std::uint32_t DOWN_GRID_LOCAL = CoreDims::DOWN_GRID;
-  constexpr std::uint32_t DOWN_GROUPS_LOCAL = CoreDims::DOWN_GROUPS;
   constexpr std::uint32_t DOWN_COL_TILE_LOCAL = CoreDims::DOWN_COL_TILE;
   const std::uint32_t down_group_r = blockIdx.x / DOWN_GRID_LOCAL;
   const std::uint32_t down_block_idx_r = blockIdx.x % DOWN_GRID_LOCAL;
   const std::uint32_t base_col_r = down_block_idx_r * DOWN_COL_TILE_LOCAL;
 
   if (down_group_r == 0) {
-    const std::uint32_t group_stride_r = Dims::BS * Dims::HIDDEN_STATES;
-
-    // Sum the DOWN_GROUPS partials for tokens in [0, batch_size) and
-    // write bf16 to activations_out.
-    //
-    // Loading into a register array first (then summing) gives the
-    // compiler license to issue all `DOWN_GROUPS` loads as
-    // independent instructions, exposing parallelism the hardware can
-    // exploit even though each load has high HBM latency.  Without
-    // this, naive `sum += a[...]` introduces a sum-dependency chain
-    // that serialises the loads at the back-end.
+    // Phase 5 with atomicAdd writeback: read the SINGLE fp32 cell at
+    // `partial[tok][col]` (already the sum across all 16 contributing
+    // blocks via Phase-4 atomicAdds) and cast to bf16.  No DOWN_GROUPS
+    // dimension to reduce over — this is just a streaming
+    // load + cast + store.
     for (std::uint32_t flat = threadIdx.x;
          flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
       const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
       const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
       const std::uint32_t col = base_col_r + col_in_block;
-      const float* base_ptr =
-          spec->down_partial_out + tok * Dims::HIDDEN_STATES + col;
-
-      float vals[DOWN_GROUPS_LOCAL];
-#pragma unroll
-      for (std::uint32_t g = 0; g < DOWN_GROUPS_LOCAL; ++g) {
-        vals[g] = base_ptr[g * group_stride_r];
-      }
-
-      float sum = 0.f;
-#pragma unroll
-      for (std::uint32_t g = 0; g < DOWN_GROUPS_LOCAL; ++g) {
-        sum += vals[g];
-      }
-      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)sum;
+      const float v = spec->down_partial_out[tok * Dims::HIDDEN_STATES + col];
+      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)v;
     }
 
     // Zero out activations_out[tok] for tok in [batch_size, Dims::BS)
