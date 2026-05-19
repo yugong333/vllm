@@ -137,10 +137,15 @@ static_assert(
       /* Down-projection weight descriptor (SWIZZLE_128B).  Callers MUST       \
          NOT pre-interleave `expert_weights_down` — the TMA hardware         \
          applies the core-matrix XOR swizzle at write time and expects         \
-         the raw row-major `[E, K, N]` fp8 tensor. */                          \
+         the raw row-major `[E, K, N]` fp8 tensor.  `row_box` =                \
+         `DOWN_COL_TILE` so each TMA delivers one full M-tile per              \
+         128-K substep (16 KB at DOWN_COL_TILE=128, 32 KB at                   \
+         DOWN_COL_TILE=256), halving the issue count when the M tile           \
+         is 256 rows. */                                                       \
       down_weights_desc = create_down_weight_tma_desc(                         \
           reinterpret_cast<const void*>(expert_weights_down_ptr),              \
-          dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N);                    \
+          dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N,                     \
+          /*row_box=*/MoECoreDims<dims>::DOWN_COL_TILE);                       \
       /* Down-projection activation descriptor reads from `spec->temp_fp8`     \
          which lives inside the scratchpad.  Compute the device pointer        \
          from the scratchpad base + the compile-time offset of temp_fp8        \

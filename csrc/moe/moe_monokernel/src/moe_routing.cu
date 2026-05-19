@@ -360,8 +360,6 @@ __device__ void topK_BS64(uint32_t top_k, ScoringFunc scoring_func,
  *  - experts[0..expert_count-1].id  — ordered list of unique expert ids
  *    active in this batch (first_token/last_token are unused in BS8)
  *  - expert_count                   — number of unique experts
- *  - path.bs8.expert_ids            — same ids packed one-per-byte into
- *    a uint64, used by the prefetch warp to look up the next expert id
  *
  * Token-to-expert assignment is NOT sorted here. The per-expert loop in
  * moe_kernel_topk_BS8 scans topk_ids_flat directly for each token.
@@ -422,8 +420,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   //         expert_slot_start[eid]  = slot_offset + count_prefix[i]
   //     and for every active eid (count > 0) appends to experts[]:
   //         experts[active_offset + active_prefix[i]].id = eid
-  //   * Lane 0 reads back the first ≤ 8 active eids and packs them into
-  //     `path.bs8.expert_ids` (8 SHM reads on lane 0 only — negligible).
+  //   * Lane 0 publishes `expert_count` for downstream consumers.
   //
   // Phase C — Slot assignment      (Pass 3, register-fed)
   //   * Identical math: __match_any_sync intra-chunk rank + cross-chunk
@@ -591,18 +588,10 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   }
   __syncwarp();
 
-  // Lane 0 packs the first ≤ 8 active eids into path.bs8.expert_ids and
-  // publishes expert_count.  Reading back from `experts[]` after the
-  // __syncwarp() captures the global first-8 (not just lane-0's block),
-  // for 8 SHM loads on a single lane — negligible relative to the 64+
-  // SHM loads the old 1a/1c passes used to issue.
+  // Lane 0 publishes expert_count (used by downstream consumers in the
+  // up- and down-projection helpers, which iterate `shm->experts[e].id`
+  // directly for e ∈ [0, expert_count)).
   if (tid == 0) {
-    const uint32_t pack_n = (expert_count < 8u) ? expert_count : 8u;
-    uint64_t packed = 0;
-    for (uint32_t k = 0; k < pack_n; ++k) {
-      packed |= static_cast<uint64_t>(shm->experts[k].id) << (k * 8);
-    }
-    shm->path.bs8.expert_ids = packed;
     shm->expert_count = expert_count;
   }
 

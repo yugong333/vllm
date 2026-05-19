@@ -19,31 +19,37 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 //
-// Design Considerations
+// This file holds two down-projection paths sharing the same file:
 //
-// * The smallest matrix dimensions that the Tensor Cores support is 16 x 8 x K
-//   - 8 is a reasonable amount of input tokens we can process at once per
-//   expert,
-//     if there are <= 64 tokens and >= 16 experts.
-//   - Weight matrix is 5120 rows, distributed over 128 SMs, gives 40 rows/SM
-//   - run 2 MMA iterations with 16 rows each
-//   - duplicate the remaining 8 rows when running the 3rd iteration and filter
-//     the output (don't overwrite results of other SM!)
+//   * moe_down_projection_topk             (BS > 8, scalar / mma.sync,
+//                                            cp.async-based)
+//   * moe_down_projection_BS8_allexperts_wgmma_tma
+//                                          (BS <= 8, WGMMA + TMA + SWZ128)
 //
-// * Max. 220kB of the 224kB Shared Memory are available for matrix tiles
-//   - token/'temp' tiles are 32kB each, weight tiles are 40kB each
-//   - plenty to space for double buffering both: fetching the next tile of
-//   expert
-//     weights and / or token activations while processing the current one.
+// Design notes for the BS8 TMA+WGMMA path:
 //
-// * Reading matrix data from Shared Memory accesses the same columns in
-// different
-//   rows simultaneously.
-//   - kernel uses tile rows lengths with an extra 16 byte padding,
-//     mapping the same column for all 8 consecutive rows onto to different
-//     banks.
-//   - downside: prevents Global->Shared Memory transfers from being fully
-//   coalesced.
+// * Each block owns DOWN_COL_TILE = 256 output cols of one expert.  WG0
+//   covers M-rows [0..63] and WG1 covers [64..127] of each 128-row
+//   M-half via m64n8k32 WGMMAs.
+//
+// * Weight + activation tiles are loaded via cp.async.bulk.tensor.2d
+//   (TMA) into a double-buffered SHM slot and signalled through
+//   mbarriers.  The K-loop runs K_TILES_DOWN outer iterations of
+//   K_STEP_DOWN K-bytes each (= 4 inner 128-K substeps with separate
+//   scale-apply at every K=128 boundary for block-wise FP8).
+//
+// * Expert transitions overlap via inter-expert lookahead (the last
+//   K-step of expert e issues TMAs for expert e+DOWN_GROUPS into the
+//   slot that's about to be freed).
+//
+// * Weight + activation scales are tiny (≤ 256 B per expert) and
+//   loaded once per expert from prefetch warps 8 / 9 in parallel —
+//   no per-K-step scale fetch.
+//
+// * Phase-4 epilogue atomicAdds the per-block fp32 partial sum into
+//   a single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`;
+//   Phase 5 reads each cell once and casts to bf16.  No cross-group
+//   reduction.
 //
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -133,262 +139,96 @@ __device__ inline void moe_request_down_expert(
 }
 
 /**
- * @brief v1 streaming-pipeline WGMMA down-projection weight tile loader.
+ * @brief Per-expert activation-scale loader (down-projection, TMA path).
  *
- * Loads one 128-row × 128-K fp8 weight tile (= one K-step) of the
- * down-projection weight matrix into a SHM slot, laid out in canonical
- * WGMMA Major::K core-matrix format so the tile can be consumed without
- * swizzle.
+ * Loads ALL `T_TILE × (Dims::N / 64)` per-token activation scales for
+ * the current expert into `a_down_scale[tok][col_block]`.  Called ONCE
+ * per expert at the top of the per-expert loop, NOT per K-step.  This
+ * is the hoisted-out-of-K-loop variant: the K-loop's WGMMA scale-apply
+ * indexes `a_down_scale[tok][s * K_SUBSTEPS_DOWN * 2 + 2 * kk + half]`
+ * directly, removing the per-K-step cp.async + pipe drain that the
+ * older variant required.
  *
- * Unlike the up-projection (which interleaves gate/up halves in its
- * 128-row tile), the down-projection maps rows [0..127] of the tile
- * DIRECTLY to output cols `[base_col, base_col + 128)`.  There is no
- * gate/up split because the down-projection has no SiLU gate.
+ * Rank-indexing invariant (R11.3, R12.9):
+ *   `a_down_scale[rank][col_block]` must match the scale for the token
+ *   whose fp8 payload sits at `a_down_wgmma[slot][?][rank][kc][ki]`.
+ *   That fp8 payload is loaded by the bulk-per-expert TMA from GM rows
+ *   `[expert_slot_start[id], expert_slot_start[id] + routed_count)`
+ *   of `spec->temp_fp8`.  Those same rows were written by the Phase-3
+ *   up-proj epilogue at `dest_row = sorted_slot[pair] =
+ *   expert_slot_start[id] + rank`, alongside
+ *   `temp_act_scale[dest_row][...]` at the same row, so reading scales
+ *   from row `expert_slot_start[id] + rank` guarantees byte-level
+ *   alignment between the fp8 payload and its per-token scale.
  *
- * GM layout assumed: `expert_weights_down[E][HIDDEN_STATES][N]` fp8,
- * where:
- *   - axis 0 = expert id,
- *   - axis 1 = down-proj output col (= the WGMMA A-operand M row),
- *   - axis 2 = K (down-proj inner dim, size `Dims::N`).
+ * Thread mapping:
+ *   - Gated to prefetch warp `RUN_PW` (one of 0..3 = warps 8..11).
+ *   - Within that warp, lanes 0..(T_TILE * (N/64) - 1) each load one
+ *     scale.  For Qwen3.5 (T_TILE=8, N/64=8): 64 lanes — but we only
+ *     have 32 in a warp, so each lane does TWO loads via a stride-32
+ *     loop.  Tiny work either way (≤256 B per expert).
  *
- * The M row `m` in `[0, 128)` of the SHM tile corresponds to global
- * weight row `base_col + m`.  The K index `k` in `[0, 128)` corresponds
- * to global K column `k_start + k`.
+ * @tparam Dims         MoE dims.
+ * @tparam ScaleTok     Must be T_TILE (8).
+ * @tparam ScaleHalves  Must be Dims::N / 64.
+ * @tparam RunPw        Prefetch-warp gate (0..3).  Use 0 for warp 8,
+ *                      1 for warp 9, etc.
+ * @param spec          Global scratchpad (reads `temp_act_scale`).
+ * @param shmem         SHM struct (reads `expert_routed_count`,
+ *                      `expert_slot_start`).
+ * @param id            Current expert id.
+ * @param dest_scale    SHM `a_down_scale[T_TILE][N/64]`.
  *
- * SHM layout written (canonical Major::K, zero swizzle):
- *   byte_off(m, k) = m_outer * 1024 + k_outer * 128
- *                  + m_inner *   16 + k_inner
- * with `m_outer = m / 8`, `m_inner = m % 8`,
- *      `k_outer = k / 16`, `k_inner = k % 16`.
- *
- * Total tile size: 16 (m_outer) × 8 (k_outer) = 128 core matrices
- *                  × 128 B = 16 384 B = 16 KB — exactly one slot of
- *                  `w_down_wgmma[2][128][128]`.
- *
- * Thread distribution: 128 prefetch threads, each thread owns one
- * destination row (`dst_row = pflat = pw * 32 + thread`) and issues
- * 8 × 16-byte cp.async transfers striding over `k_outer in [0, 8)`.
- *
- * @tparam Dims        MoE dims.
- * @tparam DestRows    Must be 128.
- * @tparam DestCols    Must be K_STEP_WGMMA (128).
- * @param  source      GM pointer [E, HIDDEN_STATES, N] fp8 down weights.
- * @param  id          Expert index.
- * @param  base_col    First output col of this block's M stripe (multiple
- *                     of 128).
- * @param  k_start     Starting K column of this tile (multiple of 128).
- * @param  dest        SHM tile [128][128] fp8.
- * @param  pipe        Async-copy pipeline.
- *
- * @note Prefetch-warp only.  Must be followed by `pipe.producer_commit()`
- *       and a consumer wait before WGMMA reads `dest`.
+ * @note Prefetch-warp only.  Caller MUST ensure a `__syncthreads()`
+ *       before the K-loop reads `a_down_scale`.
  */
-template <typename Dims, std::size_t DestRows, std::size_t DestCols>
-__device__ inline void moe_load_down_wgmma_weight_tile(
-    const W_element* __restrict__ source, std::uint32_t id,
-    std::uint32_t base_col, std::uint32_t k_start,
-    W_element (&dest)[DestRows][DestCols],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
-  using CoreDims = MoECoreDims<Dims>;
-  static_assert(DestRows == 128,
-                "down-proj streaming WGMMA weight tile must be 128 rows");
-  static_assert(DestCols == 128,
-                "down-proj streaming WGMMA weight tile must be 128 K-values");
-
-  constexpr unsigned CHUNK_B = 16;
-  constexpr unsigned CHUNK_ELEMS = CHUNK_B / sizeof(W_element);  // 16
-  constexpr unsigned K_CHUNKS_PER_ROW = DestCols / CHUNK_ELEMS;  // 8
-
-  // Only prefetch warps issue the cp.async. 128 threads = 4 warps × 32.
-  const unsigned thread = get_thread<Dims>();
-  const unsigned pw = get_prefetch_warp<Dims>();  // 0..3
-  const unsigned pflat = pw * 32 + thread;        // 0..127 — one row each
-
-  // GM base: axis-0 stride is `HIDDEN_STATES * N`, axis-1 stride is `N`
-  // (K is innermost).  Cast to OpaqueElement (uint32_t) for alignment-
-  // guaranteed 16-byte copies, same trick as the up-proj loader.
-  const OpaqueElement* weights =
-      (const OpaqueElement*)(source + id * Dims::HIDDEN_STATES * Dims::N);
-
-  pipe.producer_acquire();
-  if (pflat < 128) {
-    const unsigned dst_row = pflat;
-    const unsigned m_outer = dst_row / 8;  // 0..15
-    const unsigned m_inner = dst_row % 8;  // 0..7
-
-    // Down-proj: rows [0..127] of the tile map directly to output cols
-    // [base_col, base_col + 128).  No gate/up split — this is the key
-    // difference from the up-projection.
-    const unsigned global_row = base_col + dst_row;
-
-    OpaqueElement* dest_oe = (OpaqueElement*)&dest[0][0];
-
-  #pragma unroll
-    for (unsigned k_outer = 0; k_outer < K_CHUNKS_PER_ROW; ++k_outer) {
-      const unsigned k_col = k_outer * CHUNK_ELEMS;
-      // Canonical byte offset into the SHM tile:
-      //   m_outer * 1024 + k_outer * 128 + m_inner * 16
-      const unsigned byte_off =
-          m_outer * 1024 + k_outer * 128 + m_inner * CHUNK_B;
-      const unsigned dest_chunk_idx = byte_off / sizeof(OpaqueElement);
-      // GM byte offset: global_row * N + (k_start + k_col), with K stride
-      // of `N` (not `HIDDEN_STATES`, since down-proj weight axis 2 is K).
-      copy128(dest_oe[dest_chunk_idx],
-              weights[(global_row * Dims::N + k_start + k_col) /
-                      sizeof(OpaqueElement)],
-              pipe);
-    }
-  }
-  pipe.producer_commit();
-}
-
-/**
- * @brief Streaming-pipeline WGMMA down-projection per-token activation
- *        scale loader.
- *
- * Loads the 2 per-token per-64-col fp32 activation scales that apply to
- * one K-step of the down-projection, for all 8 SHM slot rows.  The fp8
- * activation payload itself is loaded separately by
- * `tma_load_down_wgmma_activation_bulk` (TMA + SWZ128) — this helper is
- * scales-only.
- *
- * The down-proj B operand is the fp8 quantized SiLU output produced by
- * the up-proj epilogue.  Each (token, expert) pair that routes through
- * this expert has a dedicated row in
- * `spec->temp_fp8[TEMP_ROWS_TMA][N]` at index `sorted_slot[pair] =
- * expert_slot_start[id] + rank`.  Scales for those same rows live in
- * `spec->temp_act_scale[row][col]` with `col = s * 2 + half`.
- *
- * Thread distribution (128 prefetch threads):
- *   threads 0..15  : each load one scale (8 tok × 2 halves) from GM.
- *   threads 16..127: idle.
- *
- * @tparam Dims       MoE dims.
- * @param  spec       Global scratchpad (reads `spec->temp_act_scale`).
- * @param  shmem      Shared-memory struct (for `expert_routed_count` /
- *                    `expert_slot_start`).
- * @param  id         Expert id currently being processed.
- * @param  top_k      Number of experts per token (unused; retained for
- *                    signature parity).
- * @param  batch_size Number of real tokens (unused; retained for
- *                    signature parity).
- * @param  k_start    Starting K column of this tile (multiple of 128;
- *                    unused; retained for signature parity).
- * @param  s          K-step index within the expert's K-loop
- *                    (in [0, K_TILES_DOWN=4) ).  Selects which pair
- *                    of 64-col scales to load for each token.
- * @param  dest_act   SHM fp8 activation tile — unused here (populated
- *                    by the TMA path); retained for signature parity
- *                    with earlier cp.async loaders.
- * @param  dest_scale SHM per-token scales [8 tok][2 halves] fp32.
- * @param  pipe       Async-copy pipeline.
- *
- * @note Prefetch-warp only.  Must be followed by `pipe.producer_commit()`
- *       and a consumer wait before WGMMA reads the activation slab (the
- *       WGMMA barrier is the TMA's `bar_a[slot]`, not this pipe).
- *
- * @note The 2 scale values per token cover K[0..63] and K[64..127] of
- *       the current K-step.  Up-proj epilogue writes one scale per
- *       (virtual_row, up_block_idx) with up_block_idx == 64-col index
- *       along N; so `spec->temp_act_scale[vr * (N/64) + (s*2 + half)]`
- *       addresses the scale for K[half*64 .. half*64+63] of this step.
- */
-template <typename Dims, std::size_t DestTok, std::size_t DestChunks,
-          std::size_t DestKInner, std::size_t ScaleTok, std::size_t ScaleHalf>
-__device__ inline void moe_load_down_wgmma_activation_tile(
+template <typename Dims, std::size_t ScaleTok, std::size_t ScaleHalves,
+          unsigned RunPw = 0u>
+__device__ inline void moe_load_down_wgmma_act_scale_per_expert(
     const MoEGemmSpec<Dims>* __restrict__ spec,
     const MoE_SHM<Dims>* __restrict__ shmem, std::uint32_t id,
-    std::uint32_t top_k, std::uint32_t batch_size, std::uint32_t k_start,
-    std::uint32_t s, AQ_element (&dest_act)[DestTok][DestChunks][DestKInner],
-    S_element (&dest_scale)[ScaleTok][ScaleHalf],
-    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+    S_element (&dest_scale)[ScaleTok][ScaleHalves]) {
   using CoreDims = MoECoreDims<Dims>;
-  static_assert(DestTok == CoreDims::T_TILE,
-                "down-proj activation tile must have T_TILE=8 tokens");
-  static_assert(DestChunks == 8,
-                "down-proj activation tile must have 8 K-chunks per token");
-  static_assert(DestKInner == 16,
-                "down-proj activation tile must have 16 fp8 K-bytes per chunk");
   static_assert(ScaleTok == CoreDims::T_TILE,
                 "down-proj activation scale tile must have T_TILE=8 tokens");
-  static_assert(ScaleHalf == 2,
-                "down-proj activation scale tile must have 2 halves per token");
-  static_assert(sizeof(AQ_element) == 1, "AQ_element (fp8) must be 1 byte");
+  static_assert(ScaleHalves == Dims::N / 64u,
+                "down-proj activation scale tile must have N/64 halves "
+                "per token (one per per-64-col up-block, full reduction "
+                "dim)");
 
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-  constexpr unsigned ACT_BLOCK = 64;  // per-64-col up-block size
-  constexpr unsigned SCALE_COLS = Dims::N / ACT_BLOCK;  // N/64
-  (void)MAX_TOPK;
-  (void)top_k;
-  (void)batch_size;
-  (void)k_start;
-  (void)dest_act;
+  constexpr unsigned ACT_BLOCK = 64;                    // per-64-col up-block
+  constexpr unsigned SCALE_COLS = Dims::N / ACT_BLOCK;  // = ScaleHalves
 
   const unsigned thread = get_thread<Dims>();
   const unsigned pw = get_prefetch_warp<Dims>();  // 0..3
-  const unsigned pflat = pw * 32 + thread;        // 0..127
 
-  pipe.producer_acquire();
+  if (pw != RunPw) return;
 
-  // ── fp8 payload: loaded by the Phase-4 TMA launcher ───────────────────
-  //
-  // The fp8 payload is loaded by `tma_load_down_wgmma_activation_bulk`
-  // (plus the cooperative zero-fill for unused slots); this helper only
-  // handles the scale loader below.
+  // Cache routed_count / expert_start once per thread (cheap broadcast).
+  const auto* tma_shm = &shmem->u.tiny_wgmma_tma;
+  const uint32_t routed_count =
+      static_cast<uint32_t>(tma_shm->expert_routed_count[id]);
+  const uint32_t expert_start =
+      static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
 
-  // ── Per-token activation scales: 16 fp32 values total (8 tok × 2) ─────
-  //
-  // Destination index is `rank` — the intra-expert SHM slot position
-  // produced by the Phase-3→4 expert-sorted reorganization (spec R11).
-  // Source row in `spec->temp_act_scale` is
-  // `expert_slot_start[id] + rank`.
-  //
-  // Rank-indexing invariant (R11.3, R12.9):
-  //   `a_down_scale[slot][rank][half]` must match the scale for the
-  //   token whose fp8 payload sits at
-  //   `a_down_wgmma[slot][rank][kc][ki]`.  That fp8 payload is loaded
-  //   by the bulk-per-expert TMA (R2) from GM rows
-  //   `[expert_slot_start[id], expert_slot_start[id] + routed_count)`
-  //   of `spec->temp_fp8`.  Those same rows were written by the
-  //   Phase-3 up-proj epilogue at
-  //   `dest_row = sorted_slot[pair] = expert_slot_start[id] + rank`.
-  //   The epilogue also writes `temp_act_scale[dest_row][...]` at the
-  //   same row (R11.4), so reading scales from row
-  //   `expert_slot_start[id] + rank` guarantees byte-level alignment
-  //   between the fp8 payload and its per-token scale.
-  //
-  // Threads 0..15 each load one scale (8 tok × 2 halves).
-  if (pflat < DestTok * ScaleHalf) {
-    const unsigned slot_row = pflat / ScaleHalf;  // 0..7
-    const unsigned half = pflat % ScaleHalf;  // 0..1 (K[0..63] or K[64..127])
-
-    // `tiny_wgmma_tma` is the TMA union variant (byte-identical to
-    // `tiny_wgmma` plus 32 B of mbarriers at the tail);
-    // `expert_routed_count` and `expert_slot_start` were populated by
-    // the Phase-1/2 routing-prep extension.
-    const auto* tma_shm = &shmem->u.tiny_wgmma_tma;
-    const uint32_t routed_count =
-        static_cast<uint32_t>(tma_shm->expert_routed_count[id]);
-    const uint32_t expert_start =
-        static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
+  // Strided loop over the (slot_row, half) plane.  Total entries =
+  // T_TILE * SCALE_COLS = 8 * 8 = 64 for Qwen3.5; one warp's 32 lanes
+  // do 2 loads each (stride 32).
+  constexpr unsigned TOTAL = (unsigned)(ScaleTok * ScaleHalves);
+  for (unsigned i = thread; i < TOTAL; i += 32u) {
+    const unsigned slot_row = i / SCALE_COLS;  // 0..T_TILE-1
+    const unsigned half = i % SCALE_COLS;      // 0..ScaleHalves-1
 
     if (slot_row < routed_count) {
-      // Source row in temp_act_scale matches the reorganized layout
-      // (see invariant above).
       const uint32_t source_row = expert_start + slot_row;
-      const uint32_t scale_col = s * 2 + half;
       dest_scale[slot_row][half] =
-          spec->temp_act_scale[source_row * SCALE_COLS + scale_col];
+          spec->temp_act_scale[source_row * SCALE_COLS + half];
     } else {
-      // Unused SHM slot in the rank-indexed layout.  Its fp8 payload
-      // is zero-filled by `zero_fill_unused_down_act_slots`, so the
-      // scale value is irrelevant; write 0 to avoid NaN propagation
-      // through the scale-apply multiply.
+      // Unused rank — see preamble in the BS8 down-proj kernel for
+      // why the value doesn't matter.  Set to 0 for cleanliness.
       dest_scale[slot_row][half] = 0.f;
     }
   }
-
-  pipe.producer_commit();
 }
 
 /**
@@ -461,7 +301,13 @@ __device__ inline void moe_load_down_wgmma_weight_scale_tile(
   // For the canonical layout (`base_col` multiple of 128) these two
   // indices are equal.  Computing them independently keeps the loader
   // correct if a future config picks a non-multiple-of-128 base_col.
-  if (pw == 0 && thread < DestRows * COLS) {
+  //
+  // Run on prefetch warp 1 (= block warp 9).  The matching activation
+  // scale loader (`moe_load_down_wgmma_act_scale_per_expert`) runs on
+  // prefetch warp 0 (= block warp 8) — both at the top of the
+  // per-expert loop — so the two scale loads issue in parallel on
+  // independent warps instead of serializing on warp 8 alone.
+  if (pw == 1 && thread < DestRows * COLS) {
     const uint32_t wg = thread / COLS;  // 0..1
     const uint32_t cb = thread % COLS;  // col-block index in [0, COLS)
     const uint32_t weight_row = base_col + (wg == 0 ? 0u : 64u);
@@ -649,13 +495,6 @@ __device__ inline void moe_down_mult_fp8(
       float as_02 = store_row0 ? act_block_scales_all[tok_02][n_block] : 0.f;
       float as_13 = store_row1 ? act_block_scales_all[tok_13][n_block] : 0.f;
 
-  #if 0  // disabled — too verbose
-      if (blockIdx.x == 0 && threadIdx.x == 0 && w_row == 0 && warp == 0 && tok_02 == 0) {
-        printf("[DBG MMA t0 bc=%u] md0=%.4f md1=%.4f md2=%.4f md3=%.4f ws=%.6f as_02=%.6f as_13=%.6f\n",
-               base_col, md0, md1, md2, md3, ws, as_02, as_13);
-      }
-  #endif
-
       d0 += md0 * ws * as_02;
       d1 += md1 * ws * as_13;
       d2 += md2 * ws * as_02;
@@ -670,13 +509,6 @@ __device__ inline void moe_down_mult_fp8(
       partial_result[w_row / 2 + warp][thread + 32] = d1;
       partial_result[w_row / 2 + warp][thread + 96] = d3;
     }
-
-  #if 0  // disabled — too verbose
-    if (blockIdx.x == 0 && threadIdx.x == 0 && w_row == 0 && tok_02 == 0) {
-      printf("[DBG MMA_FINAL t0 w_row=0 warp=%u] d0=%.4f d1=%.4f d2=%.4f d3=%.4f (stored? s0=%d s1=%d)\n",
-             warp, d0, d1, d2, d3, (int)store_row0, (int)store_row1);
-    }
-  #endif
   }
 }
 
@@ -728,7 +560,7 @@ __device__ inline void moe_down_projection_topk(
 
   // Prime: prefetch first expert's weights + first token tile (bf16)
   if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
     pipe.producer_acquire();
     moe_request_down_expert<Dims>(expert_weights_down, expert_scales_down,
                                   first_expert.id, shm, 0, pipe);
@@ -786,7 +618,7 @@ __device__ inline void moe_down_projection_topk(
   #endif
 
       if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         // Prefetch next tile while calc warps quantize + MMA
         pipe.producer_acquire();
         if (e + 1 < expert_count && a_row == 0) {
@@ -805,7 +637,7 @@ __device__ inline void moe_down_projection_topk(
         pipe.producer_commit();
   #endif
       } else {
-  #ifndef MONO_PROFILE_SKIP_CALC
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
         // ── Calc warps: quantize bf16 → fp8 ──────────────────────────────
         // Each calc warp handles one or more tokens.
         // Per-block (1, 128) quantization: each 128-element block gets its
@@ -884,7 +716,7 @@ __device__ inline void moe_down_projection_topk(
 
       // ── MMA: fp8 weights × fp8 activations ────────────────────────────
       if (!is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_CALC
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
         static_assert(CoreDims::W_DOWN_TILE % 8 == 0);
 
         // D-output mapping (m16n8k32):
@@ -918,7 +750,7 @@ __device__ inline void moe_down_projection_topk(
       // D-mapping: d0/d2 → sorted_row0 = (t%4)*2, d1/d3 → sorted_row1
       unsigned sorted_row0 = expert.first_token + a_row + (thread % 4) * 2;
       unsigned sorted_row1 = sorted_row0 + 1;
-  #ifndef MONO_PROFILE_SKIP_CALC
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
       moe_down_reduction_topk<Dims>(shm->partial_result,
                                     sorted_row0 < expert.last_token,
                                     sorted_row1 < expert.last_token,
@@ -995,10 +827,17 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   (void)expert_weights_down;
 
   // ── Compile-time constants ────────────────────────────────────────────
-  constexpr std::uint32_t K_TILE_W = CoreDims::K_TILE_WGMMA;              // 32
-  constexpr std::uint32_t K_STEP_DOWN = CoreDims::K_STEP_WGMMA;           // 128
-  constexpr std::uint32_t WGMMAS_PER_STEP_DOWN = K_STEP_DOWN / K_TILE_W;  // 4
-  constexpr std::uint32_t K_TILES_DOWN = Dims::N / K_STEP_DOWN;           // 4
+  constexpr std::uint32_t K_TILE_W = CoreDims::K_TILE_WGMMA;    // 32
+  constexpr std::uint32_t K_STEP_DOWN = CoreDims::K_STEP_DOWN;  // 128 or 256
+  // K_STEP_WGMMA is the inner SWZ128 atom K-width (always 128).  Each
+  // outer K-step packs K_SUBSTEPS_DOWN = K_STEP_DOWN / K_STEP_WGMMA
+  // 128-K sub-blocks; the WGMMA loop chains 4 m64n8k32 instructions
+  // per sub-block (lo+hi pair around the 128-K block-wise scale
+  // boundary).
+  constexpr std::uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;         // 128
+  constexpr std::uint32_t K_SUBSTEPS_DOWN = CoreDims::K_SUBSTEPS_DOWN;   // 1/2
+  constexpr std::uint32_t WGMMAS_PER_SUBSTEP = K_STEP_WGMMA / K_TILE_W;  // 4
+  constexpr std::uint32_t K_TILES_DOWN = Dims::N / K_STEP_DOWN;          // N/K
   constexpr std::uint32_t DOWN_COL_TILE =
       CoreDims::DOWN_COL_TILE;                                  // 128 or 256
   constexpr std::uint32_t DOWN_GRID = CoreDims::DOWN_GRID;      // 16 or 8
@@ -1020,17 +859,28 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   static_assert(DOWN_COL_HALVES <= 2u,
                 "DOWN_COL_TILE > 256 not supported by the Phase-2a "
                 "two-halves WGMMA structure.");
-  // Per-K-step weight TMA transfer size.  Each half is a 128×128 fp8
-  // tile = 16384 B; HALVES halves stack along the M axis into
-  // `w_down_wgmma[slot][0..DOWN_COL_TILE-1]`.
+  // Per-K-step weight TMA transfer size.  Each 128×128 fp8 atom is
+  // 16384 B; an outer K-step issues
+  //   `DOWN_COL_HALVES * K_SUBSTEPS_DOWN`
+  // such atoms total — `DOWN_COL_HALVES` along the M axis × the
+  // `K_SUBSTEPS_DOWN` 128-K sub-blocks that make up one outer step —
+  // stacking them along the M axis as contiguous 128-row SWZ128 atoms.
   constexpr std::uint32_t DOWN_W_TX_BYTES_PER_HALF = 16384u;
   constexpr std::uint32_t DOWN_W_TX_BYTES_TOTAL =
-      DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES;  // 16384 or 32768
+      DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES *
+      K_SUBSTEPS_DOWN;  // 16384 * halves * substeps
+  // Per-K-step activation TMA transfer size.  Each 1024-B SWZ128 atom
+  // covers one 128-K sub-block; an outer K-step issues
+  // `K_SUBSTEPS_DOWN` such atoms back-to-back along the K axis.
+  constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL = 1024u * K_SUBSTEPS_DOWN;
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
   static_assert(Dims::N % K_STEP_DOWN == 0,
-                "Dims::N must be a multiple of K_STEP_DOWN=128");
+                "Dims::N must be a multiple of K_STEP_DOWN");
+  static_assert(K_STEP_DOWN % K_STEP_WGMMA == 0,
+                "K_STEP_DOWN must be a multiple of K_STEP_WGMMA (=128, the "
+                "SWZ128 atom K-width)");
 
   // A descriptor strides for the 128×128 fp8 weight tile under
   // SWIZZLE_128B.  The TMA hardware applies the 8-row × 128-byte
@@ -1075,11 +925,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   const std::uint32_t down_group = blockIdx.x / DOWN_GRID;
   const std::uint32_t down_block_idx = blockIdx.x % DOWN_GRID;
   const std::uint32_t base_col = down_block_idx * DOWN_COL_TILE;
-
-  // `pipe` is retained for the activation-scale cp.async path: the fp8
-  // weight / activation tiles are loaded via TMA + mbarrier, not via
-  // `pipe`.
-  cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
   // ── Per-thread fp32 accumulators ──────────────────────────────────────
   // One m64n8k32 WGMMA holds 4 fp32 accumulators per thread (d0/d1/d2/d3).
@@ -1144,6 +989,18 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
   const std::uint32_t expert_count = shmem->expert_count;
 
+  // Per-slot mbarrier parity state.  Hoisted OUT of the expert loop so
+  // it stays continuously synced with the bar_{w,a}[slot] hardware
+  // phase across expert transitions.  Resetting to 0 every expert is
+  // only correct when each slot is visited an even number of times per
+  // expert (so the bar returns to phase 0); for K_STEP_DOWN=256 with
+  // K_TILES_DOWN=2 each slot is visited exactly once per expert and
+  // ends at phase 1, so a blind reset would deadlock the next
+  // expert's `try_wait_parity(0)` call.  Keeping this state continuous
+  // works for ANY K_TILES_DOWN, and adds zero cost.
+  std::uint32_t parity_w[2] = {0u, 0u};
+  std::uint32_t parity_a[2] = {0u, 0u};
+
   // ── Per-expert loop (expert_start = down_group, stride = DOWN_GROUPS) ─
   for (std::uint32_t e = down_group; e < expert_count; e += DOWN_GROUPS) {
     const std::uint32_t id = shmem->experts[e].id;
@@ -1156,12 +1013,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     const std::uint32_t expert_start =
         static_cast<std::uint32_t>(shm->expert_slot_start[id]);
 
-    // Per-slot parity state.  MUST be reset every expert because the
-    // slot re-load on a new expert invalidates the previous expert's
-    // parity state (R4.7).
-    std::uint32_t parity_w[2] = {0u, 0u};
-    std::uint32_t parity_a[2] = {0u, 0u};
-
     // Reset per-expert `final_d` accumulator.
   #pragma unroll
     for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
@@ -1171,118 +1022,166 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
     }
 
-    // ── Load weight scales ─────────────────────────────────────────────
-    // Weights scales are fixed across K-steps, so we only load them
-    // once per expert.  Loaded via cp.async from the prefetch warps —
-    // not TMA.
+    // ── Load weight scales + per-expert activation scales (parallel) ───
+    // Both scale tensors are fixed across K-steps for this expert, so
+    // we load them once per expert at the top of the per-expert loop.
     //
-    // Phase-2a layout alignment: with DOWN_COL_HALVES halves per block,
-    // the two halves occupy different 128-row scale blocks (half 0 at
-    // row-block `base_col/128`, half 1 at `base_col/128 + 1`).  We load
-    // each half's scales into `w_down_scale[h][wg][cb]` — reusing the
-    // existing double-buffer dimension (never double-used for scales;
-    // they're loaded once per expert) as the half index.
+    // Weight scales: warp 9 (RunPw=1, see helper for rationale).
+    //   Loaded via plain SHM stores from the GM pointer; each `h` call
+    //   covers a 128-row M-block × full K (= W_DOWN_SCALE_COLS=N/128
+    //   col-blocks).
+    //
+    // Activation scales: warp 8 (RunPw=0).  Loaded as a per-expert
+    //   tile of `T_TILE × (N/64)` fp32 (= 256 B for Qwen3.5).  Hoisted
+    //   out of the K-loop so the WGMMA scale-apply reads the full set
+    //   from SHM with `a_down_scale[tok][s * K_SUBSTEPS_DOWN * 2 + 2 *
+    //   kk + half]` indexing — no per-K-step reload.
+    //
+    // Both loaders run inside `if (is_prefetch_warp<Dims>())`; their
+    // `RunPw` template arg routes the actual stores onto the correct
+    // single warp, so warps 8 and 9 issue in parallel on independent
+    // SM sub-schedulers.
     if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
     #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         moe_load_down_wgmma_weight_scale_tile<Dims>(
             expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
       }
+      moe_load_down_wgmma_act_scale_per_expert<Dims, CoreDims::T_TILE,
+                                               Dims::N / 64u, /*RunPw=*/0u>(
+          spec, shmem, id, shm->a_down_scale);
   #endif
     }
 
     // ── Priming: prefetch slot 0 (w + a + a_scale for K-step 0) ────────
+    //
+    // First-iteration priming only.  For e > down_group, the previous
+    // expert's last-K-iteration in-loop launcher already issued the
+    // INTER-EXPERT LOOKAHEAD TMAs into slot 0 (see the launcher's
+    // `else if (e + DOWN_GROUPS < expert_count)` branch below), so we
+    // skip the weight + activation TMA arm/issue here — only the
+    // weight scales (cheap cp.async, no bar) and the activation
+    // scales (also cp.async, separate `pipe`) need fresh loads per
+    // expert.
     //
     // The fp8 weight and activation tiles land via
     // `cp.async.bulk.tensor.2d` issued by the launcher thread, with
     // completion signalled on `bar_w[0]` / `bar_a[0]`.  The activation
     // scale tile loads via cp.async through `pipe`.
     //
-    // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching
+    // Compiled out under MONO_PROFILE_SKIP_PREFETCH_DOWN; the matching
     // compute-side `mbarrier_try_wait_parity` on bar_{w,a}[0] inside
     // the K-loop below is also compiled out so there is no
     // spin-forever deadlock.
-    if (is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+    const bool need_first_expert_prime = (e == down_group);
+    if (need_first_expert_prime && is_tma_launcher_thread<Dims>()) {
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
       // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
-      // (= 16384 · HALVES = 16 KB for pre Phase 2a, 32 KB for post)
-      // and issue `HALVES` back-to-back 128×128 TMAs.  Half 0 lands at
-      // `&w_down_wgmma[0][0][0]`, half 1 at
-      // `&w_down_wgmma[0][128][0]` (= base + 16384 B).  All TMAs in
-      // this block retire into the same bar_w[0], so a single
-      // `mbarrier.try_wait.parity` on the compute side drains both.
+      // and issue ONE TMA per 128-K substep covering the full
+      // DOWN_COL_TILE M-rows.  The descriptor's boxDim row dimension
+      // is set to DOWN_COL_TILE host-side (see
+      // `create_down_weight_tma_desc(... row_box=DOWN_COL_TILE)`), so
+      // each TMA delivers `DOWN_COL_TILE * 128` bytes at once
+      // (16 KB for DOWN_COL_TILE=128, 32 KB for DOWN_COL_TILE=256).
+      // The two 128-row sub-atoms inside a 256-row delivery still
+      // observe the SWZ128 byte layout, so the consumer-side WGMMA A
+      // descriptor (which addresses one 128-row sub-atom per WGMMA
+      // call) is unchanged.
+      //
+      // Per-K-substep destination row offset into `w_down_wgmma[slot]`:
+      //   kk-th substep starts at row `kk * DOWN_COL_TILE`.
+      // All atoms retire into the same bar_w[0], so a single
+      // `mbarrier.try_wait.parity` on the compute side drains them all.
       mbarrier_arrive_expect_tx(&shm->bar_w[0],
                                 /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
     #pragma unroll
-      for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-        W_element* dest_base = &shm->w_down_wgmma[0][h * 128u][0];
+      for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+        W_element* dest_base = &shm->w_down_wgmma[0][kk * DOWN_COL_TILE][0];
         tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
                                  /*K=*/Dims::HIDDEN_STATES,
-                                 /*base_col=*/base_col + h * 128u,
-                                 /*k_start=*/0u,
+                                 /*base_col=*/base_col,
+                                 /*k_start=*/kk * K_STEP_WGMMA,
                                  /*dest_smem_ptr=*/(void*)dest_base,
                                  /*bar_smem_ptr=*/&shm->bar_w[0]);
       }
 
       // Activation tile for K-step 0: only issue when routed_count > 0.
-      // The helper issues 8 TMAs (one per K-chunk); the descriptor's
-      // boxDim=(16, 8) means each TMA delivers 16*8=128 B, collectively
-      // 8*128=1024 B = full 1 KB slot regardless of routed_count.
+      // One TMA per 128-K sub-block (each delivers a 1024-B SWZ128
+      // atom into `a_down_wgmma[slot][kk]`).  All atoms retire into
+      // `bar_a[0]`; the launcher arms it once with the total tx_bytes.
       if (routed_count > 0u) {
-        mbarrier_arrive_expect_tx(&shm->bar_a[0], /*tx_bytes=*/1024u);
-        tma_load_down_wgmma_activation_bulk(
-            down_activations_desc, /*k_start=*/0u,
-            /*expert_slot_start=*/expert_start,
-            /*dest_smem_ptr=*/&shm->a_down_wgmma[0][0][0][0],
-            /*bar_smem_ptr=*/&shm->bar_a[0]);
+        mbarrier_arrive_expect_tx(&shm->bar_a[0],
+                                  /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+    #pragma unroll
+        for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+          tma_load_down_wgmma_activation_bulk(
+              down_activations_desc,
+              /*k_start=*/kk * K_STEP_WGMMA,
+              /*expert_slot_start=*/expert_start,
+              /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
+              /*bar_smem_ptr=*/&shm->bar_a[0]);
+        }
       }
   #endif
     }
-    // Zero-fill the unused tail of slot 0. Warp 8 lanes 1..31 do the
-    // work; lane 0 is gated out internally so it can issue the TMA in
-    // parallel.  Also gated by SKIP_PREFETCH because the slot only
-    // exists (and only matters) when prefetches are live.
-    if (warp == 8u && routed_count < 8u) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
-      zero_fill_unused_down_act_slots<Dims>(routed_count,
-                                            &shm->a_down_wgmma[0][0][0][0]);
-  #endif
-    }
+    // Activation-slot tail (rows [routed_count, T_TILE)) is left
+    // uninitialized.  WGMMAs for ranks ≥ routed_count produce
+    // garbage in calc-thread accumulators that map to `down_out`
+    // columns the rank-filtered accumulate never reads:
+    //   if (rank_u8 != 0xFFu) out_accum[tok][col] += down_out[col][rank_u8];
+    // `rank_for_tok[tok]` only emits ranks in [0, routed_count) (or
+    // sentinel 0xFF), so the garbage columns are written but never
+    // read.  fp8 e4m3 has no NaN encoding, so the WGMMA can't trip
+    // an exception on garbage input.
 
-    // Prefetch warps load the per-token activation scale for K-step 0
-    // via cp.async (rank-indexed into the expert-sorted layout).
-    if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
-      moe_load_down_wgmma_activation_tile<Dims>(
-          spec, shmem, id, top_k, batch_size,
-          /*k_start=*/0u, /*s=*/0u, shm->a_down_wgmma[0], shm->a_down_scale[0],
-          pipe);
-  #endif
-    }
-    // Drain the scale cp.asyncs and publish the zero-fill across the
+    // Activation scales for this expert were already loaded above
+    // (top-of-expert per-expert loader on warp 8).  No per-K-step
+    // scale load is needed: the WGMMA scale-apply indexes the
+    // already-resident `a_down_scale[tok][global_half]` directly.
+
+    // Publish the prologue's `out_accum` zero-fill + mbarrier inits and
+    // the top-of-expert weight + activation scale tiles across the
     // block before the WGMMA consumers wait on bar_w[0] / bar_a[0].
-    //
-    // The pipe drain is a no-op when no `producer_commit` has happened
-    // (SKIP_PREFETCH elides the only producers above), so it's safe to
-    // keep it unconditional.  The `__syncthreads()` must stay
-    // regardless to publish the unconditional out_accum zero-fill and
-    // mbarrier init from the prologue.
-    cuda::pipeline_consumer_wait_prior<0>(pipe);
     __syncthreads();
 
     // ── Main K-loop ─────────────────────────────────────────────────────
     //
-    // Main K-loop. Both WEIGHT and ACTIVATION tiles are loaded via
-    // TMA (mbarrier wait); the activation-scale tile stays on cp.async
-    // (pipeline drain) because it is small and the layout is already
-    // convenient on that path.
+    // Both WEIGHT and ACTIVATION tiles are loaded via TMA (mbarrier
+    // wait).  Activation scales for the WHOLE expert are pre-loaded
+    // at the top of the per-expert loop (see
+    // `moe_load_down_wgmma_act_scale_per_expert` above), so the
+    // K-loop's WGMMA scale-apply just indexes the already-resident
+    // `a_down_scale[tok][global_half]` directly — no per-K-step
+    // scale fetch.
+    //
+    // PIPELINED ACCUMULATE: at iter s=0 of every expert AFTER the
+    // first one, prefetch warps run the PREVIOUS expert's
+    // `out_accum += down_out[col][rank]` accumulate concurrently with
+    // calc warps' WGMMA + the launcher's intra-expert prefetch.  This
+    // hides the per-expert epilogue accumulate behind useful WGMMA
+    // work (~1 µs/expert at BS=8) and uses the prefetch warps that
+    // were otherwise idle (TMA issue is serial on lane 0; the rest of
+    // warps 9..11 had nothing to do).  Hazards:
+    //   * `down_out` is single-buffered.  It's written by expert e's
+    //     end-of-K-loop epilogue and read by expert e+1's iter-0
+    //     deferred accumulate; the writeback `__syncthreads()` and
+    //     the priming-block `__syncthreads()` (both at the start of
+    //     each expert) make the data visible to iter 0.  The next
+    //     write to `down_out` (at end of expert e+1's K-loop) is
+    //     ordered after the iter-0 sync drain, so the previous
+    //     expert's accumulate is guaranteed to have completed.
+    //   * `rank_for_tok` follows the same lifetime as `down_out`
+    //     (computed at end of expert e, read at iter 0 of expert e+1).
+    //   * The LAST expert's accumulate is performed AFTER the expert
+    //     loop (one final pass before the GM writeback).
+    const bool has_prev_expert = (e != down_group);
     for (std::uint32_t s = 0; s < K_TILES_DOWN; ++s) {
       const std::uint32_t read_slot = s & 1;
 
       // ── COMPUTE half: WGMMA + scale-apply || TMA prefetch step s+1 ──
       if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         // Wait for this step's weight tile to be fully in SHM.  The
         // launcher pre-armed bar_w[read_slot] with tx=16384 before
         // issuing the 128x128 weight TMA (priming for s=0, previous
@@ -1298,10 +1197,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         parity_w[read_slot] ^= 1;
 
         // Wait for this step's activation tile if any tokens route to
-        // this expert.  When routed_count == 0 the launcher did not arm
-        // bar_a[read_slot] and did not issue a TMA; the SHM slot is
-        // entirely zero-filled by `zero_fill_unused_down_act_slots`,
-        // and the WGMMA reads zero — no wait needed.  (R4.5, R12.5.)
+        // this expert.  When routed_count == 0 the launcher did not
+        // arm bar_a[read_slot] and did not issue a TMA; the WGMMA
+        // reads garbage from the un-initialized SHM slot, but every
+        // thread's accumulator maps to a rank that the
+        // rank-filtered accumulate never reads (see safety argument
+        // at the priming block).  No wait needed.
         if (routed_count > 0u) {
           while (!mbarrier_try_wait_parity(&shm->bar_a[read_slot],
                                            parity_a[read_slot])) {
@@ -1310,20 +1211,22 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         }
   #endif
 
-  #ifndef MONO_PROFILE_SKIP_CALC
-        // A descriptor bases per WG per half — the weight tile is
-        // laid out as `HALVES` contiguous 128-row M-slabs (half 0 at
-        // rows [0..127], half 1 at rows [128..255]).  Within each
-        // slab, WG0 owns rows [0..63] and WG1 owns rows [64..127].
-        //
-        //   A-desc base for (wg, h):
-        //     &w_down_wgmma[slot][h * 128 + (wg==1 ? 64 : 0)][0]
-        //     = slot_base + h * 16384 + (wg==1 ? 8192 : 0)
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+        // A descriptor bases per WG per (kk-substep, h-half).  The
+        // weight tile is laid out as `K_SUBSTEPS_DOWN * DOWN_COL_HALVES`
+        // contiguous 128-row M-slabs (substep 0 occupies rows
+        // [0..DOWN_COL_TILE-1], substep 1 occupies rows
+        // [DOWN_COL_TILE..2*DOWN_COL_TILE-1], …).  Within each slab,
+        // half 0 spans the first `128 * DOWN_COL_HALVES / 2` … see the
+        // priming-block comment for the row-offset formula.  WG0 owns
+        // rows [0..63] of each (kk, h) atom and WG1 owns rows [64..127].
         const void* a_slot_base =
             (const void*)&shm->w_down_wgmma[read_slot][0][0];
         const std::uint32_t wg_offset_bytes = is_wg1 ? 8192u : 0u;
-
-        wgmma_fence();
+        // Bytes between consecutive 128×128 atoms (K_STEP_WGMMA-K-wide,
+        // 128-rows-tall) in `w_down_wgmma`; identical to a single TMA
+        // payload size.
+        constexpr std::uint32_t W_ATOM_BYTES = DOWN_W_TX_BYTES_PER_HALF;
 
         // Per-WGMMA K-advancement:
         //   A: 2 * A_LBO = 32 B inside the 1024-B A atom.
@@ -1332,169 +1235,302 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         constexpr std::uint32_t A_K_STRIDE = 2u * A_LBO;
         constexpr std::uint32_t B_K_STRIDE = 2u * B_LBO;
         const void* b_slot_base =
-            (const void*)&shm->a_down_wgmma[read_slot][0][0][0];
+            (const void*)&shm->a_down_wgmma[read_slot][0][0][0][0];
+        // Bytes between consecutive 8 tok × 128 K SWZ128 activation
+        // atoms (one per K-substep) in `a_down_wgmma[slot]`.
+        constexpr std::uint32_t B_SUBSTEP_BYTES = 1024u;
 
-          // Per-half WGMMA passes.  Each pass runs the same
-          // 4-chained-m64n8k32 structure as the pre Phase-2a kernel and
-          // accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`, then
-          // applies the (ws, as) scales at the K=128 boundary and folds
-          // into `final_d[h]`.
+          // Per-(kk, h) WGMMA passes.  Each pass runs the same
+          // 4-chained-m64n8k32 structure as the legacy K_STEP_DOWN=128
+          // kernel and accumulates into `chunk_d_lo[h]` / `chunk_d_hi[h]`,
+          // then applies the (ws, as) scales at the K=128 boundary and
+          // folds into `final_d[h]`.  Per-expert outer accumulator
+          // semantics are unchanged — the substep merely adds another
+          // inner level that itself runs 4 chained WGMMAs + scale apply.
     #pragma unroll
-        for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-          const std::uint32_t half_offset_bytes = h * 16384u;
-          const void* a_base =
-              (const void*)((const char*)a_slot_base + half_offset_bytes +
-                            wg_offset_bytes);
+        for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+          // A new `wgmma.fence` is required at the start of every
+          // group of dependent WGMMAs (one fence ↔ one
+          // commit-group/wait-group pair below).  Folding the fence
+          // outside the kk loop relies on a single commit+wait pair
+          // covering all substeps, which would force the compiler to
+          // emit a single "supergroup" of WGMMAs without
+          // intermediate scale-apply ordering — incorrect.
+          wgmma_fence();
 
-            // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
+          // Per-substep activation base: kk-th 1024-B SWZ128 atom.
+          const void* b_kk_base =
+              (const void*)((const char*)b_slot_base + kk * B_SUBSTEP_BYTES);
+
     #pragma unroll
-          for (std::uint32_t j = 0; j < 2; ++j) {
-            const void* a_ptr =
-                (const void*)((const char*)a_base + j * A_K_STRIDE);
-            const void* b_ptr =
-                (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
-            std::uint64_t desc_a =
-                make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-            std::uint64_t desc_b =
-                make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
-                                         chunk_d_lo[h][1], chunk_d_lo[h][2],
-                                         chunk_d_lo[h][3]);
+          for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+            // Weight-tile atom row offset for (kk, h):
+            //   row_off = (kk * DOWN_COL_HALVES + h) * 128.
+            // SHM byte offset = row_off * 128 (since each row is the
+            // full 128-K SWZ128 line) = (kk * HALVES + h) * 16384.
+            const std::uint32_t atom_off_bytes =
+                (kk * DOWN_COL_HALVES + h) * W_ATOM_BYTES;
+            const void* a_base =
+                (const void*)((const char*)a_slot_base + atom_off_bytes +
+                              wg_offset_bytes);
+
+              // 4 chained WGMMAs into chunk_d_lo[h]  (K[0..63], j = 0, 1).
+    #pragma unroll
+            for (std::uint32_t j = 0; j < 2; ++j) {
+              const void* a_ptr =
+                  (const void*)((const char*)a_base + j * A_K_STRIDE);
+              const void* b_ptr =
+                  (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
+              std::uint64_t desc_a =
+                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              std::uint64_t desc_b =
+                  make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
+                                           chunk_d_lo[h][1], chunk_d_lo[h][2],
+                                           chunk_d_lo[h][3]);
+            }
+
+              // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
+    #pragma unroll
+            for (std::uint32_t j = 2; j < WGMMAS_PER_SUBSTEP; ++j) {
+              const void* a_ptr =
+                  (const void*)((const char*)a_base + j * A_K_STRIDE);
+              const void* b_ptr =
+                  (const void*)((const char*)b_kk_base + j * B_K_STRIDE);
+              std::uint64_t desc_a =
+                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              std::uint64_t desc_b =
+                  make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
+              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
+                                           chunk_d_hi[h][1], chunk_d_hi[h][2],
+                                           chunk_d_hi[h][3]);
+            }
           }
 
-            // 4 chained WGMMAs into chunk_d_hi[h]  (K[64..127], j = 2, 3).
+          wgmma_commit_group();
+          wgmma_wait_group<0>();
+
+          // ── Scale-apply at the K=128 boundary (per-substep, per-half) ─
+          // Each (kk, h) uses its own weight-scale entry
+          // `w_down_scale[h][my_wg][ws_col]` (ws_col = global 128-K
+          // index along Dims::N) and its own per-token activation
+          // scale halves indexed at the (s, kk)-derived global 64-K
+          // half offset in the per-expert `a_down_scale[tok][...]`.
+          const std::uint32_t tok_02 = (lane % 4) * 2;
+          const std::uint32_t tok_13 = (lane % 4) * 2 + 1;
+
+          // Activation scales are now hoisted to a per-expert
+          // single-buffer `a_down_scale[tok][global_half]`.  The global
+          // 64-K half index for outer step `s`, substep `kk`, half
+          // `half ∈ {0, 1}` is `s * K_SUBSTEPS_DOWN * 2 + kk * 2 +
+          // half` (= `s * (K_STEP_DOWN/64) + 2*kk + half`).
+          const std::uint32_t base_half = s * K_SUBSTEPS_DOWN * 2u + 2u * kk;
+          const float as_lo_02 = shm->a_down_scale[tok_02][base_half + 0u];
+          const float as_hi_02 = shm->a_down_scale[tok_02][base_half + 1u];
+          const float as_lo_13 = shm->a_down_scale[tok_13][base_half + 0u];
+          const float as_hi_13 = shm->a_down_scale[tok_13][base_half + 1u];
+
+          // Global 128-K block index along Dims::N for this (s, kk):
+          //   global_kblock = (s * K_STEP_DOWN + kk * K_STEP_WGMMA) / 128
+          //                 = s * K_SUBSTEPS_DOWN + kk
+          const std::uint32_t ws_col =
+              (W_DOWN_SCALE_COLS > 1) ? (s * K_SUBSTEPS_DOWN + kk) : 0u;
+
     #pragma unroll
-          for (std::uint32_t j = 2; j < WGMMAS_PER_STEP_DOWN; ++j) {
-            const void* a_ptr =
-                (const void*)((const char*)a_base + j * A_K_STRIDE);
-            const void* b_ptr =
-                (const void*)((const char*)b_slot_base + j * B_K_STRIDE);
-            std::uint64_t desc_a =
-                make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-            std::uint64_t desc_b =
-                make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
-                                         chunk_d_hi[h][1], chunk_d_hi[h][2],
-                                         chunk_d_hi[h][3]);
+          for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+            const float ws = shm->w_down_scale[h][my_wg][ws_col];
+            final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
+                             chunk_d_hi[h][0] * as_hi_02 * ws;
+            final_d[h][1] += chunk_d_lo[h][1] * as_lo_13 * ws +
+                             chunk_d_hi[h][1] * as_hi_13 * ws;
+            final_d[h][2] += chunk_d_lo[h][2] * as_lo_02 * ws +
+                             chunk_d_hi[h][2] * as_hi_02 * ws;
+            final_d[h][3] += chunk_d_lo[h][3] * as_lo_13 * ws +
+                             chunk_d_hi[h][3] * as_hi_13 * ws;
+            chunk_d_lo[h][0] = chunk_d_lo[h][1] = chunk_d_lo[h][2] =
+                chunk_d_lo[h][3] = 0.f;
+            chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
+                chunk_d_hi[h][3] = 0.f;
           }
-        }
-
-        wgmma_commit_group();
-        wgmma_wait_group<0>();
-
-        // ── Scale-apply at the K=128 boundary (per-half) ──────────────
-        // Each half uses its own weight-scale row-block entry
-        // `w_down_scale[h][my_wg][ws_col]` loaded once per expert.
-        // The activation scales are shared across halves (one set per
-        // slot, indexed by token) because both halves process the same
-        // 128-K K-step against the same activation tile.
-        const std::uint32_t tok_02 = (lane % 4) * 2;
-        const std::uint32_t tok_13 = (lane % 4) * 2 + 1;
-
-        const float as_lo_02 = shm->a_down_scale[read_slot][tok_02][0];
-        const float as_hi_02 = shm->a_down_scale[read_slot][tok_02][1];
-        const float as_lo_13 = shm->a_down_scale[read_slot][tok_13][0];
-        const float as_hi_13 = shm->a_down_scale[read_slot][tok_13][1];
-
-        const std::uint32_t ws_col = (W_DOWN_SCALE_COLS > 1) ? s : 0u;
-
-    #pragma unroll
-        for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-          const float ws = shm->w_down_scale[h][my_wg][ws_col];
-          final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
-                           chunk_d_hi[h][0] * as_hi_02 * ws;
-          final_d[h][1] += chunk_d_lo[h][1] * as_lo_13 * ws +
-                           chunk_d_hi[h][1] * as_hi_13 * ws;
-          final_d[h][2] += chunk_d_lo[h][2] * as_lo_02 * ws +
-                           chunk_d_hi[h][2] * as_hi_02 * ws;
-          final_d[h][3] += chunk_d_lo[h][3] * as_lo_13 * ws +
-                           chunk_d_hi[h][3] * as_hi_13 * ws;
-          chunk_d_lo[h][0] = chunk_d_lo[h][1] = chunk_d_lo[h][2] =
-              chunk_d_lo[h][3] = 0.f;
-          chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
-              chunk_d_hi[h][3] = 0.f;
-        }
+        }  // end kk substep loop
   #endif
       }
 
-      // Launcher runs IN PARALLEL with the WGMMA above. It arms and
-      // issues TMA for step s+1 into the OTHER slot ((s+1)%2),
-      // following the same pattern as the priming block.
+      // Launcher runs IN PARALLEL with the WGMMA above.  Two cases:
       //
-      // Compiled out under MONO_PROFILE_SKIP_PREFETCH; the matching
+      //   (a) `s + 1 < K_TILES_DOWN` — intra-expert prefetch: arms the
+      //       OTHER slot for the current expert's next K-step.
+      //   (b) `s + 1 == K_TILES_DOWN` AND there is a next expert in
+      //       this block's group — INTER-EXPERT LOOKAHEAD: arms the
+      //       slot that's about to be freed (slot 0 for K_TILES_DOWN
+      //       even, see static_assert below) and issues the next
+      //       expert's K=0 weight + activation TMAs into it.  This
+      //       keeps DRAM busy during the current expert's writeback /
+      //       accumulate phase, eliminating the GPU-quiet "blue gap"
+      //       at expert transitions in the NCU timeline.
+      //
+      // The next-expert priming block at the top of the expert loop
+      // detects `e > down_group` and skips its TMA arm/issue when the
+      // lookahead has already armed bar_{w,a}[0] — only the (cheap)
+      // weight + activation scale cp.async loads still run.
+      //
+      // Compiled out under MONO_PROFILE_SKIP_PREFETCH_DOWN; the matching
       // compute-side waits on bar_{w,a}[next_slot] in the next
       // iteration are also compiled out so there is no spin-forever
       // deadlock.
+      static_assert(K_TILES_DOWN % 2u == 0u,
+                    "Inter-expert lookahead requires K_TILES_DOWN to be "
+                    "even so the freshly-freed slot at s=K_TILES_DOWN-1 "
+                    "(== (s+1)&1 == 0) is the same slot the next expert's "
+                    "s=0 wait reads.  All currently instantiated Dims "
+                    "variants satisfy this (Qwen3.5 N=512 with K_STEP_DOWN "
+                    "in {128, 256} → K_TILES_DOWN in {4, 2}).  If this "
+                    "fires for a future shape, either disable the "
+                    "lookahead branch or introduce a per-expert slot "
+                    "offset.");
       if (is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
+  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
         if (s + 1 < K_TILES_DOWN) {
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
 
-          // Next weight tile — HALVES back-to-back 128×128 TMAs,
-          // same structure as the priming block.  Single bar_w arm
-          // with the TOTAL tx_bytes drains every half in one wait on
-          // the compute side.
+          // Next weight tile — ONE TMA per 128-K substep (covers the
+          // full DOWN_COL_TILE M-rows), same structure as the priming
+          // block.  Single bar_w arm with the TOTAL tx_bytes drains
+          // every atom in one wait on the compute side.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
     #pragma unroll
-          for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-            W_element* dest_base = &shm->w_down_wgmma[next_slot][h * 128u][0];
-            tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
-                                     /*K=*/Dims::HIDDEN_STATES,
-                                     /*base_col=*/base_col + h * 128u,
-                                     /*k_start=*/next_k_start,
-                                     /*dest_smem_ptr=*/(void*)dest_base,
-                                     /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
+          for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+            W_element* dest_base =
+                &shm->w_down_wgmma[next_slot][kk * DOWN_COL_TILE][0];
+            tma_load_down_wgmma_tile(
+                down_weights_desc, /*expert_id=*/id,
+                /*K=*/Dims::HIDDEN_STATES,
+                /*base_col=*/base_col,
+                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                /*dest_smem_ptr=*/(void*)dest_base,
+                /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
           }
 
           // Next activation tile — only if any tokens route to this
-          // expert.  The 8-TMA bulk helper delivers the full 1024 B
-          // regardless of routed_count.
+          // expert.  K_SUBSTEPS_DOWN back-to-back 1024-B atoms.
           if (routed_count > 0u) {
             mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                      /*tx_bytes=*/1024u);
-            tma_load_down_wgmma_activation_bulk(
-                down_activations_desc, /*k_start=*/next_k_start,
-                /*expert_slot_start=*/expert_start,
-                /*dest_smem_ptr=*/&shm->a_down_wgmma[next_slot][0][0][0],
-                /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
+                                      /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+    #pragma unroll
+            for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+              tma_load_down_wgmma_activation_bulk(
+                  down_activations_desc,
+                  /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                  /*expert_slot_start=*/expert_start,
+                  /*dest_smem_ptr=*/
+                  &shm->a_down_wgmma[next_slot][kk][0][0][0],
+                  /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
+            }
+          }
+        } else if (e + DOWN_GROUPS < expert_count) {
+          // ── INTER-EXPERT LOOKAHEAD ────────────────────────────────
+          //
+          // Prefetch the NEXT expert's K=0 weight + activation tiles
+          // into the slot that's about to be freed.  With
+          // K_TILES_DOWN even, that slot is index 0 — same slot the
+          // next expert's `read_slot = s & 1` lookup picks at s=0,
+          // so the next expert's K-loop starts on data already in
+          // SHM with the parity bookkeeping already aligned via the
+          // hoisted `parity_w[]` / `parity_a[]` state.
+          const std::uint32_t lookahead_slot = (s + 1) & 1;  // == 0
+          const std::uint32_t next_e = e + DOWN_GROUPS;
+          const std::uint32_t next_id = shmem->experts[next_e].id;
+          const std::uint32_t next_routed_count =
+              static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
+          const std::uint32_t next_expert_start =
+              static_cast<std::uint32_t>(shm->expert_slot_start[next_id]);
+
+          mbarrier_arrive_expect_tx(&shm->bar_w[lookahead_slot],
+                                    /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+            W_element* dest_base =
+                &shm->w_down_wgmma[lookahead_slot][kk * DOWN_COL_TILE][0];
+            tma_load_down_wgmma_tile(
+                down_weights_desc, /*expert_id=*/next_id,
+                /*K=*/Dims::HIDDEN_STATES,
+                /*base_col=*/base_col,
+                /*k_start=*/kk * K_STEP_WGMMA,
+                /*dest_smem_ptr=*/(void*)dest_base,
+                /*bar_smem_ptr=*/&shm->bar_w[lookahead_slot]);
+          }
+
+          if (next_routed_count > 0u) {
+            mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
+                                      /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+    #pragma unroll
+            for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+              tma_load_down_wgmma_activation_bulk(
+                  down_activations_desc,
+                  /*k_start=*/kk * K_STEP_WGMMA,
+                  /*expert_slot_start=*/next_expert_start,
+                  /*dest_smem_ptr=*/
+                  &shm->a_down_wgmma[lookahead_slot][kk][0][0][0],
+                  /*bar_smem_ptr=*/&shm->bar_a[lookahead_slot]);
+            }
           }
         }
   #endif
       }
-      // Warp 8 (all lanes including the launcher): zero-fill the unused
-      // tail of the NEXT slot when routed_count < 8. Lane 0 is gated
-      // out inside the helper so TMA issue on lane 0 is not delayed.
-      if (warp == 8u && s + 1 < K_TILES_DOWN && routed_count < 8u) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
-        const std::uint32_t next_slot = (s + 1) & 1;
-        zero_fill_unused_down_act_slots<Dims>(
-            routed_count, &shm->a_down_wgmma[next_slot][0][0][0]);
-  #endif
-      }
+      // Activation-slot tail is left uninitialized; see the matching
+      // comment in the per-expert priming block above.
 
-      // Prefetch warps load the per-token activation scale for step
-      // s+1 via cp.async (rank-indexed into the expert-sorted layout).
+      // Activation scales are loaded once per expert (top of expert
+      // loop) — no per-K-step scale reload.  Prefetch warps still
+      // run the PREVIOUS expert's deferred accumulate at iter 0 of
+      // every expert AFTER the first concurrently with calc warps'
+      // iter-0 WGMMA (see the K-loop block comment above for the
+      // lifetime/hazard argument).
       if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH
-        if (s + 1 < K_TILES_DOWN) {
-          const std::uint32_t next_slot = (s + 1) & 1;
-          const std::uint32_t next_s = s + 1;
-          const std::uint32_t next_k_start = next_s * K_STEP_DOWN;
-          moe_load_down_wgmma_activation_tile<Dims>(
-              spec, shmem, id, top_k, batch_size, next_k_start, next_s,
-              shm->a_down_wgmma[next_slot], shm->a_down_scale[next_slot], pipe);
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+        // Deferred accumulate of the PREVIOUS expert.  Runs on
+        // prefetch warps only (warps 8..11, 128 threads), iterating
+        // over the (tok, col) plane in stride-128 chunks.  Calc warps
+        // run their iter-0 WGMMAs in parallel.
+        //
+        // Reads:
+        //   * `shm->partial_result.down_out` — written by the
+        //     previous expert's end-of-K-loop writeback, published by
+        //     the expert-loop top __syncthreads.
+        //   * `shm->rank_for_tok` — computed at the end of the
+        //     previous expert (after its writeback, before the
+        //     trailing __syncthreads), so it observes the same
+        //     publication path.
+        // Writes:
+        //   * `shm->out_accum[tok][col]` — `+=` only, no contention
+        //     with calc warps (they don't touch out_accum during the
+        //     K-loop).
+        if (has_prev_expert && s == 0u) {
+          const unsigned thread_in_pf =
+              thread_in_block -
+              CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP;
+          constexpr unsigned PF_THREADS =
+              CoreDims::PREFETCH_WARP_COUNT * CoreDims::THREADS_PER_WARP;
+          for (unsigned tok_col = thread_in_pf;
+               tok_col < batch_size * DOWN_COL_TILE; tok_col += PF_THREADS) {
+            const unsigned tok = tok_col / DOWN_COL_TILE;
+            const unsigned col = tok_col % DOWN_COL_TILE;
+            const uint8_t rank_u8 = shm->rank_for_tok[tok];
+            if (rank_u8 != 0xFFu) {
+              shm->out_accum[tok][col] +=
+                  shm->partial_result.down_out[col][rank_u8];
+            }
+          }
         }
   #endif
       }
 
-      // Drain the scale cp.asyncs and make the zero-fill visible before
-      // the next iteration's WGMMA reads the new slot.  Safe to keep
-      // unconditional: the pipe drain is a no-op when SKIP_PREFETCH
-      // has elided every `producer_commit`, and the __syncthreads() is
-      // still needed to keep all warps aligned per iteration.
-      cuda::pipeline_consumer_wait_prior<0>(pipe);
+      // Align all warps before the next iteration's WGMMA reads the
+      // new slot.  Activation scales were hoisted out of the K-loop
+      // (see top-of-expert per-expert loader), so no pipe drain is
+      // needed here — only the cross-warp `__syncthreads()`.
       __syncthreads();
     }  // end K-loop
 
@@ -1510,7 +1546,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // WG1 adds +64 to the row offset within its 128-row half because
     // WG1 owns output cols [h*128+64 .. h*128+127] within that half.
     if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_CALC
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
       const std::uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const std::uint32_t col_base = (lane % 4) * 2;
     #pragma unroll
@@ -1528,35 +1564,22 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
   #endif
     }
-    __syncthreads();
 
-    // ── Accumulate per-token contributions into out_accum ──────────────
+    // ── Compute rank_for_tok for the current expert ──────────────────
     //
-    // `down_out[col][rank]` holds the partial contribution for SHM
-    // slot `rank` (intra-expert row inside the expert's contiguous
-    // slab of `temp_fp8`), NOT for the natural logical token id.  We
-    // therefore walk the (tok, k_in_topk) grid in `topk_ids_flat`,
-    // filter by the current expert id, and derive the intra-expert
-    // rank as `rank = sorted_slot[pair] - expert_start`.  This rank
-    // is THE SAME across all DOWN_COL_TILE columns of a given token,
-    // so we hoist the 8-iter top-K scan out of the (tok, col) inner
-    // loop and cache `rank_for_tok[tok]` once per expert in SHM.
+    // Pre-compute rank for each token once per expert.  Sentinel 0xFF
+    // means this token does not route through the current expert (no
+    // contribution).
+    //
+    // The accumulate that consumes both `down_out` and `rank_for_tok`
+    // is DEFERRED to the next expert's iter-0 prefetch-warp body (see
+    // the K-loop block comment above).  For the LAST expert in a
+    // group, an unconditional accumulate runs after the expert loop.
     //
     // 8 threads (one per token) compute the rank in parallel; the
-    // remaining 376 threads idle for the same number of cycles they
-    // were already spending on the redundant inner scan, so the
-    // hoist is pure win.
-    //
-    // Iterating up to `batch_size * DOWN_COL_TILE` (not `Dims::BS *
-    // DOWN_COL_TILE`) is safe: tokens >= batch_size are never written
-    // in the final GM writeback below.
-    //
-    // Compiled out under MONO_PROFILE_SKIP_CALC: out_accum stays at
-    // its prologue zero-fill, so Phase 5 reads zeros and produces
-    // garbage output — matches the SKIP_CALC contract.
-  #ifndef MONO_PROFILE_SKIP_CALC
-    // Pre-compute rank for each token once.  Sentinel 0xFF means this
-    // token does not route through the current expert (no contribution).
+    // remaining 376 threads idle.  Runs together with the writeback
+    // above behind the same trailing __syncthreads().
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
     if (thread_in_block < batch_size) {
       const unsigned tok = thread_in_block;
       uint8_t rank_val = 0xFFu;
@@ -1571,8 +1594,31 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
       shm->rank_for_tok[tok] = rank_val;
     }
+  #endif
     __syncthreads();
 
+    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
+  }  // end expert loop
+
+  // ── Final accumulate for the LAST expert in this block's group ────────
+  //
+  // The pipelined deferred accumulate inside the K-loop covers experts
+  // [down_group, down_group + DOWN_GROUPS, …, expert_count - DOWN_GROUPS).
+  // The LAST expert visited (`e_last = down_group + ((expert_count -
+  // 1 - down_group) / DOWN_GROUPS) * DOWN_GROUPS`) has nothing to
+  // defer to, so we run one final accumulate here.  All warps
+  // participate (now that the K-loop is done, the prefetch warps are
+  // free to help).
+  //
+  // The expert-loop's trailing __syncthreads() already published this
+  // block's `down_out` and `rank_for_tok`.  No additional sync
+  // required before reading them.
+  //
+  // For blocks whose group has zero experts (expert_count <=
+  // down_group), `e_started` stays false and the accumulate is
+  // skipped — `down_out` was never written for this block.
+  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
+  if (expert_count > down_group) {
     for (unsigned tok_col = thread_in_block;
          tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
       const unsigned tok = tok_col / DOWN_COL_TILE;
@@ -1582,23 +1628,36 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank_u8];
       }
     }
+  }
+  __syncthreads();
   #endif
-    __syncthreads();
-
-    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
-  }  // end expert loop
 
   MONO_PHASE_TIMESTAMP(t_down_after_all_experts);
 
-  // ── After all experts in this group: write out_accum → GM partial_out ─
-  const std::uint32_t group_stride = Dims::BS * Dims::HIDDEN_STATES;
-  float* gm_partial = spec->down_partial_out + down_group * group_stride;
+  // ── After all experts in this group: atomicAdd out_accum → GM partial ─
+  //
+  // EXPERIMENT: instead of writing to a per-group slice
+  // (`down_partial_out[down_group][tok][col]`) and reducing across
+  // groups in Phase 5, every contributing block atomicAdds its
+  // `out_accum` slice into the SAME single-buffer `partial[BS][HIDDEN]`
+  // region (the first `BS * HIDDEN_STATES` floats of the original
+  // `down_partial_out` allocation, treated as a single buffer).
+  //
+  // Phase 5 then reads each cell ONCE and casts to bf16 — no 16-way
+  // sum.  The colstripe barrier still gates Phase 5 since all 16
+  // contributing blocks must finish their atomicAdds first.
+  //
+  // The buffer is zero-initialized at kernel entry (see
+  // `moe_kernel_topk` prologue), and the up-proj-completion barrier
+  // (#2) publishes that zero across all blocks before any Phase 4
+  // atomicAdd fires.
+  float* gm_partial = spec->down_partial_out;  // single-buffer view
   for (unsigned idx = thread_in_block; idx < batch_size * DOWN_COL_TILE;
        idx += blockDim.x) {
     const unsigned tok = idx / DOWN_COL_TILE;
     const unsigned col = idx % DOWN_COL_TILE;
-    gm_partial[tok * Dims::HIDDEN_STATES + base_col + col] =
-        shm->out_accum[tok][col];
+    atomicAdd(gm_partial + tok * Dims::HIDDEN_STATES + base_col + col,
+              shm->out_accum[tok][col]);
   }
 }
 

@@ -117,10 +117,26 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
  * layout).
  *
  * The returned descriptor targets `CU_TENSOR_MAP_DATA_TYPE_UINT8` with
- * `rank = 2`, `globalDim = [N, num_experts * K]`, `boxDim = [128, 128]`,
- * `elementStrides = [1, 1]`, `CU_TENSOR_MAP_INTERLEAVE_NONE`,
- * `CU_TENSOR_MAP_SWIZZLE_128B`, `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`,
- * and `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`.
+ * `rank = 2`, `globalDim = [N, num_experts * K]`,
+ * `boxDim = [128, row_box]`, `elementStrides = [1, 1]`,
+ * `CU_TENSOR_MAP_INTERLEAVE_NONE`, `CU_TENSOR_MAP_SWIZZLE_128B`,
+ * `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`, and
+ * `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`.
+ *
+ * `row_box` controls how many rows (=output cols) each
+ * `cp.async.bulk.tensor.2d` issue delivers.  Valid values:
+ *   * 128 — one 128×128 fp8 atom = 16 KB per issue (legacy).  The
+ *     kernel's M-axis loop issues `DOWN_COL_TILE / 128` TMAs back-to-
+ *     back to populate one 128-K K-substep.
+ *   * 256 — two stacked 128×128 atoms = 32 KB per issue.  Halves the
+ *     issue count when `DOWN_COL_TILE = 256` (one TMA covers the full
+ *     M tile per K-substep).  The two 128-row sub-atoms still observe
+ *     the SWZ128 byte layout — the 256-row box simply concatenates two
+ *     sub-atoms along the M axis, so the consumer-side WGMMA A
+ *     descriptor (which addresses one 128-row sub-atom per WGMMA) is
+ *     unchanged.
+ * The maximum legal `row_box` is 256 (TMA `boxDim` is capped at 256
+ * per axis).
  *
  * NOTE on axis ordering: unlike the up-projection weight descriptor
  * (where `K` is the innermost reduction axis and the outer axis is
@@ -149,7 +165,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
  */
 CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
                                         uint32_t num_experts, uint32_t K,
-                                        uint32_t N);
+                                        uint32_t N, uint32_t row_box = 128u);
 
 /**
  * @brief Build a `CUtensorMap` describing the fp8 intermediate-activation
@@ -432,10 +448,13 @@ __device__ __forceinline__ void tma_load_down_wgmma_tile(
  * Since `boxDim[1] = 8` is baked into the descriptor, this issue always
  * fetches the full 8-row × 128-N atom.  When the expert's
  * `routed_token_count < 8`, the "unused" rows
- * `[routed_token_count, 8)` in the SHM slot must be overwritten with
- * zero-valued fp8 bytes before the WGMMA consumes the tile; that
- * responsibility lives in `zero_fill_unused_down_act_slots` below and
- * is ordered by the `__syncthreads()` at the end of each Phase-4 K-step.
+ * `[routed_token_count, 8)` in the SHM slot land with TMA-fetched bytes
+ * beyond the expert's own slab.  The kernel's WGMMA path tolerates
+ * that garbage: each calc thread's accumulators map to a fixed rank
+ * via lane id, and the rank-filtered accumulate at end-of-expert
+ * (`if (rank_for_tok[tok] != 0xFF)`) only reads `down_out` columns
+ * for ranks `< routed_count`.  fp8 e4m3 has no NaN encoding, so the
+ * WGMMA cannot trip an exception on garbage input.
  *
  * Coordinate convention for the down-activation descriptor: innermost
  * axis is N and outer axis is the `sorted_slot` row index into
@@ -450,13 +469,13 @@ __device__ __forceinline__ void tma_load_down_wgmma_tile(
  *     This function does NOT gate on `threadIdx`.
  *   - MUST only be invoked when `routed_token_count > 0`.  When no
  *     tokens route to this expert, the caller SHALL neither arm
- *     `bar_smem_ptr` nor call this helper; the SHM slot is instead
- *     zero-filled entirely by `zero_fill_unused_down_act_slots`.
+ *     `bar_smem_ptr` nor call this helper; the SHM slot is left
+ *     uninitialized and its contents are tolerated by the WGMMA
+ *     path (see preamble above).
  *   - `bar_smem_ptr` MUST have been pre-armed EXACTLY ONCE with
  *     `mbarrier_arrive_expect_tx(bar_smem_ptr, 1024)` BEFORE calling
  *     this function.  The TMA atom is always a full 8-row × 128-B
- *     slab (1024 B) regardless of `routed_token_count`; the tail rows
- *     are overwritten in SHM by `zero_fill_unused_down_act_slots`.
+ *     slab (1024 B) regardless of `routed_token_count`.
  *   - `dest_smem_ptr` MUST be 1024-B aligned (the swizzle atom
  *     alignment) and point at `&shm->a_down_wgmma[slot][0][0][0]`
  *     (the 1024-B activation-tile slot).
@@ -490,130 +509,6 @@ __device__ __forceinline__ void tma_load_down_wgmma_activation_bulk(
   // Descriptor axis order (innermost first): coord0 = N, coord1 = row.
   tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/expert_slot_start,
               dest_smem_ptr, bar_smem_ptr);
-}
-
-/**
- * @brief Cooperatively zero-fill the unused token rows of a down-proj
- *        activation SHM slot.
- *
- * On the Phase-4 TMA path the down-activation loader
- * (`tma_load_down_wgmma_activation_bulk`) fills the first
- * `routed_count` rows of an 8-row × 128-byte SWZ128 SHM slot
- * (`shm->a_down_wgmma[slot][tok][0..7 kc][0..15 ki]`) with the routed
- * tokens' fp8 K-values.  The remaining rows `[routed_count, 8)` are left with
- * TMA-fetched bytes beyond the expert's own slab (or undefined data if
- * the expert sits at the tail of `temp_fp8`).  This helper overwrites
- * those tail rows with zero bytes so that the subsequent WGMMA's reads
- * contribute zero to the accumulator — exactly matching the `cp.async`
- * loader's zero-fill behavior for the not-routed case (R2.6, R7.3,
- * R12.8).
- *
- * Thread mapping (R5.4): cooperative across warp 8, lanes 1..31
- * (lane 0 is the TMA launcher and is busy issuing the bulk TMA).  The
- * 31 participating lanes each stride through the unused region with
- * 4-byte (uint32) stores, covering at most
- *   `(8 - routed_count) * 8 kc * 16 B = (8 - routed_count) * 128 B`
- * bytes = at most 896 B when `routed_count == 1`, i.e. at most
- * `896 / 4 = 224` 4-byte stores distributed over 31 lanes
- * (~8 iterations per lane).
- *
- * Ordering / visibility (R2.6, R5.4): the zero-fill is NOT synchronized
- * against the TMA completion here — the caller is expected to issue a
- * `__syncthreads()` at the end of the Phase-4 K-step iteration before
- * the next iteration's WGMMA consumers wait on `bar_a[slot]`.  That
- * syncthreads() both makes the zero-fill visible across the block and
- * orders it before the next use of the slot.  This helper therefore
- * does NOT itself emit any fence or sync — it is a pure set of
- * per-lane SHM stores.
- *
- * SHM layout assumed: `shm->a_down_wgmma[slot]` is a 1024-B SWZ128 atom
- * viewed as `[T_TILE = 8 tok][FP8_ACT_NUM_CHUNKS = 8 kc][FP8_ACT_K_CHUNK
- * = 16 ki]`.  Each token occupies a 128-B row `[tok*128, tok*128+128)`
- * of the atom; the SWZ128 XOR permutes bytes WITHIN each row but not
- * across rows, so zeroing the contiguous range `[tok*128, tok*128+128)`
- * for each unused `tok` logically zeroes all 128 bytes of that token's
- * row (zero XOR any index = zero at that byte).  The unused region is
- * therefore a set of complete 128-B rows for `tok ∈ [routed_count, 8)`.
- *
- * Caller contract:
- *   - Must be called by every thread in warp 8 (lanes 0..31).  Lane 0
- *     performs no stores and is expected to be issuing the bulk TMA
- *     in parallel; lanes 1..31 perform the actual zero-fill stores.
- *     Inside the function, the gate is `lane_id != 0`, so it is safe
- *     to invoke uniformly from warp 8.
- *   - `0 ≤ routed_count ≤ 8`.  When `routed_count == 8` the helper is
- *     a no-op and may also be skipped by the caller.  When
- *     `routed_count == 0` the helper zero-fills the full 1 KB slot
- *     (8 tokens × 128 B).
- *   - `a_down_wgmma_slot_base_ptr` MUST be 4-byte aligned and point at
- *     `&shm->a_down_wgmma[slot][0][0][0]` (the base of one 1 KB slot).
- *
- * Template parameter `Dims` is unused by the body but retained so the
- * helper reads symmetrically with other `Dims`-templated helpers in
- * this file and so future Dims-dependent constants (e.g. alternative
- * `T_TILE` / `FP8_ACT_NUM_CHUNKS` values) can be wired in without
- * changing call sites.
- *
- * @tparam Dims                        The MoE `Dims` variant (unused
- *                                     today, see note above).
- * @param  routed_count                Number of routed tokens for the
- *                                     current expert at this slot,
- *                                     in `[0, 8]`.
- * @param  a_down_wgmma_slot_base_ptr  4-B aligned SHM base pointer of
- *                                     one `a_down_wgmma[slot]` slice,
- *                                     i.e. `&shm->a_down_wgmma[slot][0][0][0]`.
- */
-template <typename Dims>
-__device__ __forceinline__ void zero_fill_unused_down_act_slots(
-    std::uint32_t routed_count, void* a_down_wgmma_slot_base_ptr) {
-  // Fixed SHM layout of `a_down_wgmma[slot]` under SWZ128 (see
-  // moe_internal.h): a 1024-B atom viewed as
-  //   [T_TILE = 8 tok][FP8_ACT_NUM_CHUNKS = 8 kc][FP8_ACT_K_CHUNK = 16 ki]
-  // Each token's 128-B row occupies SHM bytes `[tok*128, tok*128+128)`.
-  constexpr std::uint32_t T_TILE_TOK = 8u;   // tokens per slot
-  constexpr std::uint32_t ROW_BYTES = 128u;  // bytes per token row
-  constexpr std::uint32_t DWORDS_PER_ROW = ROW_BYTES / 4u;  // 32 dwords per row
-
-  // Early-out when no tail rows need zeroing.
-  if (routed_count >= T_TILE_TOK) {
-    return;
-  }
-
-  // Lane within the caller's warp.  Lane 0 is the TMA launcher; skip
-  // it so the store traffic does not block TMA issue.  Lanes 1..31
-  // (31 workers) split the stores.
-  const std::uint32_t lane_id = threadIdx.x & 31u;
-  if (lane_id == 0u) {
-    return;
-  }
-
-  std::uint32_t* dst_u32 =
-      reinterpret_cast<std::uint32_t*>(a_down_wgmma_slot_base_ptr);
-
-  // Total 4-byte stores in the unused region:
-  //   (8 - routed_count) tokens × 32 dwords per 128-B row.
-  //   Bound: at most 7 * 32 = 224 dwords = 896 B, distributed across
-  //   31 worker lanes (~8 dwords per lane worst case).
-  const std::uint32_t unused_tok = T_TILE_TOK - routed_count;
-  const std::uint32_t total_dwords = unused_tok * DWORDS_PER_ROW;
-
-  // Strided loop: lanes 1..31 step by 31 through the flat dword index.
-  // Shift the starting index by `lane_id - 1` so lanes 1..31 map to
-  // flat indices 0..30 on the first iteration.
-#pragma unroll 1
-  for (std::uint32_t i = lane_id - 1u; i < total_dwords; i += 31u) {
-    // Unpack `i = (t_in_unused, d)` with layout
-    //   d           ∈ [0, 32)           fastest (dword within row)
-    //   t_in_unused ∈ [0, unused_tok)   outermost
-    const std::uint32_t d = i & (DWORDS_PER_ROW - 1u);  // i % 32
-    const std::uint32_t t_in_unused = i >> 5;           // i / 32
-    const std::uint32_t tok = routed_count + t_in_unused;
-
-    // SHM linear offset in uint32 units:
-    //   dst_u32[tok * DWORDS_PER_ROW + d]
-    const std::uint32_t slot_u32_off = tok * DWORDS_PER_ROW + d;
-    dst_u32[slot_u32_off] = 0u;
-  }
 }
 
 }  // namespace moe_monokernel

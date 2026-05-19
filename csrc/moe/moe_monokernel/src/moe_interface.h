@@ -153,6 +153,13 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     // Enables the TMA-based weight + activation load path in Phase 3 of
     // the BS8 WGMMA up-projection kernel.
     static constexpr bool USE_TMA = true;
+    // Down-projection outer K-step width (must be a multiple of 128).
+    // Default 128 matches the SWZ128 atom K-width and reproduces the
+    // legacy single-substep behaviour.  Set to 256 to halve the number
+    // of outer K-iterations (Dims::N / K_STEP_DOWN), at the cost of
+    // doubling the per-slot weight tile in SHM.  See `down_k_step` in
+    // moe_internal.h for the cost breakdown.
+    static constexpr std::uint32_t K_STEP_DOWN = 256;
   };
 };
 

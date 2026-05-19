@@ -1194,25 +1194,36 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   PROPERTIES COMPILE_DEFINITIONS "WGMMA_INPUT_DEBUG")
 
-    # Profiling flags — uncomment ONE of the two to isolate the wall-clock
-    # cost of calc vs prefetch warps at barrier stalls. The kernel
-    # produces garbage outputs with either flag; it's only useful for
-    # timing the remaining work via NCU or a wall-clock comparison.
+    # Profiling flags — uncomment ONE (or a combination) to isolate the
+    # wall-clock cost of calc vs prefetch warps at barrier stalls. The
+    # kernel produces garbage outputs with any of these flags; they are
+    # only useful for timing the remaining work via NCU or wall-clock.
     #
-    #   SKIP_CALC     : calc-warp bodies compiled out. Prefetches still
-    #                   issue — measures "how fast would the kernel be
-    #                   if the calc path were free?"
-    #   SKIP_PREFETCH : prefetch-warp bodies compiled out. Calc still
-    #                   runs on whatever's in SHM — measures "how fast
-    #                   would the kernel be if data were already there?"
+    # IMPORTANT — use `set_property(... APPEND PROPERTY COMPILE_DEFINITIONS
+    # ...)` (not `set_source_files_properties(... PROPERTIES ...)`).
+    # The latter REPLACES the property value, so a second call (e.g. the
+    # `MONO_PROFILE_PHASE_TIMING` line further below) silently wipes out
+    # everything set above it.  `APPEND` accumulates flags correctly.
     #
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC")
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH")
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS
-    #     "MONO_PROFILE_SKIP_CALC;MONO_PROFILE_SKIP_PREFETCH")
+    # Per-phase fine-grained flags (preferred for analyzing a single
+    # phase in isolation while leaving the others functionally correct):
+    #
+    #   SKIP_CALC_UP        : up-proj calc warps compiled out
+    #   SKIP_PREFETCH_UP    : up-proj prefetches compiled out
+    #   SKIP_CALC_DOWN      : down-proj calc warps compiled out
+    #   SKIP_PREFETCH_DOWN  : down-proj prefetches compiled out
+    #
+    # Example — measure pure down-proj prefetch / TMA-wait cost (calc
+    # path is "free", remaining time is data movement + barrier stalls):
+    #
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC_DOWN")
+    #
+    # Example — measure pure down-proj compute cost (data already in
+    # SHM, no TMA traffic, no barrier waits):
+    #
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH_DOWN")
 
     # Phase-timing instrumentation — uncomment to enable per-phase
     # clock64() timestamps written by block 0, thread 0.  Read back
@@ -1220,8 +1231,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # tail of MoEGemmSpec.  Kernel output is CORRECT (no skip flags);
     # overhead is negligible (7 clock64 reads + 7 GM stores total).
     #
-    set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-      PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
+    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+      APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
