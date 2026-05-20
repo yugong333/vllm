@@ -944,11 +944,13 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // Byte-for-byte mirror of the `cp.async` reference variant's constants
   // so that SHM layouts, WGMMA descriptors, and K-step sizing remain
   // identical across the two paths (design P1/P2).
-  constexpr uint32_t W_UP_M = CoreDims::W_UP_TILE_WGMMA;           // 128
-  constexpr uint32_t K_STEP = CoreDims::K_STEP_WGMMA;              // 128
-  constexpr uint32_t K_TILES = CoreDims::K_TILES_WGMMA;            // K/128
-  constexpr uint32_t WGMMAS_PER_STEP = CoreDims::WGMMAS_PER_STEP;  // 4
-  constexpr uint32_t UP_SCALE_COLS = Dims::UP_SCALE_COLS;          // 16
+  constexpr uint32_t W_UP_M = CoreDims::W_UP_TILE_WGMMA;     // 128
+  constexpr uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;  // 128
+  constexpr uint32_t K_STEP = CoreDims::K_STEP_UP;           // 128 / 256
+  constexpr uint32_t K_SUBSTEPS = CoreDims::K_SUBSTEPS_UP;   // 1 / 2
+  constexpr uint32_t K_TILES = CoreDims::K_TILES_UP;         // K/K_STEP
+  constexpr uint32_t WGMMAS_PER_SUBSTEP = CoreDims::WGMMAS_PER_STEP;  // 4
+  constexpr uint32_t UP_SCALE_COLS = Dims::UP_SCALE_COLS;             // 16
 
   // Descriptor strides for 128×128 Major::K B128-swizzled A operand.
   //
@@ -1029,8 +1031,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // lands on `next_slot = K_TILES % 2 = 0`.  That slot-0 stitch is what
   // the next expert's iter-0 QUANT/COMPUTE waits on; an odd K_TILES
   // would land the stitch on slot 1, breaking the cross-expert
-  // mbarrier chain.  HIDDEN_STATES=2048 / K_STEP=128 → K_TILES=16,
-  // satisfies the invariant.
+  // mbarrier chain.  At K_STEP_UP=128 (default) HIDDEN_STATES=2048 →
+  // K_TILES=16; at K_STEP_UP=256 → K_TILES=8; both satisfy the
+  // invariant.
   static_assert(K_TILES % 2 == 0,
                 "Stage-A pipeline requires K_TILES to be even so the "
                 "end-of-loop stitch arms the same slot that the next "
@@ -1043,6 +1046,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // the still-in-flight Phase-1 bf16_in[0] TMA, so the iter-0 COMPUTE
   // can start the moment both barriers flip.
   //
+  // For K_STEP > K_STEP_WGMMA the slot holds K_SUBSTEPS_UP back-to-back
+  // 128×128 SWZ128 atoms stacked along the K axis (one TMA per atom);
+  // bar_w[0] is armed once with the TOTAL tx_bytes so a single
+  // `mbarrier.try_wait.parity` on the calc side drains all atoms.
+  //
   // For subsequent experts inside the same helper invocation, the
   // previous expert's K-loop stitch (at s=K_TILES-1 COMPUTE) arms
   // bar_w[0] + TMAs w[0] of the next expert.  No pre-loop work there.
@@ -1050,16 +1058,26 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching calc-
   // warp wait on bar_w[0] inside the K-loop is also compiled out so
   // there is no spin-forever deadlock.
+  constexpr uint32_t UP_W_TX_BYTES_PER_SUBSTEP = 16384u;  // 128×128 fp8 atom
+  constexpr uint32_t UP_W_TX_BYTES_TOTAL =
+      UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;            // 16 KB / 32 KB
+  constexpr uint32_t UP_A_TX_BYTES_PER_SUBSTEP = 2048u;  // 8 tok × 128 K bf16
+  constexpr uint32_t UP_A_TX_BYTES_TOTAL =
+      UP_A_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 2 KB / 4 KB
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     const uint32_t first_id = shmem->experts[expert_start].id;
-    mbarrier_arrive_expect_tx(&shm->bar_w[0], /*tx_bytes=*/16384u);
-    tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/first_id,
-                           /*N=*/Dims::N,
-                           /*base_row_up=*/base_row_up,
-                           /*k_start=*/0u,
-                           /*dest_slot=*/&shm->w_wgmma[0][0][0],
-                           /*bar=*/&shm->bar_w[0]);
+    mbarrier_arrive_expect_tx(&shm->bar_w[0],
+                              /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
+    #pragma unroll
+    for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+      tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/first_id,
+                             /*N=*/Dims::N,
+                             /*base_row_up=*/base_row_up,
+                             /*k_start=*/kk * K_STEP_WGMMA,
+                             /*dest_slot=*/&shm->w_wgmma[0][kk * W_UP_M][0],
+                             /*bar=*/&shm->bar_w[0]);
+    }
   #endif
   }
 
@@ -1103,9 +1121,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     //                       and (on iter 0) publishes up_scale from the
     //                       prefetch warp's synchronous load above.
     //   COMPUTE half:
-    //     calc:      wait bar_w[s%2]; 4× WGMMA; scale-apply.
-    //     launcher:  arm + TMA the NEXT slot's weight (16 KB) AND bf16
-    //                (2 KB) tiles.  Both are issued here so the launcher
+    //     calc:      wait bar_w[s%2]; K_SUBSTEPS × (4× WGMMA + scale-apply).
+    //     launcher:  arm + TMA the NEXT slot's K_SUBSTEPS weight + bf16
+    //                atoms (UP_W_TX_BYTES_TOTAL + UP_A_TX_BYTES_TOTAL
+    //                bytes total).  Both are issued here so the launcher
     //                is guaranteed to run AFTER the calc warp's wait on
     //                bar_w[cur_slot] has completed (the __syncthreads()
     //                between QUANT and COMPUTE ensures this).  Issuing
@@ -1147,10 +1166,19 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         // `act_scale = 1.0` inside `moe_streaming_quantize_k128`
         // (ragged-batch isolation matches the cp.async reference
         // byte-for-byte on tokens `[0, batch_size)`).
+        //
+        // For K_STEP > K_STEP_WGMMA the slot holds K_SUBSTEPS_UP
+        // back-to-back 128-K bf16 / fp8 atoms; the quantize helper
+        // takes one [T_TILE][128] bf16 atom plus its [8][T_TILE][16]
+        // fp8 atom per call, with the per-128-K block scale written
+        // to `act_scale[tok][s * K_SUBSTEPS + kk]`.
         const uint32_t tok = warp;
-        moe_streaming_quantize_k128<Dims>(
-            shm->bf16_in[cur_slot], shm->fp8_act[cur_slot], tok, batch_size,
-            &shmem->act_scale[tok][s]);
+    #pragma unroll
+        for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+          moe_streaming_quantize_k128<Dims>(
+              shm->bf16_in[cur_slot][kk], shm->fp8_act[cur_slot][kk], tok,
+              batch_size, &shmem->act_scale[tok][s * K_SUBSTEPS + kk]);
+        }
   #endif
       }
 
@@ -1169,91 +1197,93 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   #endif
 
   #ifndef MONO_PROFILE_SKIP_CALC_UP
-        // WGMMA descriptor bases per WG.
-        // WG0: rows [0..63]  → &w_wgmma[slot][0][0]
-        // WG1: rows [64..127] → &w_wgmma[slot][0][0] + 64*128 (= 8192 B)
+        // WGMMA descriptor bases per WG.  In the M-stacked SHM layout,
+        // substep `kk` occupies SHM rows `[kk*128 .. kk*128 + 128)`,
+        // so the WG row offset (0 for WG0, 64 for WG1) is added on top
+        // of `kk * 128` to pick the per-WG 64-row half within each
+        // 128-row substep atom.
+        // WG0 substep 0: rows [0..63]    → &w_wgmma[slot][0][0]
+        // WG1 substep 0: rows [64..127]  → &w_wgmma[slot][64][0]
+        // WG0 substep 1: rows [128..191] → &w_wgmma[slot][128][0]
+        // WG1 substep 1: rows [192..255] → &w_wgmma[slot][192][0]
         const void* a_slot_base = (const void*)&shm->w_wgmma[cur_slot][0][0];
-        const void* a_base =
-            is_wg1 ? (const void*)((const char*)a_slot_base + 8192)
-                   : a_slot_base;
+        const uint32_t wg_offset_bytes = is_wg1 ? 8192u : 0u;
+        // Bytes between consecutive 128-row substep atoms in
+        // `w_wgmma[slot]`: 128 rows × 128 K-bytes = 16 KB.
+        constexpr uint32_t K_SUBSTEP_W_BYTES = 16384u;
 
-        wgmma_fence();
+        // Per-substep activation base: kk-th 1024-B SWZ128 atom inside
+        // the activation slot (addressed via `fp8_act[slot][kk]`).
 
-        // Chain 4 WGMMAs, each consuming K=32 (= 2 consecutive K-chunks
-        // of 16 from the fp8 activation tile).
+        // Chain 4 WGMMAs per K-substep, each consuming K=32 (= 2
+        // consecutive K-chunks of 16 from the fp8 activation tile).
+        // Scales are applied at every K=128 boundary (matching the
+        // block-wise FP8 scale granularity).
         constexpr uint32_t A_K_STRIDE = 2u * static_cast<uint32_t>(A_LBO);
     #pragma unroll
-        for (uint32_t j = 0; j < WGMMAS_PER_STEP; ++j) {
-          const void* a_ptr =
-              (const void*)((const char*)a_base + j * A_K_STRIDE);
-          const void* b_ptr = (const void*)&shm->fp8_act[cur_slot][j * 2][0][0];
-          uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
-          uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
-          wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
-                                       chunk_d2, chunk_d3);
+        for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+          // A new `wgmma.fence` is required at the start of every group
+          // of dependent WGMMAs (one fence ↔ one commit-group/wait-group
+          // pair below).  Folding the fence outside the kk loop relies
+          // on a single commit+wait pair covering all substeps, which
+          // would force the compiler to emit a single "supergroup" of
+          // WGMMAs without intermediate scale-apply ordering — incorrect.
+          wgmma_fence();
+
+          // Per-substep weight base: kk-th 128-row substep atom + this
+          // WG's 64-row half within the atom.
+          const void* a_kk_base =
+              (const void*)((const char*)a_slot_base + kk * K_SUBSTEP_W_BYTES +
+                            wg_offset_bytes);
+
+    #pragma unroll
+          for (uint32_t j = 0; j < WGMMAS_PER_SUBSTEP; ++j) {
+            const void* a_ptr =
+                (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
+            const void* b_ptr =
+                (const void*)&shm->fp8_act[cur_slot][kk][j * 2][0][0];
+            uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+            uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
+            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
+                                         chunk_d2, chunk_d3);
+          }
+
+          wgmma_commit_group();
+          wgmma_wait_group<0>();
+
+          // ── Scale-apply at the K=128 boundary (per-substep) ──────────
+          //
+          // HOT-PATH BRANCH HYGIENE (ptxas C7520 fix).  The chain of 4
+          // `wgmma.mma_async` above, and the one that will fire on the
+          // next K-substep, must not be separated by any *within-warp*
+          // divergent control flow.  When they are, ptxas inserts a
+          // WG.AR (warp-group arrive-release) fence into the divergent
+          // path and emits a C7520 perf warning.  Both former offenders
+          // (lane-divergent batch_size predicate and within-warp
+          // gate/up branch) are folded into unconditional reads — the
+          // quantize path zero-fills out-of-range tokens and writes
+          // `act_scale[tok][...] = 1.0f`, so the WGMMA sees a zero
+          // B-operand and the scale-apply is numerically irrelevant
+          // for those lanes.
+          //
+          // Scale indices for outer step `s`, substep `kk`:
+          //   * activation: `act_scale[tok][s * K_SUBSTEPS + kk]`
+          //   * weight:     `up_scale[0][s * K_SUBSTEPS + kk + ws_off]`
+          // For K_STEP_UP=K_STEP_WGMMA (legacy 128-K step) K_SUBSTEPS=1
+          // and the index collapses to the original `s` form.
+          const uint32_t kblk = s * K_SUBSTEPS + kk;
+          const uint32_t ws_off = is_gate_half ? 0u : UP_SCALE_COLS;
+          const float ws = shm->up_scale[0][kblk + ws_off];
+          const uint32_t tok_02 = (lane % 4) * 2;
+          const uint32_t tok_13 = tok_02 + 1;
+          const float as_02 = shmem->act_scale[tok_02][kblk];
+          const float as_13 = shmem->act_scale[tok_13][kblk];
+          final_d0 += chunk_d0 * ws * as_02;
+          final_d1 += chunk_d1 * ws * as_13;
+          final_d2 += chunk_d2 * ws * as_02;
+          final_d3 += chunk_d3 * ws * as_13;
+          chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
         }
-
-        wgmma_commit_group();
-        wgmma_wait_group<0>();
-
-        // ── Scale-apply at the K=128 boundary (once per step) ──────────
-        //
-        // HOT-PATH BRANCH HYGIENE (ptxas C7520 fix).  The chain of 4
-        // `wgmma.mma_async` above, and the one that will fire on the
-        // next K-step, must not be separated by any *within-warp*
-        // divergent control flow.  When they are, ptxas inserts a
-        // WG.AR (warp-group arrive-release) fence into the divergent
-        // path and emits:
-        //
-        //   (C7520) Potential Performance Loss: wgmma.mma_async
-        //   instructions are serialized due to program dependence on
-        //   compiler-inserted WG.AR in divergent path in the
-        //   function '..._moe_kernel_topk...'
-        //
-        // The two former offenders lived right here:
-        //
-        //   (1) `(tok_{02,13} < batch_size) ? act_scale[...][s] : 0.f`
-        //       `tok_02 = (lane % 4) * 2` and `tok_13 = tok_02 + 1`
-        //       give `{0,2,4,6}` and `{1,3,5,7}` across the 32 lanes
-        //       of each calc warp, so whenever `batch_size < 8`
-        //       different lanes of the SAME warp take different sides
-        //       of the predicate — a classic in-warp divergent load.
-        //   (2) `is_gate_half ? gate_ws : up_ws` issued two SHM loads
-        //       plus a `selp`; uniform-per-warp but still two
-        //       predicated loads sitting between successive WGMMA
-        //       chains.
-        //
-        // Both are safe to make UNCONDITIONAL:
-        //
-        //   * `moe_streaming_quantize_k128` already writes
-        //     `act_scale[tok][s] = 1.0f` AND zero-fills
-        //     `fp8_act[kc][tok][ki]` for every `tok >= batch_size`.
-        //     The WGMMA therefore sees a zero B-operand for those
-        //     lanes, so `chunk_d{0..3}` is 0 regardless of the
-        //     scaling value — the predicate was purely defensive and
-        //     contributed no numerical change.
-        //   * `tok_02, tok_13 ∈ [0, 8)` and `Dims::BS == 8`, so the
-        //     index into `act_scale[BS][...]` is statically safe
-        //     without a guard.
-        //   * The gate/up scale is a single SHM load with a computed
-        //     offset; the offset is warp-uniform, so ptxas folds it
-        //     into a single `ld.shared.f32` without any predicate.
-        //
-        // With both branches gone, the scale-apply is pure
-        // straight-line FMA over six per-lane registers — WG.AR no
-        // longer has to be stitched in between K-steps and the four
-        // chained WGMMAs can overlap as intended.
-        const uint32_t ws_off = is_gate_half ? 0u : UP_SCALE_COLS;
-        const float ws = shm->up_scale[0][s + ws_off];
-        const uint32_t tok_02 = (lane % 4) * 2;
-        const uint32_t tok_13 = tok_02 + 1;
-        const float as_02 = shmem->act_scale[tok_02][s];
-        const float as_13 = shmem->act_scale[tok_13][s];
-        final_d0 += chunk_d0 * ws * as_02;
-        final_d1 += chunk_d1 * ws * as_13;
-        final_d2 += chunk_d2 * ws * as_02;
-        final_d3 += chunk_d3 * ws * as_13;
-        chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
   #endif
       }
 
@@ -1264,6 +1294,12 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // previous iteration has completed before the launcher arms
       // bar_w[next_slot] for the next iteration.
       //
+      // For K_STEP > K_STEP_WGMMA the launcher issues K_SUBSTEPS_UP
+      // back-to-back TMAs per slot (one per 128-K substep, stacked
+      // along the K axis in SHM).  Both barriers are armed once with
+      // the TOTAL tx_bytes so a single `mbarrier.try_wait.parity` on
+      // the calc side drains all atoms.
+      //
       // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching
       // calc-warp waits on bar_{w,a}[next_slot] in the next iteration
       // are also compiled out so there is no spin-forever deadlock.
@@ -1273,36 +1309,51 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           // Intra-expert: fetch (s+1) tiles of the CURRENT expert.
           const uint32_t next_k_start = (s + 1) * K_STEP;
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
-                                    /*tx_bytes=*/16384u);
-          tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/id,
-                                 /*N=*/Dims::N,
-                                 /*base_row_up=*/base_row_up,
-                                 /*k_start=*/next_k_start,
-                                 /*dest_slot=*/&shm->w_wgmma[next_slot][0][0],
-                                 /*bar=*/&shm->bar_w[next_slot]);
+                                    /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+            tma_load_up_wgmma_tile(
+                up_weights_desc, /*expert_id=*/id,
+                /*N=*/Dims::N,
+                /*base_row_up=*/base_row_up,
+                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                /*bar=*/&shm->bar_w[next_slot]);
+          }
           mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                    /*tx_bytes=*/2048u);
-          tma_load_bf16_input_tile(activations_desc,
-                                   /*k_start=*/next_k_start,
-                                   &shm->bf16_in[next_slot][0][0],
-                                   &shm->bar_a[next_slot]);
+                                    /*tx_bytes=*/UP_A_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+            tma_load_bf16_input_tile(
+                activations_desc,
+                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                &shm->bf16_in[next_slot][kk][0][0], &shm->bar_a[next_slot]);
+          }
         } else if (has_next_e) {
           // End-of-expert stitch: fetch iter-0 tiles of the NEXT expert.
           // For K_TILES even, `next_slot == 0` — matches the next
           // expert's iter-0 cur_slot.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
-                                    /*tx_bytes=*/16384u);
-          tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/next_id,
-                                 /*N=*/Dims::N,
-                                 /*base_row_up=*/base_row_up,
-                                 /*k_start=*/0u,
-                                 /*dest_slot=*/&shm->w_wgmma[next_slot][0][0],
-                                 /*bar=*/&shm->bar_w[next_slot]);
+                                    /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+            tma_load_up_wgmma_tile(
+                up_weights_desc, /*expert_id=*/next_id,
+                /*N=*/Dims::N,
+                /*base_row_up=*/base_row_up,
+                /*k_start=*/kk * K_STEP_WGMMA,
+                /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
+                /*bar=*/&shm->bar_w[next_slot]);
+          }
           mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                    /*tx_bytes=*/2048u);
-          tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
-                                   &shm->bf16_in[next_slot][0][0],
-                                   &shm->bar_a[next_slot]);
+                                    /*tx_bytes=*/UP_A_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
+            tma_load_bf16_input_tile(activations_desc,
+                                     /*k_start=*/kk * K_STEP_WGMMA,
+                                     &shm->bf16_in[next_slot][kk][0][0],
+                                     &shm->bar_a[next_slot]);
+          }
         }
           // Else: last expert's last iteration — leave barriers idle.
   #endif

@@ -160,6 +160,14 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     // doubling the per-slot weight tile in SHM.  See `down_k_step` in
     // moe_internal.h for the cost breakdown.
     static constexpr std::uint32_t K_STEP_DOWN = 256;
+    // Up-projection outer K-step width (must be a multiple of 128).
+    // Default 128 matches the SWZ128 atom K-width and reproduces the
+    // legacy single-substep behaviour.  Set to 256 to halve the number
+    // of outer K-iterations (Dims::HIDDEN_STATES / K_STEP_UP), at the
+    // cost of doubling the per-slot bf16/fp8 activation tile and the
+    // per-slot weight tile in SHM.  See `up_k_step` in moe_internal.h
+    // for the cost breakdown.
+    static constexpr std::uint32_t K_STEP_UP = 256;
   };
 };
 
