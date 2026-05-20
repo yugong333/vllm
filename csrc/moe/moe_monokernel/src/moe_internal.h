@@ -187,6 +187,46 @@ struct down_k_step {
   static constexpr std::uint32_t value = test<Dims>(0);
 };
 
+// ── Up-proj K-step size opt-in detection ────────────────────────────────
+// `Dims::KernelConfig::K_STEP_UP` is optional; default to 128 (= the
+// up-proj's existing K_STEP_WGMMA, which matches the SWZ128 atom
+// K-width and the per-K-step block-wise FP8 scale boundary).  Set to
+// 256 in a Dims variant to halve the number of outer K-iterations of
+// the up-proj K-loop, doubling per-iter work so the launcher + bar
+// arms + sync overhead is amortized over more compute.
+//
+// Must be a multiple of 128 (the SWZ128 atom K-width) and a divisor of
+// `Dims::HIDDEN_STATES` (the up-proj reduction dim).
+//
+// Costs of K_STEP_UP > 128:
+//   * `bf16_in` slot grows to `T_TILE * K_STEP_UP * 2` bytes.
+//   * `fp8_act` slot grows to `(K_STEP_UP / FP8_ACT_K_CHUNK) * T_TILE
+//     * FP8_ACT_K_CHUNK = T_TILE * K_STEP_UP` bytes.
+//   * `w_wgmma` slot grows to `W_UP_TILE_WGMMA * K_STEP_UP` bytes.
+//   * One `bar_w` / `bar_a` arm covers `K_STEP_UP / K_STEP_WGMMA` ×
+//     the per-128-K payload; a single mbarrier wait drains all
+//     substeps.
+//   * The QUANT / WGMMA loop runs `K_SUBSTEPS_UP = K_STEP_UP / 128`
+//     inner 128-K sub-blocks per outer K-step; scales are applied at
+//     every 128-K boundary (matching the block-wise FP8 quantization
+//     granularity).
+template <typename Dims>
+struct up_k_step {
+ private:
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::KernelConfig::K_STEP_UP) {
+    return (std::uint32_t)D::KernelConfig::K_STEP_UP;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return 128u;
+  }
+
+ public:
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
 /**
  * @brief Scratchpad memory for use within the monokernel.
  *
@@ -611,6 +651,31 @@ struct MoECoreDims {
                 "down-projection (one outer K-step consumes K_STEP_DOWN "
                 "K-elements).");
 
+  // ── Up-proj outer K-step (Dims::KernelConfig::K_STEP_UP tunable) ────
+  // K_STEP_UP is the K-width consumed per OUTER K-step of the up-
+  // projection K-loop; multiple of K_STEP_WGMMA = 128 (the SWZ128 atom
+  // K-width and the per-128-K block-wise FP8 scale boundary).
+  // Defaults to 128 (= K_STEP_WGMMA) for full backward compatibility;
+  // setting `KernelConfig::K_STEP_UP = 256` halves the K-loop iter
+  // count and doubles per-iter QUANT/COMPUTE work.
+  //
+  // Each outer K-step runs `K_SUBSTEPS_UP = K_STEP_UP / K_STEP_WGMMA`
+  // inner 128-K sub-blocks; the QUANT half quantizes one 128-K bf16
+  // input chunk per substep, and the COMPUTE half runs 4 chained
+  // m64n8k32 WGMMAs + scale-apply per substep.
+  static constexpr std::uint32_t K_STEP_UP = up_k_step<Dims>::value;
+  static constexpr std::uint32_t K_SUBSTEPS_UP = K_STEP_UP / K_STEP_WGMMA;
+  static_assert(K_STEP_UP >= K_STEP_WGMMA && K_STEP_UP % K_STEP_WGMMA == 0,
+                "K_STEP_UP must be a positive multiple of K_STEP_WGMMA "
+                "(=128, the SWZ128 atom K-width).");
+  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % K_STEP_UP == 0,
+                "Dims::HIDDEN_STATES must be a multiple of K_STEP_UP for "
+                "the WGMMA up-projection (one outer K-step consumes "
+                "K_STEP_UP K-elements of the reduction dim).");
+  // Up-proj outer K-loop iteration count (replaces K_TILES_WGMMA in
+  // call sites that should follow the K_STEP_UP setting).
+  static constexpr std::uint32_t K_TILES_UP = Dims::HIDDEN_STATES / K_STEP_UP;
+
   // Effective M (row-tile) size of one block's up-proj work — 64 for the
   // WGMMA path, 16 for the scalar path.  Used to compute UP_GRID = 2*N/M.
   static constexpr std::uint32_t W_UP_TILE_EFFECTIVE =
@@ -753,10 +818,18 @@ struct MoE_SHM {
     // 16-byte aligned as required by the SM90 mbarrier PTX ops.
     struct TinyDataWGMMA_TMA {
       // ── Streaming activation pipeline ──────────────────────────────
+      // Up-proj activation tile size scales with K_STEP_UP (= 128 by
+      // default; 256 with the K_STEP_UP=256 opt-in).  Each slot holds
+      // K_SUBSTEPS_UP 128-K SWZ128-friendly bf16 / fp8 atoms stacked
+      // along an inner substep dimension.
       static constexpr uint32_t BF16_IN_K = CoreDims::K_STEP_WGMMA;  // 128
-      A_element bf16_in[2][CoreDims::T_TILE][BF16_IN_K];
+      static constexpr uint32_t UP_K_SUBSTEPS = CoreDims::K_SUBSTEPS_UP;
+      A_element bf16_in[2][UP_K_SUBSTEPS][CoreDims::T_TILE][BF16_IN_K];
 
       static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
+      // Number of 16-K fp8 chunks per ONE 128-K SWZ128 atom (the unit
+      // shared by the up-proj's per-substep layout and the down-proj's
+      // per-substep layout).  Always 128 / 16 = 8.
       static constexpr uint32_t FP8_ACT_NUM_CHUNKS =
           CoreDims::K_STEP_WGMMA / FP8_ACT_K_CHUNK;  // 128 / 16 = 8
 
@@ -787,9 +860,9 @@ struct MoE_SHM {
         // a sequence of `DOWN_ACT_K_SUBSTEPS` 1024-B atoms — each
         // atom is exactly one K_STEP_WGMMA=128 K-substep of the
         // outer K-step.
-        alignas(1024)
-            AQ_element fp8_act[2][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                              [FP8_ACT_K_CHUNK];  // 2 KB (up)
+        alignas(1024) AQ_element
+            fp8_act[2][UP_K_SUBSTEPS][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
+                   [FP8_ACT_K_CHUNK];  // 2 KB / 4 KB (up)
         alignas(1024)
             AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
                                    [FP8_ACT_NUM_CHUNKS]
@@ -805,7 +878,18 @@ struct MoE_SHM {
       // multiple of 128 so the SWIZZLE_128B core-matrix atoms still tile
       // the outer M axis cleanly.
       static constexpr uint32_t W_DOWN_WGMMA_M = CoreDims::DOWN_COL_TILE;
-      static constexpr uint32_t W_WGMMA_K = CoreDims::K_STEP_WGMMA;  // 128
+      // K dim of the up-proj weight tile is held at K_STEP_WGMMA (= 128)
+      // so the row stride matches the SWIZZLE_128B core-matrix width.
+      // For K_STEP_UP > 128 we stack `K_SUBSTEPS_UP` 128-K SWZ128 atoms
+      // along the M axis (substep 0 → rows [0..127], substep 1 → rows
+      // [128..255], …) — same trick the down-proj uses for K_STEP_DOWN.
+      // Each atom remains a self-contained 1024-B-aligned 128×128 region
+      // so the TMA swizzle and the WGMMA A-descriptor (which addresses
+      // one 128-row sub-atom per call) both work without a row-stride
+      // change.
+      static constexpr uint32_t W_WGMMA_K = CoreDims::K_STEP_WGMMA;
+      static constexpr uint32_t W_WGMMA_M_TOTAL =
+          W_WGMMA_M * CoreDims::K_SUBSTEPS_UP;
       // Down-proj outer K-step width (tunable via Dims::KernelConfig::
       // K_STEP_DOWN, default = 128).  Each outer K-step packs
       // `K_SUBSTEPS_DOWN` 128-K sub-blocks into the same SHM slot,
@@ -821,26 +905,32 @@ struct MoE_SHM {
         // `w_wgmma` and `w_down_wgmma` alias the same SHM bytes, so
         // the alignas applies to both views.
         //
-        // Pre Phase 2a (DOWN_COL_TILE=128, K_STEP_DOWN=128):
-        //   w_wgmma     : [2][128][128] = 32 KB
-        //   w_down_wgmma: [2][128][128] = 32 KB
+        // Sizing (per slot):
+        //   w_wgmma[2][W_WGMMA_M_TOTAL][K_STEP_WGMMA=128]
+        //     K_STEP_UP=128: W_WGMMA_M_TOTAL=128 → 16 KB
+        //     K_STEP_UP=256: W_WGMMA_M_TOTAL=256 → 32 KB
+        //                    (2 substeps × 128 M rows × 128 K bytes
+        //                     stacked along M)
+        //   w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL][K_STEP_WGMMA=128]
+        //     DOWN_COL_TILE=128, K_STEP_DOWN=128: 16 KB
+        //     DOWN_COL_TILE=256, K_STEP_DOWN=128: 32 KB
+        //     DOWN_COL_TILE=256, K_STEP_DOWN=256: 64 KB (2 substeps ×
+        //                                                256 M rows ×
+        //                                                128 K bytes
+        //                                                stacked along M)
         //
-        // Post Phase 2a baseline (DOWN_COL_TILE=256, K_STEP_DOWN=128):
-        //   w_down_wgmma: [2][256][128] = 64 KB
-        //
-        // K_STEP_DOWN=256 (DOWN_COL_TILE=256):
-        //   w_down_wgmma: [2][512][128] = 128 KB  (2 K-substeps × 256 M
-        //                                          rows × 128 K-bytes,
-        //                                          stacked along M as
-        //                                          contiguous 128-row
-        //                                          SWZ128 atoms)
-        //
-        // The up-proj only uses the leading 32 KB of the union; the
-        // tail bytes are unused during Phase 3.
-        alignas(1024)
-            W_element w_wgmma[2][W_WGMMA_M][W_WGMMA_K];  // 32 KB (up-proj)
-        alignas(1024) W_element w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
-                                            [W_WGMMA_K];  // 32..128 KB (down)
+        // The union picks max(W_UP_BYTES, W_DOWN_BYTES); the smaller
+        // view's tail bytes are unused during its phase (up-proj
+        // doesn't touch the down view, and vice versa, separated by
+        // the Phase 3→4 grid sync).
+        alignas(1024) W_element
+            w_wgmma[2][W_WGMMA_M_TOTAL]
+                   [W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
+        alignas(1024) W_element
+            w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
+                        [CoreDims::K_STEP_WGMMA];  // 128 wide × M
+                                                   // stacked atoms
+                                                   // (down-proj)
       };
 
       static constexpr uint32_t DOWN_ACT_HALVES_PER_EXPERT =

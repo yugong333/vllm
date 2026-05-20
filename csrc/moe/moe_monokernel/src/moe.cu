@@ -133,14 +133,27 @@ __device__ void moe_kernel_topk_BS8(
     // for Phase 2.  The arm happens on the same thread that just did the
     // init, so no fence is required between them.
     //
+    // For K_STEP_UP > K_STEP_WGMMA the iter-0 activation slot holds
+    // K_SUBSTEPS_UP back-to-back 128-K bf16 atoms (one per substep);
+    // bar_a[0] is armed once with the TOTAL tx_bytes so a single
+    // `mbarrier.try_wait.parity` on the calc side drains all atoms.
+    //
     // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching calc-
     // warp wait on bar_a[0] inside the up-proj helper is also compiled
     // out so there is no spin-forever deadlock.  The calc warps read
     // garbage from the still-uninitialized `bf16_in[0]` slot and the
     // kernel produces junk output — useful only for timing.
-    mbarrier_arrive_expect_tx(&u_tma->bar_a[0], /*tx_bytes=*/2048u);
-    tma_load_bf16_input_tile(activations_desc, /*k_start=*/0u,
-                             &u_tma->bf16_in[0][0][0], &u_tma->bar_a[0]);
+    constexpr std::uint32_t UP_A_TX_BYTES_PER_SUBSTEP_P1 = 2048u;
+    constexpr std::uint32_t UP_A_TX_BYTES_TOTAL_P1 =
+        UP_A_TX_BYTES_PER_SUBSTEP_P1 * CoreDims::K_SUBSTEPS_UP;
+    mbarrier_arrive_expect_tx(&u_tma->bar_a[0],
+                              /*tx_bytes=*/UP_A_TX_BYTES_TOTAL_P1);
+  #pragma unroll
+    for (std::uint32_t kk = 0; kk < CoreDims::K_SUBSTEPS_UP; ++kk) {
+      tma_load_bf16_input_tile(activations_desc,
+                               /*k_start=*/kk * CoreDims::K_STEP_WGMMA,
+                               &u_tma->bf16_in[0][kk][0][0], &u_tma->bar_a[0]);
+    }
 #endif
   }
   if (is_prefetch_warp<Dims>()) {
