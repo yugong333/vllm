@@ -199,14 +199,11 @@ struct down_k_step {
 // `Dims::HIDDEN_STATES` (the up-proj reduction dim).
 //
 // Costs of K_STEP_UP > 128:
-//   * `bf16_in` slot grows to `T_TILE * K_STEP_UP * 2` bytes.
-//   * `fp8_act` slot grows to `(K_STEP_UP / FP8_ACT_K_CHUNK) * T_TILE
-//     * FP8_ACT_K_CHUNK = T_TILE * K_STEP_UP` bytes.
 //   * `w_wgmma` slot grows to `W_UP_TILE_WGMMA * K_STEP_UP` bytes.
-//   * One `bar_w` / `bar_a` arm covers `K_STEP_UP / K_STEP_WGMMA` ×
+//   * One `bar_w` arm covers `K_STEP_UP / K_STEP_WGMMA` ×
 //     the per-128-K payload; a single mbarrier wait drains all
 //     substeps.
-//   * The QUANT / WGMMA loop runs `K_SUBSTEPS_UP = K_STEP_UP / 128`
+//   * The WGMMA loop runs `K_SUBSTEPS_UP = K_STEP_UP / 128`
 //     inner 128-K sub-blocks per outer K-step; scales are applied at
 //     every 128-K boundary (matching the block-wise FP8 quantization
 //     granularity).
@@ -800,31 +797,117 @@ struct MoE_SHM {
     //
     // Used when `use_wgmma<Dims>::value && use_tma<Dims>::value` are both
     // true — the TMA-based activation & weight loading path for the BS8
-    // WGMMA up-projection.  Layout is identical to the pre-TMA streaming
-    // WGMMA SHM layout with two pairs of 64-bit mbarriers appended:
+    // WGMMA up- and down-projections.
     //
-    //   * bar_w[2]  — 16 B, one weight-tile barrier per double-buffer slot.
-    //                 Armed by the TMA launcher with tx_bytes = 16384
-    //                 (one 128×128 fp8 weight tile) before the 4-subtile
-    //                 `cp.async.bulk.tensor.2d` stripe sequence.  Consumed
-    //                 by the WGMMA warps via `mbarrier.try_wait.parity`.
-    //   * bar_a[2]  — 16 B, one activation-tile barrier per double-buffer
-    //                 slot.  Armed by the launcher with tx_bytes = 2048
-    //                 (one 8×128 bf16 tile) before the single activation
-    //                 `cp.async.bulk.tensor.2d`.  Consumed by the calc
-    //                 warps inside the streaming quantize step.
+    // Routing-window pipeline (Phase 1 → Phase 2 → Phase 3):
+    //   * `bf16_in_full` — routing-window BF16 buffer.  Populated in
+    //     Phase 1 by the TMA launcher via a single 16-issue
+    //     `cp.async.bulk.tensor.2d` loop covering the full per-block
+    //     `[BS][HIDDEN_STATES]` BF16 input tile.  Completion is
+    //     signalled on `bar_rwin`; consumed by Phase 2's
+    //     `routing_phase_quantize` and dead by the Phase-2 trailing
+    //     `__syncthreads()`.
+    //   * `fp8_act_full` — routing-phase-quantized FP8 buffer covering
+    //     all `K_BLOCKS_TOTAL` 128-K substeps.  Written by Phase 2's
+    //     `routing_phase_quantize` (warps 1..11), read by the Phase-3
+    //     up-projection K-loop with no double-buffer slot alternation
+    //     (Req 3.4, 3.5).
+    //   * `a_down_wgmma` — down-projection activation buffer (Phase 4).
+    //     Populated by the down-proj's per-expert TMA bulk activation
+    //     load and consumed by the down-proj WGMMA K-loop.  Aliases
+    //     SHM bytes that are dead by the time Phase 4 starts (the
+    //     Phase-3 → Phase-4 grid sync serializes the reuse).
     //
-    // Both barrier arrays are `alignas(16)` so their start addresses are
-    // 16-byte aligned as required by the SM90 mbarrier PTX ops.
+    // mbarriers (all `alignas(16)` to satisfy the SM90 mbarrier PTX
+    // alignment requirement):
+    //   * bar_w[2]  — weight-tile mbarriers (one per double-buffer
+    //                 slot).  Armed by the TMA launcher with the
+    //                 per-arm weight tx_bytes before the
+    //                 `cp.async.bulk.tensor.2d` stripe sequence.
+    //                 Consumed by the WGMMA warps via
+    //                 `mbarrier.try_wait.parity` in both the up- and
+    //                 down-projection K-loops.
+    //   * bar_a[2]  — down-projection activation-tile mbarriers (one
+    //                 per double-buffer slot).  Armed and consumed
+    //                 EXCLUSIVELY by `moe_down_projection_BS8_..._tma`
+    //                 (Phase 4); re-initialized in the down-proj
+    //                 prologue.  No up-proj consumer remains —
+    //                 Phase-3 sources its activation operand from
+    //                 `fp8_act_full`.
+    //   * bar_rwin  — routing-window mbarrier (`arrival_count = 1`).
+    //                 Armed by the TMA launcher in Phase 1 with
+    //                 `tx_bytes = BS * K_BLOCKS_TOTAL * K_STEP_WGMMA *
+    //                 sizeof(A_element)` (= 32 KB for Qwen3.5).
+    //                 Consumed by warps 1..11 at the start of Phase 2
+    //                 before reading `bf16_in_full`.
     struct TinyDataWGMMA_TMA {
-      // ── Streaming activation pipeline ──────────────────────────────
-      // Up-proj activation tile size scales with K_STEP_UP (= 128 by
-      // default; 256 with the K_STEP_UP=256 opt-in).  Each slot holds
-      // K_SUBSTEPS_UP 128-K SWZ128-friendly bf16 / fp8 atoms stacked
-      // along an inner substep dimension.
-      static constexpr uint32_t BF16_IN_K = CoreDims::K_STEP_WGMMA;  // 128
+      // ── K-substep constants ────────────────────────────────────────
+      // `UP_K_SUBSTEPS` is the number of 128-K SWZ128 atoms per outer
+      // up-proj K-step (= K_STEP_UP / K_STEP_WGMMA).
       static constexpr uint32_t UP_K_SUBSTEPS = CoreDims::K_SUBSTEPS_UP;
-      A_element bf16_in[2][UP_K_SUBSTEPS][CoreDims::T_TILE][BF16_IN_K];
+      // Total number of 128-K SWZ128 atoms per token along the K axis
+      // (= Dims::HIDDEN_STATES / K_STEP_WGMMA).  Equal to 16 for
+      // Qwen3.5 (HIDDEN_STATES = 2048).  Used by the new Phase-1
+      // routing-window TMA load (covers the full BF16 input tile in
+      // K_BLOCKS_TOTAL bulk loads — Option B in the design's
+      // "TMA-granularity decision") and by the new single-buffer
+      // `fp8_act_full` that covers all K substeps for Phase-3
+      // direct FP8 reads (Req 3.4, 3.5; design "Single-buffer
+      // fp8_act covering all K substeps").
+      static constexpr uint32_t K_BLOCKS_TOTAL =
+          Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
+
+      // ── BS-dependent sizing clamp for the BS8-path-only fields ─────
+      // The new `bf16_in_full` and `fp8_act_full` fields below are
+      // consumed only by the BS8 TMA+WGMMA path (this entire fusion is
+      // scoped to that path — see the spec's Req 7.1, 7.2, 7.3, 7.6).
+      // The `tiny_wgmma_tma` variant of `union U` is, however, present
+      // in `MoE_SHM<Dims>` for every Dims, and `sizeof(MoE_SHM<Dims>)`
+      // takes the max across all union members.  To keep the BS64
+      // path's `MoE_SHM<Dims>` size byte-identical to the
+      // pre-optimization baseline (Req 7.1), we collapse the BS-
+      // dependent extents of the new fields to 1 when `Dims::BS > 8`
+      // and to their natural value otherwise.  The runtime BS8
+      // dispatch never reads the BS64-instantiated views; the BS64
+      // dispatch never reads `tiny_wgmma_tma` at all (it uses the
+      // `path.bs64` arm of the outer union).
+      //
+      // Tile-major shape (Req 1.4, 1.5; design "TMA-granularity
+      // decision"): the BF16 input SHM buffer is shaped as
+      // `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` rather than the natural-
+      // looking `[BS][HIDDEN_STATES]` because the activation TMA
+      // descriptor (`create_activations_tma_desc`) is configured with
+      // `boxDim = (128, 8)` (innermost = K, outer = tokens) and
+      // SWIZZLE_NONE.  Each `cp.async.bulk.tensor.2d` issued by
+      // `moe_load_full_bf16_input` writes a COMPACT 8 × 128 BF16 box
+      // (= 2 KB) to SHM with the box's outer-row stride equal to the
+      // INNER box dim (256 B), NOT to the destination's logical row
+      // stride.  With a `[BS][HIDDEN_STATES]` SHM layout (row stride
+      // = HIDDEN_STATES * 2 = 4096 B for Qwen3.5), consecutive
+      // K-substep TMA writes would overlap by ~1.75 KB and corrupt
+      // each other (the TMA byte layout would not match the
+      // consumer's row-strided indexing).
+      //
+      // The tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` layout
+      // gives every K-substep its own self-contained 2 KB slab whose
+      // bytes are exactly the bytes the TMA writes for that
+      // `(coord0 = k_start, coord1 = 0)` issue.  Consumers
+      // (`routing_phase_quantize`) read `bf16_in_full[kblk][token]`
+      // as a natural `[K_STEP_WGMMA]` row — no row-stride
+      // reinterpretation needed.
+      //
+      // Total size is identical to the prior `[BS][HIDDEN_STATES]`
+      // shape: 16 × 8 × 128 × 2 = 32 KB for Qwen3.5, so the union
+      // with `w_wgmma` / `w_down_wgmma` and the per-Dims SHM-budget
+      // static_assert (≤ 228 KB) are unaffected.
+      static constexpr uint32_t BF16_IN_FULL_K_BLOCKS =
+          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+      static constexpr uint32_t BF16_IN_FULL_BS =
+          (Dims::BS <= 8) ? Dims::BS : 1;
+      static constexpr uint32_t BF16_IN_FULL_K =
+          (Dims::BS <= 8) ? CoreDims::K_STEP_WGMMA : 1;
+      static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS =
+          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
 
       static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
       // Number of 16-K fp8 chunks per ONE 128-K SWZ128 atom (the unit
@@ -842,33 +925,44 @@ struct MoE_SHM {
       static constexpr uint32_t DOWN_FP8_ACT_NUM_CHUNKS =
           CoreDims::K_STEP_DOWN / FP8_ACT_K_CHUNK;  // 128 or 256 / 16
 
-      union {
-        // 1024-byte alignment required by SWIZZLE_128B on the down-proj
-        // activation TMA: the XOR pattern uses low bits of the SHM
-        // address and only behaves consistently within 1024-B-aligned
-        // regions.  `fp8_act` and `a_down_wgmma` alias the same 2 KB
-        // region (one SWZ128 atom per slot), and the grid.sync between
-        // Phase 3 and Phase 4 serializes the two views so the reuse is
-        // safe.
-        //
-        // `fp8_act` keeps the canonical K-major [kc][tok][ki] view —
-        // the up-proj activation path stays on SWIZZLE_NONE with
-        // software quantize populating SHM.  `a_down_wgmma` uses the
-        // (sub-step, token, kc, ki) view that matches the CUTLASS
-        // Major::K B128 layout after the TMA's SWZ128 XOR.  The
-        // sub-step dimension is collapsed into the leading axis as
-        // a sequence of `DOWN_ACT_K_SUBSTEPS` 1024-B atoms — each
-        // atom is exactly one K_STEP_WGMMA=128 K-substep of the
-        // outer K-step.
-        alignas(1024) AQ_element
-            fp8_act[2][UP_K_SUBSTEPS][FP8_ACT_NUM_CHUNKS][CoreDims::T_TILE]
-                   [FP8_ACT_K_CHUNK];  // 2 KB / 4 KB (up)
-        alignas(1024)
-            AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
-                                   [FP8_ACT_NUM_CHUNKS]
-                                   [FP8_ACT_K_CHUNK];  // 2 KB (down, K=128)
-                                                       // 4 KB (down, K=256)
-      };
+      // 1024-byte alignment required by SWIZZLE_128B on the down-proj
+      // activation TMA: the XOR pattern uses low bits of the SHM
+      // address and only behaves consistently within 1024-B-aligned
+      // regions.
+      //
+      // `a_down_wgmma` is the down-projection activation buffer
+      // (Phase 4).  It uses the (sub-step, token, kc, ki) view that
+      // matches the CUTLASS Major::K B128 layout after the TMA's
+      // SWZ128 XOR.  The sub-step dimension is collapsed into the
+      // leading axis as a sequence of `DOWN_ACT_K_SUBSTEPS` 1024-B
+      // atoms — each atom is exactly one K_STEP_WGMMA=128 K-substep
+      // of the outer K-step.
+      alignas(1024)
+          AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
+                                 [FP8_ACT_NUM_CHUNKS]
+                                 [FP8_ACT_K_CHUNK];  // 2 KB (down, K=128)
+                                                     // 4 KB (down, K=256)
+
+      // ── NEW: single-buffer fp8_act covering all K substeps ──────────
+      // Single-buffer FP8 activation buffer for the BS8 TMA+WGMMA
+      // post-fusion Phase-3 reads (Req 3.4, 3.5; design "Single-buffer
+      // fp8_act covering all K substeps").  Indexed by `k_block ∈
+      // [0, K_BLOCKS_TOTAL)`; the up-proj K-loop reads
+      // `fp8_act_full[s * UP_K_SUBSTEPS + kk][...]` with no slot
+      // alternation.  Layout per `k_block`: `[FP8_ACT_NUM_CHUNKS]
+      // [T_TILE][FP8_ACT_K_CHUNK]` — same atom shape as the now-
+      // removed legacy `fp8_act` slot.
+      //
+      // Sizing (Qwen3.5, K_BLOCKS_TOTAL=16): 16 × 8 × 8 × 16 = 16 KB.
+      //
+      // The BS-dependent extent (`FP8_ACT_FULL_K_BLOCKS`) collapses
+      // to 1 for `Dims::BS > 8` so the BS64 path's `MoE_SHM<Dims>`
+      // size stays byte-identical to the pre-optimization baseline
+      // (Req 7.1).  See the BF16_IN_FULL_BS / BF16_IN_FULL_K
+      // comment above K_BLOCKS_TOTAL for the rationale.
+      alignas(1024)
+          AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
+                                 [CoreDims::T_TILE][FP8_ACT_K_CHUNK];
 
       static constexpr uint32_t W_WGMMA_M =
           128;  // M dim of weight tile (up-proj)
@@ -905,6 +999,46 @@ struct MoE_SHM {
         // `w_wgmma` and `w_down_wgmma` alias the same SHM bytes, so
         // the alignas applies to both views.
         //
+        // ── NEW: full BF16 input tile, unioned with w_wgmma + w_down_wgmma
+        // (Req 4.1, 4.2, 4.3; design "Data Models" / "Aliasing safety").
+        //
+        // `bf16_in_full[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]`
+        //   = 16 × 8 × 128 × 2 = 32 KB for Qwen3.5.
+        // Lifetime: written by the Phase-1 routing-window TMA, read
+        // by the Phase-2 routing_phase_quantize, dead by the Phase-2
+        // trailing __syncthreads().  Aliases bytes with w_wgmma /
+        // w_down_wgmma whose lifetimes start strictly later (Phase 3
+        // up-proj weight TMA / Phase 4 down-proj weight TMA), so the
+        // union is byte-disjoint at any instant in time.
+        //
+        // Tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` layout (vs.
+        // the apparently-natural `[BS][HIDDEN_STATES]`): the
+        // activation TMA descriptor uses `boxDim = (128, 8)` and
+        // SWIZZLE_NONE, so each
+        // `cp.async.bulk.tensor.2d` writes a COMPACT 8 × 128 BF16
+        // box to SHM whose outer (token) stride equals the inner
+        // box dim (256 B), NOT the destination's logical row stride.
+        // With a `[BS][HIDDEN_STATES]` layout (row stride 4 KB on
+        // Qwen3.5), consecutive K-substep TMA writes would overlap
+        // by ~1.75 KB and corrupt each other.  The tile-major
+        // layout gives every K-substep its own self-contained 2 KB
+        // slot at offset `kblk * (BS * K_STEP_WGMMA * 2)`, matching
+        // the TMA's natural compact write order, and lets
+        // `routing_phase_quantize` read `bf16_in_full[kblk][token]`
+        // as a natural `[K_STEP_WGMMA]` row.
+        //
+        // Aligned to 1024 B to inherit the SWZ128 alignment of the
+        // unioned weight buffers (the bf16 activation TMA descriptor
+        // itself uses SWIZZLE_NONE so 16 B alignment would suffice).
+        //
+        // Sizing is BS-clamped (`BF16_IN_FULL_K_BLOCKS` /
+        // `BF16_IN_FULL_BS` / `BF16_IN_FULL_K`) so the field
+        // collapses to a 1×1×1 placeholder for `Dims::BS > 8`,
+        // keeping the BS64 path's `MoE_SHM<Dims>` size byte-
+        // identical to the pre-optimization baseline (Req 7.1).
+        // See the BF16_IN_FULL_K_BLOCKS / BF16_IN_FULL_BS /
+        // BF16_IN_FULL_K comment above for the rationale.
+        //
         // Sizing (per slot):
         //   w_wgmma[2][W_WGMMA_M_TOTAL][K_STEP_WGMMA=128]
         //     K_STEP_UP=128: W_WGMMA_M_TOTAL=128 → 16 KB
@@ -919,10 +1053,16 @@ struct MoE_SHM {
         //                                                128 K bytes
         //                                                stacked along M)
         //
-        // The union picks max(W_UP_BYTES, W_DOWN_BYTES); the smaller
-        // view's tail bytes are unused during its phase (up-proj
-        // doesn't touch the down view, and vice versa, separated by
-        // the Phase 3→4 grid sync).
+        // The union picks max(BF16_IN_FULL_BYTES, W_UP_BYTES,
+        // W_DOWN_BYTES); the smaller view's tail bytes are unused
+        // during its phase (Phase 1/2 doesn't touch the weight
+        // views, Phase 3 doesn't touch the bf16 input view, and
+        // Phase 4 doesn't touch the up-proj weight view — separated
+        // by the Phase-2 trailing __syncthreads() and the Phase 3→4
+        // grid sync).
+        alignas(1024) A_element
+            bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
+                        [BF16_IN_FULL_K];  // 32 KB (Phase 1/2)
         alignas(1024) W_element
             w_wgmma[2][W_WGMMA_M_TOTAL]
                    [W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
@@ -981,15 +1121,38 @@ struct MoE_SHM {
       // before the 4 sub-tile TMAs that populate `w_wgmma[slot]`; WGMMA
       // consumers poll via `mbarrier.try_wait.parity` (R3.1, R3.3, R3.5).
       //
-      // Activation-tile mbarriers (one per double-buffer slot).  The
-      // launcher arms `bar_a[slot]` with `tx_bytes=2048` before the
-      // single TMA that populates `bf16_in[slot]`; the streaming quantize
-      // consumers poll via `mbarrier.try_wait.parity` (R3.1, R3.4, R3.6).
+      // Down-projection activation-tile mbarriers (one per double-
+      // buffer slot).  Used EXCLUSIVELY by the down-projection
+      // (Phase 4): the down-proj launcher arms `bar_a[slot]` before
+      // each per-expert bulk activation TMA into `a_down_wgmma[slot]`,
+      // and the down-proj WGMMA K-loop waits via
+      // `mbarrier.try_wait.parity`.  Re-initialized in the down-proj
+      // prologue (`moe_down_projection.cu`) so the up-side init in
+      // `moe.cu`'s prologue is no longer required.  No up-projection
+      // consumer remains — Phase 3 sources its activation operand
+      // from `fp8_act_full`.
       //
       // `alignas(16)` satisfies R11.4 and the 16-byte alignment that the
       // SM90 `mbarrier.*.shared::cta.b64` instructions require.
       alignas(16) uint64_t bar_w[2];  // 16 B
       alignas(16) uint64_t bar_a[2];  // 16 B
+
+      // ── NEW: routing-window mbarrier (Req 1.5, 1.6) ─────────────────
+      // Single mbarrier (`arrival_count = 1`) used to hand off the
+      // Phase-1 routing-window TMA load (full BF16 input tile, 32 KB)
+      // from the TMA launcher thread to warps 1..11 at the start of
+      // Phase 2.  Armed once by the launcher with
+      //   `tx_bytes = BS * K_BLOCKS_TOTAL * K_STEP_WGMMA *
+      //              sizeof(A_element)`
+      // (= 8 × 16 × 128 × 2 = 32 KB for Qwen3.5).  Initialized in the
+      // kernel prologue alongside `bar_w[0..1]`, before the
+      // `fence_mbarrier_init_release_cluster()` and any
+      // `mbarrier.arrive.expect_tx`.  Re-init not needed; the wait
+      // drains it.
+      //
+      // `alignas(16)` matches `bar_w` / `bar_a` and the SM90
+      // `mbarrier.*.shared::cta.b64` instruction alignment.
+      alignas(16) uint64_t bar_rwin;
 
       // ── Phase 3 → Phase 4 (expert, token) reorganization tables ─────
       //
@@ -1037,7 +1200,25 @@ struct MoE_SHM {
       //     SHM slot — no dedicated inverse table needed.
       static constexpr uint32_t MAX_TOPK = 8;
       static constexpr uint32_t MAX_PAIRS = Dims::BS * MAX_TOPK;
-      uint16_t expert_slot_start[Dims::NUM_EXPERTS];
+      // `alignas(16)` is required (NOT cosmetic): Phase B of
+      // `prepare_moe_topk_BS8` (in `moe_routing.cu`) emits a packed
+      // 16-byte STS.128 store per warp lane via
+      //   `*reinterpret_cast<uint4*>(&expert_slot_start[tid * BLK]) =
+      //    packed_starts;`
+      // with `BLK = 8` u16 elements (= 16 B) per lane.  The compiler
+      // emits a 128-bit vector shared store that requires the
+      // destination address to be 16-byte aligned; `tid * BLK * 2 =
+      // tid * 16` is 16-aligned only if the array base itself is
+      // 16-aligned.  Without this `alignas(16)` the routing-window
+      // mbarrier `bar_rwin` (8 B + alignas(16) → 8 B of trailing
+      // padding consumed by the next field) shifts
+      // `expert_slot_start[]` to an 8-B-aligned-but-not-16-B-aligned
+      // offset, which causes a `cudaErrorMisalignedAddress` at the
+      // STS.128 issue.  The writer comment in `moe_routing.cu`
+      // already documents this expectation; this `alignas(16)` makes
+      // the contract explicit on the declaration side so future SHM
+      // layout changes cannot silently break it.
+      alignas(16) uint16_t expert_slot_start[Dims::NUM_EXPERTS];
       uint8_t expert_routed_count[Dims::NUM_EXPERTS];
       uint8_t sorted_slot[MAX_PAIRS];
       // Per-expert per-token cached rank used by the down-proj
@@ -1050,6 +1231,39 @@ struct MoE_SHM {
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
     } tiny_wgmma_tma;
+
+    // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────
+    // The new `bf16_in_full` field of `TinyDataWGMMA_TMA` is unioned
+    // with `w_wgmma` and `w_down_wgmma` so the BS8 TMA+WGMMA Phase-1/2
+    // BF16 input tile shares bytes with the up- and down-projection
+    // weight tiles (lifetimes are strictly disjoint — see design
+    // "Aliasing safety (Req 4.7)").  Verify at compile time that the
+    // three views start at the same offset within `TinyDataWGMMA_TMA`
+    // so a future layout change that accidentally moves `bf16_in_full`
+    // out of the anonymous union (and therefore breaks aliasing) is
+    // caught at the build step rather than producing silent SHM
+    // corruption at runtime.
+    //
+    // Placed immediately after the `TinyDataWGMMA_TMA` struct
+    // definition (the struct is now complete here; the asserts cannot
+    // live inside the struct because `offsetof` requires a complete
+    // type).  Still inside `union U` of the enclosing
+    // `MoE_SHM<Dims>` so `Dims` is in scope.
+    //
+    // These asserts hold for ALL Dims (including BS64) because the
+    // three fields are members of the same anonymous union and thus
+    // all start at offset 0 of that union.  On BS64 the BS-clamped
+    // extents `BF16_IN_FULL_K_BLOCKS=1` / `BF16_IN_FULL_BS=1` /
+    // `BF16_IN_FULL_K=1` collapse the bf16 view to a 2-byte
+    // placeholder but the union offset invariant is unchanged — the
+    // asserts pass and the BS64 SHM footprint stays byte-identical to
+    // the pre-optimization baseline (Req 7.1).
+    static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
+                      offsetof(typename U::TinyDataWGMMA_TMA, w_wgmma),
+                  "bf16_in_full must alias w_wgmma exactly (Req 4.1).");
+    static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
+                      offsetof(typename U::TinyDataWGMMA_TMA, w_down_wgmma),
+                  "bf16_in_full must alias w_down_wgmma exactly (Req 4.7).");
 
     // BS64 path: holds weight tiles and partial results for down-projection
     // only (up-projection uses Gemm1Data; activations come from

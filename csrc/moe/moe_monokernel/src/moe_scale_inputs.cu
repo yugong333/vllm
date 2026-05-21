@@ -346,33 +346,36 @@ __device__ void moe_scale_activation_BS8_wgmma(
 }
 
 /**
- * @brief v1 streaming-pipeline per-K-tile bf16 → fp8 quantization.
+ * @brief Per-K-tile bf16 → fp8 quantization (single-row BF16 view).
  *
- * Called by the 8 calc warps (warps 0..7) during the streaming K-loop's
- * quantize half-stage.  Each calc warp handles EXACTLY ONE token slot
- * (warp_id == tok_slot), converting 128 bf16 K-values into 128 fp8
- * K-values with a per-token-per-128-K-block scale.
+ * Called by exactly one warp per `(token, k_block)` pair.  Each call
+ * converts 128 bf16 K-values for ONE token into 128 fp8 K-values with
+ * a per-token-per-128-K-block scale.
  *
  * Input layout:
- *   bf16_in[tok][0..127]  — contiguous bf16 activations for token `tok`,
- *                            for the current K=128 tile.
+ *   bf16_row[0..127]      — contiguous bf16 activations for the
+ *                            token slot `tok`, for the current 128-K
+ *                            substep.
  *
  * Output layout (canonical WGMMA K-major):
  *   fp8_act[kc][tok][ki]  — where kc = 0..7, tok = 0..7, ki = 0..15,
  *                            and kc*16 + ki = global K within the tile.
+ *                            The helper writes ONLY the slice
+ *                            [kc][tok][ki] for the caller-supplied
+ *                            `tok`; other tokens at the same k_block
+ *                            are written by other warps.
  *
  * Scale output:
- *   act_scale_for_step    — one fp32 scale value per token (this K-step's
- *                            block-wise scale for blk = k_step_idx).
- *                            Caller supplies a pointer to the (tok, blk)
- *                            slot of shmem->act_scale.
+ *   act_scale_for_step    — one fp32 scale value for this (tok, k_block)
+ *                            pair.  Caller supplies a pointer to the
+ *                            `&shmem->act_scale[tok][k_block]` slot.
  *
  * Thread distribution: 32 threads per warp, each owning 4 K-values
- * (4 × 32 = 128 = one full tile).  Warp-reduce finds the block max.
- * If `tok >= batch_size`, the warp zero-fills its fp8 slot and writes
- * act_scale = 1.0f (neutral — the scale-apply will multiply by zero via
- * the `as_0X = (tok < batch_size) ? ... : 0.f` guard in the up-proj
- * kernel, so this scale value is never consumed).
+ * (4 × 32 = 128 = one full 128-K substep).  Warp-reduce finds the
+ * block max.  If `tok >= batch_size`, the warp zero-fills its fp8 slot
+ * and writes `act_scale = 1.0f` (neutral — the scale-apply will
+ * multiply by zero via the `as_0X = (tok < batch_size) ? ... : 0.f`
+ * guard in the up-proj kernel, so this scale value is never consumed).
  *
  * The canonical fp8 output layout means thread t writes its 4 quantized
  * values at
@@ -380,28 +383,42 @@ __device__ void moe_scale_activation_BS8_wgmma(
  * where col = t * 4 and i in 0..3.  With 4 consecutive K-values per
  * thread and a 16-wide chunk, all 4 values fall in the same kc.
  *
+ * Refactor note (topk-bs8-tma-prefetch-quant-fusion task 3.1):
+ * The BF16 view was narrowed from a `[T_TILE=8][128]` 2 KB atom to a
+ * `[128]` single-row view.  This unblocks calling the helper from the
+ * routing-phase fusion path, where the BF16 source is the full
+ * tile-major `bf16_in_full[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` SHM
+ * buffer populated by `moe_load_full_bf16_input` — the caller passes
+ * `bf16_in_full[k_block][token]` directly as a natural `[128]` row
+ * (no row-stride reinterpretation needed).  All FP8 writes and the
+ * scale-output convention are unchanged — the refactored helper
+ * still accepts `tok` and writes the same `fp8_act[kc][tok][ki]`
+ * bytes as before.  Existing callers that previously passed
+ * `slot[kk]` (a `[8][128]` tile) now pass `slot[kk][tok]` (a `[128]`
+ * row).
+ *
  * @tparam Dims              MoE dims.
- * @tparam BF16InRows        Must be T_TILE (8).
  * @tparam BF16InCols        Must be K_STEP_WGMMA (128).
  * @tparam Fp8NumChunks      Must be K_STEP_WGMMA / 16 (8).
  * @tparam Fp8Tok            Must be T_TILE (8).
  * @tparam Fp8KInner         Must be 16.
- * @param  bf16_in           SHM-resident bf16 input tile [T_TILE][128].
+ * @param  bf16_row          SHM-resident bf16 row for token `tok`,
+ *                            for the current 128-K substep.
  * @param  fp8_act           SHM output fp8 tile
  *                            [Fp8NumChunks][T_TILE][Fp8KInner].
- * @param  tok               Token slot this call is writing (= calc warp id).
+ * @param  tok               Token slot this call is writing.
  * @param  batch_size        Number of real tokens (remaining zero-filled).
- * @param  act_scale_for_step fp32 destination for this token's scale.
+ * @param  act_scale_for_step fp32 destination for this (tok, k_block)
+ *                            scale.
  */
-template <typename Dims, std::size_t BF16InRows, std::size_t BF16InCols,
-          std::size_t Fp8NumChunks, std::size_t Fp8Tok, std::size_t Fp8KInner>
+template <typename Dims, std::size_t BF16InCols, std::size_t Fp8NumChunks,
+          std::size_t Fp8Tok, std::size_t Fp8KInner>
 __device__ __forceinline__ void moe_streaming_quantize_k128(
-    const A_element (&bf16_in)[BF16InRows][BF16InCols],
+    const A_element (&bf16_row)[BF16InCols],
     AQ_element (&fp8_act)[Fp8NumChunks][Fp8Tok][Fp8KInner], std::uint32_t tok,
     std::uint32_t batch_size, float* __restrict__ act_scale_for_step) {
   static_assert(Dims::BS <= 8, "Streaming quantize is for BS<=8");
-  static_assert(BF16InRows == 8, "bf16_in must have 8 token rows");
-  static_assert(BF16InCols == 128, "bf16_in must have 128 K cols");
+  static_assert(BF16InCols == 128, "bf16_row must have 128 K cols");
   static_assert(Fp8NumChunks == 8, "fp8_act must have 8 K-chunks of 16");
   static_assert(Fp8Tok == 8, "fp8_act must have 8 token rows");
   static_assert(Fp8KInner == 16, "fp8_act inner dim must be 16");
@@ -428,9 +445,9 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
   // Real token path: load 4 bf16, warp-reduce max, quantize.
   const uint32_t col = thread * 4;
   __nv_bfloat162 bf_01 =
-      *reinterpret_cast<const __nv_bfloat162*>(&bf16_in[tok][col + 0]);
+      *reinterpret_cast<const __nv_bfloat162*>(&bf16_row[col + 0]);
   __nv_bfloat162 bf_23 =
-      *reinterpret_cast<const __nv_bfloat162*>(&bf16_in[tok][col + 2]);
+      *reinterpret_cast<const __nv_bfloat162*>(&bf16_row[col + 2]);
   bf_01 = mask_NaNs_to_zero(bf_01);
   bf_23 = mask_NaNs_to_zero(bf_23);
   float2 f01 = __bfloat1622float2(bf_01);
@@ -458,6 +475,159 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
   fp8_act[kc][tok][ki + 3] = q3;
 
   if (thread == 0) *act_scale_for_step = blk_act_scale;
+}
+
+/**
+ * @brief Phase-2 routing-window BF16 → FP8 quantization (BS8 TMA+WGMMA only).
+ *
+ * Called from `moe_kernel_topk_BS8`'s Phase-2 dispatch on warps 1..11
+ * (warp 0 runs `prepare_moe_topk_BS8` instead).  Distributes the
+ * `BS * K_BLOCKS_TOTAL = 128` (token, k_block) quantization tasks
+ * across the 11 participating warps using a stride-11 partition over
+ * the linear pair index `i = token * K_BLOCKS_TOTAL + k_block`.  Each
+ * warp-owned pair invokes `moe_streaming_quantize_k128<Dims>` exactly
+ * once with a single-row BF16 view onto the prefetched
+ * `bf16_in_full[k_block][token]`.
+ *
+ * The BF16 source uses the tile-major
+ * `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` SHM layout populated by the
+ * Phase-1 routing-window TMA (`moe_load_full_bf16_input`).  Each
+ * K-substep slot is a self-contained 2 KB region whose bytes match
+ * the activation TMA's compact `boxDim = (128, 8)` write layout —
+ * see the doc comment on `TinyDataWGMMA_TMA::bf16_in_full` in
+ * `moe_internal.h` for the rationale.
+ *
+ * Caller contract (NOT enforced inside the helper):
+ *   1. The caller MUST gate warp 0 OUT of this call.  Warp 0 runs
+ *      `prepare_moe_topk_BS8` concurrently and is also gated out of
+ *      the `bar_rwin` wait described below.
+ *   2. The caller MUST wait on the routing-window mbarrier
+ *      (`u.tiny_wgmma_tma.bar_rwin`) on every warp 1..11 thread before
+ *      invoking this helper.  Reading `bf16_in_full` before the wait
+ *      succeeds is a data race against the in-flight Phase-1 TMA load.
+ *   3. The caller MUST emit a block-wide `__syncthreads()` AFTER this
+ *      helper returns to publish the FP8 atom + scale writes to all
+ *      warps before the Phase-3 up-projection K-loop reads them.
+ *   4. Ragged batches (`token >= batch_size`) are handled inside this
+ *      helper via the existing zero-fill + scale = 1.0f path of
+ *      `moe_streaming_quantize_k128` (Req 2.7).
+ *
+ * Scope (Req 7.1, 7.2, 7.3, 7.6): this helper is only valid when
+ * `Dims::BS <= 8` AND the call site is on the BS8 TMA+WGMMA path.
+ * The static_assert below makes miss-instantiation a build error.
+ *
+ * Work distribution (Req 2.4): warp `w ∈ [1, 12)` owns pair indices
+ *   { i ∈ [0, BS * K_BLOCKS_TOTAL) : (i % 11) == (w - 1) }.
+ * With `BS = 8`, `K_BLOCKS_TOTAL = 16`, `PAIRS_TOTAL = 128`, and 11
+ * warps, every pair is owned by exactly one warp.  Warp 0 owns no
+ * pair.  Imbalance is at most one extra pair per warp (~9%), which
+ * is acceptable given the alternative is wasting warps.
+ *
+ * @tparam Dims          MoE dims.
+ * @tparam KBlocks       Outer extent of `bf16_in_full`
+ *                       (= K_BLOCKS_TOTAL for BS8; the field is
+ *                       BS-clamped to 1 for BS64, see
+ *                       TinyDataWGMMA_TMA::BF16_IN_FULL_K_BLOCKS).
+ * @tparam Bs            Middle extent of `bf16_in_full` (= Dims::BS
+ *                       for BS8, BS-clamped to 1 for BS64).
+ * @tparam KStep         Inner extent of `bf16_in_full` (= K_STEP_WGMMA
+ *                       = 128 for BS8, BS-clamped to 1 for BS64).
+ * @tparam Fp8KBlocks    Outer extent of `fp8_act_full` (= K_BLOCKS_TOTAL
+ *                       for BS8, BS-clamped to 1 for BS64).
+ * @tparam Fp8NumChunks  Must be 8 (= K_STEP_WGMMA / FP8_ACT_K_CHUNK).
+ * @tparam Fp8Tok        Must be 8 (= T_TILE).
+ * @tparam Fp8KInner     Must be 16 (= FP8_ACT_K_CHUNK).
+ * @tparam ScaleBs       Outer extent of `act_scale` (= Dims::BS).
+ * @tparam ScaleKBlocks  Inner extent of `act_scale` (= ACT_SCALE_BLOCKS
+ *                       = HIDDEN_STATES / 128).
+ *
+ * @param bf16_in_full   SHM-resident BF16 input tile populated by the
+ *                       Phase-1 routing-window TMA load, shaped
+ *                       `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]`.
+ * @param fp8_act_full   SHM-resident FP8 output, single-buffer indexed
+ *                       by `k_block`.
+ * @param act_scale      Per-token per-128-K-block FP8 scales.  Lives
+ *                       in the `MoE_SHM` common region (next to the
+ *                       routing scratchpad).
+ * @param batch_size     Real token count (≤ Dims::BS); ragged tokens
+ *                       get the helper's zero-fill + scale = 1.0f path.
+ *
+ * Implements R2.3, R2.4, R2.6, R2.7, R2.8.
+ * Design: "New helper: routing_phase_quantize",
+ *         "Phase 2 — Prepare (concurrent across 12 warps)".
+ */
+template <typename Dims, std::size_t KBlocks, std::size_t Bs, std::size_t KStep,
+          std::size_t Fp8KBlocks, std::size_t Fp8NumChunks, std::size_t Fp8Tok,
+          std::size_t Fp8KInner, std::size_t ScaleBs, std::size_t ScaleKBlocks>
+__device__ inline void routing_phase_quantize(
+    const A_element (&bf16_in_full)[KBlocks][Bs][KStep],
+    AQ_element (&fp8_act_full)[Fp8KBlocks][Fp8NumChunks][Fp8Tok][Fp8KInner],
+    float (&act_scale)[ScaleBs][ScaleKBlocks], std::uint32_t batch_size) {
+  using CoreDims = MoECoreDims<Dims>;
+
+  // Scope guard — BS8 TMA+WGMMA only (Req 7.1, 7.2, 7.3, 7.6).
+  static_assert(Dims::BS <= 8,
+                "routing_phase_quantize is BS8-only (Req 7.1, 7.2, 7.3, 7.6)");
+  // 128-K SWZ128 atoms per token along K (= HIDDEN_STATES / 128).  16
+  // for Qwen3.5.  This is the same constant declared as
+  // TinyDataWGMMA_TMA::K_BLOCKS_TOTAL; we recompute it locally so the
+  // helper does not need to friend that struct.
+  constexpr std::uint32_t K_BLOCKS_TOTAL =
+      Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
+  static_assert(KBlocks == K_BLOCKS_TOTAL,
+                "bf16_in_full outer extent must be K_BLOCKS_TOTAL for BS8");
+  static_assert(Bs == Dims::BS,
+                "bf16_in_full middle extent must be Dims::BS for BS8");
+  static_assert(KStep == CoreDims::K_STEP_WGMMA,
+                "bf16_in_full inner extent must be K_STEP_WGMMA (128)");
+  static_assert(Fp8NumChunks == 8, "fp8_act_full middle dim must be 8");
+  static_assert(Fp8Tok == CoreDims::T_TILE,
+                "fp8_act_full token dim must be T_TILE");
+  static_assert(Fp8KInner == 16, "fp8_act_full inner dim must be 16");
+  static_assert(ScaleBs == Dims::BS, "act_scale outer extent must be Dims::BS");
+  static_assert(Fp8KBlocks == K_BLOCKS_TOTAL,
+                "fp8_act_full outer extent must be K_BLOCKS_TOTAL for BS8");
+  static_assert(ScaleKBlocks == K_BLOCKS_TOTAL,
+                "act_scale inner extent must be K_BLOCKS_TOTAL");
+
+  constexpr std::uint32_t PAIRS_TOTAL = Dims::BS * K_BLOCKS_TOTAL;
+  // Warps 1..11 participate (warp 0 runs prepare_moe_topk_BS8).
+  constexpr std::uint32_t NUM_QUANT_WARPS = 11u;
+
+  const std::uint32_t warp = get_any_warp<Dims>();  // ∈ [1, 12)
+  // Defense-in-depth: warp 0 must be gated out by the caller.  Failing
+  // this assert at runtime would mean warp 0 also wrote some pair —
+  // since `w_idx = warp - 1u` would underflow, we'd partition the work
+  // wrong.  This is checked in the caller's `if (warp == 0) { ... }
+  // else { routing_phase_quantize(...) }` dispatch (Req 2.1).
+  assert(warp >= 1u && warp < 12u);
+  const std::uint32_t w_idx = warp - 1u;  // ∈ [0, 11)
+
+  // Stride-NUM_QUANT_WARPS partition over the linear pair index.
+  // `#pragma unroll 1` keeps the loop body small — each iteration is
+  // already a moe_streaming_quantize_k128 call which is __forceinline.
+  #pragma unroll 1
+  for (std::uint32_t i = w_idx; i < PAIRS_TOTAL; i += NUM_QUANT_WARPS) {
+    const std::uint32_t token = i / K_BLOCKS_TOTAL;
+    const std::uint32_t kblk = i % K_BLOCKS_TOTAL;
+
+    // Tile-major BF16 source: `bf16_in_full[kblk][token]` is the
+    // natural `[K_STEP_WGMMA = 128]` row written by the Phase-1 TMA's
+    // compact 2 KB box for this K-substep.  No row-stride
+    // reinterpretation is needed — the array reference type already
+    // matches the helper's `[128]` row signature.
+    const auto& bf_row = bf16_in_full[kblk][token];
+
+    // FP8 view for this k_block: fp8_act_full[kblk] — same
+    // [kc][tok][ki] shape the helper writes into.  The helper's `tok`
+    // argument selects which token slot to write FP8 bytes into; other
+    // tokens at the same k_block are written by other warps owning
+    // other pairs.
+    auto& fp8_atom = fp8_act_full[kblk];
+
+    moe_streaming_quantize_k128<Dims>(bf_row, fp8_atom, /*tok=*/token,
+                                      batch_size, &act_scale[token][kblk]);
+  }
 }
 
 namespace detail {

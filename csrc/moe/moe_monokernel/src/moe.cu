@@ -30,12 +30,16 @@ namespace moe_monokernel {
  * up- and down-projections.
  *
  * Pipeline:
- *   Phase 1: routing + topK (running in parallel with a greedy TMA
- *            prefetch of the k_start=0 bf16 activation tile on every
- *            block — activations are expert-independent)
- *   Phase 2: no-op (streaming WGMMA up-proj does its own priming)
- *   Phase 3: up-proj — streaming WGMMA with on-the-fly bf16→fp8
- *            quantize → SiLU → write bf16 to spec->temp_bf16
+ *   Phase 1: routing + topK (running in parallel with the routing-window
+ *            TMA: a single 16-issue load that fetches the full per-block
+ *            BF16 input tile into `bf16_in_full`, completion signalled
+ *            on `bar_rwin`)
+ *   Phase 2: warp 0 runs `prepare_moe_topk_BS8`; warps 1..11 wait on
+ *            `bar_rwin` and quantize the full bf16 tile into
+ *            `fp8_act_full` + `act_scale`.
+ *   Phase 3: up-proj — streaming WGMMA reads FP8 directly from
+ *            `fp8_act_full` (no per-K-step bf16 TMA, no `bar_a`,
+ *            no QUANT half) → SiLU → fp8 writeback to spec->temp_fp8.
  *   grid.sync()
  *   Phase 4: down-proj — streaming WGMMA; each block atomicAdds
  *            its fp32 partial sum into the single-buffer
@@ -88,32 +92,27 @@ __device__ void moe_kernel_topk_BS8(
     }
   }
 
-  // ── Phase 1: routing (topK) + greedy activation prefetch ───────────────
+  // ── Phase 1: routing (topK) + routing-window BF16 prefetch ─────────────
   // Phase 1 runs routing (topK / prepare_moe_topk) which writes
   // shmem->experts and shmem->topk_ids_flat that later phases depend on.
   //
-  // In parallel with routing, the launcher thread greedily fires the
-  // bf16 activation TMA for k_start=0.  Activations are expert-independent
-  // (the descriptor covers all tokens × all K), so every block can start
-  // fetching immediately — without waiting for routing to determine
-  // expert_count.  Blocks that later turn out to be outside the feasible
-  // range (up_group >= shmem->expert_count) simply leave their 2 KB tile
-  // unused and bar_a[0] sits at parity 1; no hang, no corruption, just
-  // one wasted 2 KB fetch that L2 coalesces across SMs.
+  // In parallel with routing, the prefetch warps issue the routing-
+  // window TMA: a single 16-issue load that pulls the full per-block
+  // BF16 input tile (`BS × HIDDEN_STATES`) into `bf16_in_full` (Req 1.4,
+  // 1.5).  Completion is signalled on the single mbarrier `bar_rwin`
+  // (`arrival_count = 1`, `tx_bytes = BS * K_BLOCKS_TOTAL *
+  // K_STEP_WGMMA * sizeof(A_element)`).  Phase 2 then quantizes the
+  // full tile into `fp8_act_full`, which the up-projection K-loop
+  // reads directly — no per-K-step bf16 TMA, no `bar_a` (Req 3.1, 3.7).
   //
   // Correctness requirements:
   //   * mbarriers must be initialized before any `arrive_expect_tx`.
   //     The init and the arm run on the same launcher thread, so
   //     program order guarantees local visibility.  The
-  //     `fence_mbarrier_init_release_cluster()` between them (and the
-  //     block-wide `__syncthreads()` below) publishes the init to every
-  //     consumer warp before it waits on `bar_a[0]`.
-  //   * The hoisted Step A handles the e==expert_start iteration only;
-  //     the up-proj helper is called with `external_priming = true` and
-  //     never issues its own bf16_in[0] TMA.  For experts 1..N inside
-  //     a group, Step A is issued at the tail of the previous expert's
-  //     iteration (in parallel with SiLU writeback) — see the end of
-  //     `moe_up_projection_BS8_allexperts_wgmma_tma`'s expert loop.
+  //     `fence_mbarrier_init_release_cluster()` below (and the
+  //     block-wide `__syncthreads()` at the end of Phase 2) publishes
+  //     the init to every consumer warp before it waits on
+  //     `bar_rwin` / `bar_w[*]`.
   auto* u_tma = &shmem->u.tiny_wgmma_tma;
   if (is_tma_launcher_thread<Dims>()) {
     // mbarrier inits are kept regardless of the profile flags: they are
@@ -123,57 +122,143 @@ __device__ void moe_kernel_topk_BS8(
     // so a consumer will never block on an uninitialized parity.
     mbarrier_init(&u_tma->bar_w[0], 1u);
     mbarrier_init(&u_tma->bar_w[1], 1u);
-    mbarrier_init(&u_tma->bar_a[0], 1u);
-    mbarrier_init(&u_tma->bar_a[1], 1u);
+    // Phase-1 routing-window mbarrier (Req 1.6). Single mbarrier with
+    // arrival_count = 1 and tx_bytes = BS * K_BLOCKS_TOTAL *
+    // K_STEP_WGMMA * sizeof(A_element) (= 32 KB for Qwen3.5). Armed by
+    // the TMA launcher thread at the start of Phase 1; waited on by
+    // every warp in [1, 12) at the start of Phase 2 before reading
+    // bf16_in_full. Init shares the same launcher-thread / fence
+    // discipline as bar_w so consumers never block on an
+    // uninitialized parity.
+    mbarrier_init(&u_tma->bar_rwin, 1u);
     fence_mbarrier_init_release_cluster();
-
-#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-    // Greedy Step A: activations are expert-independent, so fire the
-    // k_start=0 TMA now — in parallel with routing — instead of waiting
-    // for Phase 2.  The arm happens on the same thread that just did the
-    // init, so no fence is required between them.
-    //
-    // For K_STEP_UP > K_STEP_WGMMA the iter-0 activation slot holds
-    // K_SUBSTEPS_UP back-to-back 128-K bf16 atoms (one per substep);
-    // bar_a[0] is armed once with the TOTAL tx_bytes so a single
-    // `mbarrier.try_wait.parity` on the calc side drains all atoms.
-    //
-    // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching calc-
-    // warp wait on bar_a[0] inside the up-proj helper is also compiled
-    // out so there is no spin-forever deadlock.  The calc warps read
-    // garbage from the still-uninitialized `bf16_in[0]` slot and the
-    // kernel produces junk output — useful only for timing.
-    constexpr std::uint32_t UP_A_TX_BYTES_PER_SUBSTEP_P1 = 2048u;
-    constexpr std::uint32_t UP_A_TX_BYTES_TOTAL_P1 =
-        UP_A_TX_BYTES_PER_SUBSTEP_P1 * CoreDims::K_SUBSTEPS_UP;
-    mbarrier_arrive_expect_tx(&u_tma->bar_a[0],
-                              /*tx_bytes=*/UP_A_TX_BYTES_TOTAL_P1);
-  #pragma unroll
-    for (std::uint32_t kk = 0; kk < CoreDims::K_SUBSTEPS_UP; ++kk) {
-      tma_load_bf16_input_tile(activations_desc,
-                               /*k_start=*/kk * CoreDims::K_STEP_WGMMA,
-                               &u_tma->bf16_in[0][kk][0][0], &u_tma->bar_a[0]);
-    }
-#endif
   }
-  if (is_prefetch_warp<Dims>()) {
-    // WGMMA path: prefetch warps are idle here.  The streaming pipeline's
-    // first bf16 tile is already in flight (greedy TMA above) and the
-    // rest of priming runs inside the up-proj helper.
+  // Block-wide barrier publishes the mbarrier inits to every warp
+  // before any warp issues a `try_wait.parity` against them.  Without
+  // this sync, warp 9 (a non-launcher prefetch warp) can race past
+  // the launcher's `mbarrier_init(&bar_rwin, 1u)` and hit the Phase-2
+  // wait loop while `bar_rwin` is still in an undefined state, which
+  // compute-sanitizer flags as `Unknown Error` at the
+  // `SYNCS.PHASECHK.TRANS64.TRYWAIT` instruction (mbarrier state
+  // corruption).  `bar_w[*]` was previously protected by the calc-warp
+  // path's early `topK_BS8` cost; `bar_rwin` is the only mbarrier
+  // waited on by EVERY warp 1..11 with no intervening prior work, so
+  // the discipline must be made explicit here.
+  //
+  // `fence_mbarrier_init_release_cluster()` alone is not sufficient:
+  // it pairs with a matching acquire on the consuming side, but
+  // `mbarrier.try_wait.parity` is not an acquire of the init; it
+  // assumes the init has already been published.  The `__syncthreads()`
+  // is what publishes the launcher-thread-only init writes to all
+  // warps.
+  __syncthreads();
+  // ── Phase 1 — Routing-window concurrent dispatch (Req 1.1, 1.2,
+  // 1.3, 1.7, 1.8).
+  //
+  // Re-organized as an if-elif-else over warp identity:
+  //   * warp ∈ [8, 12) (prefetch warps):
+  //       - TMA launcher thread (warp 8, lane 0) arms `bar_rwin` once
+  //         with `tx_bytes = BS * K_BLOCKS_TOTAL * K_STEP_WGMMA *
+  //         sizeof(A_element)` (= 32 KB for Qwen3.5) and issues
+  //         K_BLOCKS_TOTAL `cp.async.bulk.tensor.2d` instructions
+  //         covering the full per-block BF16 input tile via
+  //         `moe_load_full_bf16_input` (Option B, design
+  //         "TMA-granularity decision").  Both gated under
+  //         `MONO_PROFILE_SKIP_PREFETCH_UP` so the matching wait in
+  //         the Phase-2 dispatch (added in task 4.2) is paired-elided.
+  //       - Other prefetch lanes do nothing in Phase 1.
+  //   * warp ∈ [0, 8) (calc warps): unchanged `topK_BS8` +
+  //     `sync_calc_threads<>()` (256-thread `bar.sync 15`).
+  //     `prepare_moe_topk_BS8` runs in Phase 2 on warp 0 alongside
+  //     `routing_phase_quantize` on warps 1..11.
+  const unsigned warp_id = get_any_warp<Dims>();
+  if (warp_id >= CoreDims::CALC_WARP_COUNT) {
+    // Prefetch warps + TMA launcher thread (warp ∈ [8, 12)).
+    if (is_tma_launcher_thread<Dims>()) {
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+      // Single mbarrier arm covers all K_BLOCKS_TOTAL bulk loads.
+      // The helper itself does not arm — see the doc comment on
+      // `moe_load_full_bf16_input` for the caller contract.
+      constexpr std::uint32_t RWIN_TX_BYTES =
+          Dims::BS * MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL *
+          CoreDims::K_STEP_WGMMA *
+          static_cast<std::uint32_t>(sizeof(A_element));
+      mbarrier_arrive_expect_tx(&u_tma->bar_rwin,
+                                /*tx_bytes=*/RWIN_TX_BYTES);
+      moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full,
+                                     &u_tma->bar_rwin);
+#endif
+    }
+    // Other prefetch lanes (warp 8 lanes 1..31, warps 9..11) do
+    // nothing in Phase 1.  Phase 2 (task 4.2) re-engages them as
+    // BF16→FP8 quantization workers.
   } else {
-    // Routing is intentionally NOT guarded by MONO_PROFILE_SKIP_CALC_UP:
-    // `shmem->expert_count` / `shmem->experts[e].id` drive the helper's
-    // expert loop bounds and an uninitialized expert_count could be
-    // anything from 0 to 2^32 (runaway loop).  The BS64 path handles
-    // MONO_PROFILE_SKIP_CALC_{UP,DOWN} the same way — `topK_BS64` and
-    // `prepare_moe_topk_BSx_Ey` run regardless; only the per-expert
-    // QUANT / WGMMA / writeback work is compiled out.
+    // Calc warps (warp ∈ [0, 8)).  Routing is intentionally NOT
+    // guarded by MONO_PROFILE_SKIP_CALC_UP: `shmem->expert_count` /
+    // `shmem->experts[e].id` drive the helper's expert loop bounds
+    // and an uninitialized expert_count could be anything from 0
+    // to 2^32 (runaway loop).  The BS64 path handles
+    // MONO_PROFILE_SKIP_CALC_{UP,DOWN} the same way — `topK_BS64`
+    // and `prepare_moe_topk_BSx_Ey` run regardless; only the
+    // per-expert QUANT / WGMMA / writeback work is compiled out.
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size,
                    shmem);
     MONO_PHASE_TIMESTAMP(t_after_topk);
     sync_calc_threads<Dims>();
     MONO_PHASE_TIMESTAMP(t_after_sync_calc);
+    // `prepare_moe_topk_BS8` is no longer called from the calc-warp
+    // branch — it now runs in the Phase-2 dispatch below on warp 0
+    // only, alongside `routing_phase_quantize` on warps 1..11
+    // (Req 2.1, 2.2; design "Phase 2 — Prepare (concurrent across 12
+    // warps)").
+  }
+
+  // ── Phase 2 — Prepare-phase concurrent dispatch (Req 2.1, 2.2,
+  // 2.5, 2.9, 2.10).
+  //
+  // Warp dispatch over the 12 warps in the block:
+  //   * warp 0: runs `prepare_moe_topk_BS8` (builds expert ids,
+  //     `sorted_slot`, `expert_count`, `expert_slot_start[]`).  Does
+  //     NOT wait on `bar_rwin` because warp 0 does not read
+  //     `bf16_in_full`.
+  //   * warps 1..11: wait on `bar_rwin` (paired with the Phase-1
+  //     16-issue TMA load armed in 4.1) and then run
+  //     `routing_phase_quantize`, which calls
+  //     `moe_streaming_quantize_k128` once per (token, k_block) pair
+  //     across the 11 warps in stride-11 partition (Req 2.4).
+  //
+  // The wait on `bar_rwin` and the `routing_phase_quantize` body are
+  // gated on different `MONO_PROFILE_SKIP_*` flags so they can be
+  // toggled independently:
+  //   * `MONO_PROFILE_SKIP_PREFETCH_UP` elides BOTH the Phase-1
+  //     `bar_rwin` arm + 16 TMA issues AND this Phase-2 wait
+  //     (paired-elision, Req 1.8, 8.7) — so warps 1..11 never block
+  //     on a routing-window mbarrier that was never armed.
+  //   * `MONO_PROFILE_SKIP_CALC_UP` elides the
+  //     `routing_phase_quantize` body itself (Req 2.9); warp 0's
+  //     `prepare_moe_topk_BS8` keeps running so downstream phases
+  //     still see a valid `expert_count` / `experts[]`.
+  //
+  // The trailing `__syncthreads()` is the SINGLE block-wide sync
+  // that ends Phase 2 (Req 2.10): it publishes BOTH warp 0's routing
+  // metadata writes AND warps 1..11's `fp8_act_full` / `act_scale`
+  // writes to all warps before Phase 3 begins.  No additional
+  // intra-Phase-2 sync between warp 0 and warps 1..11 is required —
+  // they touch disjoint SHM (warp 0 writes
+  // `experts[]`/`sorted_slot[]`/...; warps 1..11 write
+  // `fp8_act_full`/`act_scale`).
+  if (warp_id == 0) {
     prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
+  } else {
+#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
+    uint32_t parity_rwin = 0;
+    while (!mbarrier_try_wait_parity(&u_tma->bar_rwin, parity_rwin)) {
+    }
+#endif
+#ifndef MONO_PROFILE_SKIP_CALC_UP
+    routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full,
+                                 shmem->act_scale, batch_size);
+#endif
   }
   __syncthreads();
 
@@ -211,16 +296,14 @@ __device__ void moe_kernel_topk_BS8(
   const std::uint32_t up_block_idx = blockIdx.x % UP_GRID;
   const bool in_up = (up_group < UP_GROUPS);
 
-  // Phase 2 is a no-op for the v1 streaming WGMMA pipeline.  Phase 3's
-  // moe_up_projection_BS8_allexperts_wgmma_tma does its own priming:
-  //   (1) bf16_in[0] from global (HOISTED to Phase 1 above — fired
-  //       greedily on every block in parallel with routing; the helper
-  //       skips its internal first-expert Step A because we pass
-  //       external_priming=true).
-  //   (2) prefetch w[0] and bf16_in[1] || quantize bf16_in[0] → fp8[0]
-  // No __syncthreads() here: the Phase-1 sync above already published
-  // both the barrier init and shmem->expert_count, and computing
-  // up_group / up_block_idx / in_up is pure register work.
+  // Phase 3 (`moe_up_projection_BS8_allexperts_wgmma_tma`) reads FP8
+  // activations directly from `fp8_act_full`, which Phase 2 produced
+  // and the trailing `__syncthreads()` above published.  The up-proj
+  // helper does its own weight-tile priming via the pre-loop
+  // `bar_w[0]` arm + first-expert weight TMA.  No __syncthreads()
+  // here: the Phase-2 trailing sync already published both the
+  // barrier init and shmem->expert_count, and computing up_group /
+  // up_block_idx / in_up is pure register work.
 
   // ── Phase 3: Up-projection — expert groups in parallel ────────────────
   // Group `g` (blocks [g*UP_GRID, (g+1)*UP_GRID)) iterates experts starting
@@ -237,8 +320,7 @@ __device__ void moe_kernel_topk_BS8(
         activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
         spec, shmem, up_weights_desc, activations_desc, up_block_idx,
         /*expert_start=*/up_group,
-        /*expert_stride=*/UP_GROUPS,
-        /*external_priming=*/true);
+        /*expert_stride=*/UP_GROUPS);
   }
 
   MONO_PHASE_TIMESTAMP(t_after_up);
@@ -495,11 +577,22 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   // explicit at the BS8 TMA+WGMMA instantiation site so that any
   // future layout regression that overflows the 228 KB opt-in budget
   // after the Phase-2a alignment is flagged with a pointed error.
+  //
+  // Also enforces Req 4.6 of the topk-bs8-tma-prefetch-quant-fusion
+  // spec ("`sizeof(MoE_SHM<Dims>)` <= 233472 for every BS8 TMA+WGMMA
+  // Dims variant"): `228 * 1024 == 233472`, and the predicate
+  // `use_tma<Dims>::value && Dims::BS <= 8` matches every BS8
+  // TMA+WGMMA Dims variant.  No second per-Dims-variant assert is
+  // required because this one is per-Dims-variant by construction —
+  // the kernel is instantiated once per Dims, so the static_assert
+  // fires once per BS8 TMA+WGMMA variant and once per non-BS8
+  // TMA variant (the latter via the broader assert above).
   static_assert(!(use_tma<Dims>::value && Dims::BS <= 8) ||
                     sizeof(MoE_SHM<Dims>) <= 228 * 1024,
                 "Exceeds 228 KB opt-in SHM budget for BS8 TMA+WGMMA after "
                 "Phase 2a layout alignment (DOWN_COL_TILE = 256 doubles "
-                "the per-block down-proj weight tile).");
+                "the per-block down-proj weight tile).  Also enforces "
+                "the topk-bs8-tma-prefetch-quant-fusion Req 4.6 budget.");
 
   assert(MoECoreDims<Dims>::THREADS_PER_WARP == 32);
   assert(blockDim.x == Dims::KernelConfig::BLOCK_SIZE);

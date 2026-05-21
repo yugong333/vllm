@@ -30,6 +30,16 @@
 // TUs that will consume the loaders) are CUDA-compiled.
 #include "ptx_utils.h"
 
+// `A_element` (= `__nv_bfloat16`) is referenced in the
+// `moe_load_full_bf16_input` template signature below.  `moe_interface.h`
+// is the canonical declaration site for the kernel's element-type
+// aliases and is a lightweight header (no
+// `INSIDE_MOE_MONOKERNEL_IMPLEMENTATION` guard), so including it here is safe
+// for every existing consumer of `moe_tma.h` (the host-only `moe_tma.cu`, the
+// device-side `.cu` files in the kernel's whole-program-inlined chain, and the
+// standalone `tma_descriptor_factory_test.cu`).
+#include "moe_interface.h"
+
 // Build-time guard: TMA descriptor encoding requires CUDA toolkit 12.0+
 // (see requirement R12.1).  The CUDA Driver API exposes `CUtensorMap` only
 // on 12.0+, so fail fast with a clear message on older toolchains.
@@ -305,8 +315,10 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  *     `mbarrier_arrive_expect_tx(bar_smem_ptr, 2048)` BEFORE calling
  *     this function.  This function itself does NOT call
  *     `mbarrier_arrive_expect_tx`; it only issues the TMA load.
- *   - `dest_smem_ptr` MUST be 16-B aligned and point at
- *     `shm->bf16_in[slot][0][0]` (the 2048-B activation-tile slot).
+ *   - `dest_smem_ptr` MUST be 16-B aligned and point at a 2048-B
+ *     activation-tile slot in SHM.  Used by
+ *     `moe_load_full_bf16_input` to populate
+ *     `shm->bf16_in_full[kblk][0][0]` (one 8×128 BF16 box per call).
  *   - `desc` MUST be the descriptor produced by
  *     `create_activations_tma_desc`, typically passed to the kernel as
  *     a `__grid_constant__ CUtensorMap const` parameter.
@@ -315,8 +327,9 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  * @param desc          Host-built activation TMA descriptor
  *                      (`__grid_constant__`).
  * @param k_start       Innermost-axis starting K column (multiple of 128).
- * @param dest_smem_ptr 16-B aligned SHM destination pointer to
- *                      `shm->bf16_in[slot][0][0]` (2048 B).
+ * @param dest_smem_ptr 16-B aligned SHM destination pointer to a
+ *                      2048-B activation-tile slot (e.g.
+ *                      `shm->bf16_in_full[kblk][0][0]`).
  * @param bar_smem_ptr  16-B aligned SHM mbarrier pre-armed by the caller
  *                      with `expect_tx = 2048`.
  */
@@ -327,6 +340,117 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(
   // We always fetch all 8 tokens starting at token 0 (R2.5, R15.2).
   tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/0u, dest_smem_ptr,
               bar_smem_ptr);
+}
+
+/**
+ * @brief Issue a full per-block BF16 input tile TMA load via
+ *        `K_BLOCKS_TOTAL` back-to-back 128-K-wide bulk TMA issues
+ *        (Phase-1 routing-window prefetch — Option B in the design's
+ *        "TMA-granularity decision").
+ *
+ * Covers the entire `[Dims::BS, Dims::HIDDEN_STATES]` BF16 activation
+ * tile — `K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / 128` issues of the
+ * existing `tma_load_bf16_input_tile` helper, one per 128-K substep
+ * `k_start ∈ {0, 128, 256, …, (K_BLOCKS_TOTAL - 1) * 128}`.  Reuses the
+ * same `CUtensorMap` produced by `create_activations_tma_desc` (no new
+ * descriptor) and the same `(coord0 = k_start, coord1 = 0)` coordinate
+ * convention.
+ *
+ * Each per-substep issue writes a `BS × 128`-element BF16 box into a
+ * disjoint slab of the row-major `[BS][HIDDEN_STATES]` SHM destination
+ * at offset `k_start * sizeof(A_element)` along the inner axis (i.e.
+ * `&dest[0][k_start]`); the natural row-major layout of the destination
+ * places token `t`'s K-stripe `[k_start, k_start + 128)` at SHM offset
+ * `(t * HIDDEN_STATES + k_start) * sizeof(A_element)`, matching what
+ * the activation descriptor's `boxDim = (128, 8)` produces.
+ *
+ * Why Option B (16 × 2 KB issues) instead of one 32 KB issue:
+ * `cuTensorMapEncodeTiled` caps per-axis `boxDim` at 256 elements
+ * regardless of swizzle mode, so a single-issue load with innermost
+ * axis = `HIDDEN_STATES = 2048` is rejected by the Driver API.  See the
+ * design's "TMA-granularity decision" section.
+ *
+ * This helper consumes only a `CUtensorMap` and a typed SHM reference;
+ * it deliberately does NOT depend on `MoE_SHM` or `MoECoreDims` so that
+ * it stays usable from `moe_tma.h` without a heavy include.  The 128-K
+ * substep width is the SWZ128 atom width and is hardcoded to match the
+ * activation descriptor's `boxDim[0] = 128` (`create_activations_tma_desc`
+ * in `moe_tma.cu`); a `static_assert` guards the descriptor invariant
+ * (`Dims::HIDDEN_STATES % 128 == 0`).
+ *
+ * Caller contract (CRITICAL — Req 1.4, 1.5):
+ *   - Must be called by exactly ONE thread per block (the TMA launcher,
+ *     warp 8 lane 0 in the BS8 TMA+WGMMA path, selected via
+ *     `is_tma_launcher_thread<Dims>()`).  Does NOT gate on `threadIdx`;
+ *     calling from multiple threads issues duplicate
+ *     `cp.async.bulk.tensor.2d` instructions and corrupts the
+ *     mbarrier's transaction-bytes accounting.
+ *   - `bar_smem_ptr` MUST have been pre-armed EXACTLY ONCE by the
+ *     caller, BEFORE calling this helper, via
+ *     `mbarrier_arrive_expect_tx(bar_smem_ptr,
+ *                                K_BLOCKS_TOTAL * Dims::BS * 128 *
+ *                                    sizeof(A_element))`
+ *     (= 32 768 bytes for Qwen3.5: `BS=8`, `HIDDEN_STATES=2048`).  This
+ *     helper itself does NOT call `mbarrier_arrive_expect_tx`; it only
+ *     issues the `K_BLOCKS_TOTAL` TMA loads, and the cumulative
+ *     transaction count is what the caller's single arm covers.
+ *   - `desc` MUST be the descriptor produced by
+ *     `create_activations_tma_desc`, typically passed to the kernel as
+ *     a `__grid_constant__ CUtensorMap const` parameter.  No new
+ *     descriptor is required.
+ *   - `dest` MUST be the BS8-sized BF16 input tile in SHM (Phase-1/2
+ *     buffer); the caller's typed SHM layout supplies the underlying
+ *     `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` storage (the union view in
+ *     `TinyDataWGMMA_TMA::bf16_in_full`).  Aligned to at least 1024 B
+ *     by the union's `alignas(1024)`.
+ *   - This helper is consumed only by the BS8 TMA+WGMMA path; do NOT
+ *     instantiate it from any other variant (Req 7.1, 7.2, 7.3, 7.6).
+ *
+ * @tparam Dims          The MoE Dims tag (provides `BS` and
+ *                       `HIDDEN_STATES`).
+ * @param  activations_desc Host-built activation TMA descriptor
+ *                          (`__grid_constant__`), reused unchanged from
+ *                          `create_activations_tma_desc`.
+ * @param  dest          Reference to the tile-major BF16 SHM
+ *                       destination tile shaped
+ *                       `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` (typically
+ *                       `shmem->u.tiny_wgmma_tma.bf16_in_full`).
+ * @param  bar_smem_ptr  Pointer to the routing-window mbarrier in SHM
+ *                       (`shmem->u.tiny_wgmma_tma.bar_rwin`), pre-armed
+ *                       by the caller with the cumulative `tx_bytes`.
+ */
+template <typename Dims>
+__device__ __forceinline__ void moe_load_full_bf16_input(
+    CUtensorMap const& activations_desc,
+    A_element (&dest)[Dims::HIDDEN_STATES / 128u][Dims::BS][128u],
+    std::uint64_t* bar_smem_ptr) {
+  // 128-K SWZ128 atom width — matches the activation descriptor's
+  // `boxDim[0] = 128` baked into `create_activations_tma_desc` and the
+  // `K_STEP_WGMMA` constant in `MoECoreDims`.  Hardcoded here so this
+  // helper does not depend on `MoECoreDims` / `MoE_SHM`.
+  constexpr std::uint32_t K_STEP_WGMMA = 128u;
+  static_assert(Dims::HIDDEN_STATES % K_STEP_WGMMA == 0,
+                "moe_load_full_bf16_input requires HIDDEN_STATES to be a "
+                "multiple of 128 (the SWZ128 atom K-width).");
+  constexpr std::uint32_t K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / K_STEP_WGMMA;
+
+#pragma unroll
+  for (std::uint32_t kk = 0u; kk < K_BLOCKS_TOTAL; ++kk) {
+    const std::uint32_t k_start = kk * K_STEP_WGMMA;
+    // Tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` SHM placement:
+    // each TMA issue writes a self-contained 2 KB box (BS × 128 BF16)
+    // into slot `kk`.  The destination `&dest[kk][0][0]` matches what
+    // the descriptor's `boxDim = (128, 8)` produces: 8 contiguous
+    // token rows × 128 K-elements per row, advancing by
+    // `K_STEP_WGMMA * sizeof(A_element) = 256` bytes per row.  This
+    // is the SAME byte stride the TMA hardware uses, so the box
+    // lands compactly in the slot.  See the doc comment on
+    // `TinyDataWGMMA_TMA::bf16_in_full` in `moe_internal.h` for why
+    // the destination is tile-major rather than `[BS][HIDDEN_STATES]`.
+    tma_load_bf16_input_tile(activations_desc, /*k_start=*/k_start,
+                             /*dest_smem_ptr=*/&dest[kk][0][0],
+                             /*bar_smem_ptr=*/bar_smem_ptr);
+  }
 }
 
 // ─── Down-projection (Phase 4) TMA load helpers ──────────────────────────

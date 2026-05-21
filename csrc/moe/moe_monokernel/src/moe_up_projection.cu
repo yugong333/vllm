@@ -253,8 +253,8 @@ __device__ inline void moe_load_up_wgmma_tile_128x128(
  *
  * @note Prefetch-warp only. Unused token slots (`tok >= batch_size`)
  *       are NOT loaded; the streaming quantize step zero-fills the
- *       corresponding fp8_act slots regardless of bf16_in contents,
- *       so leaving bf16_in[tok>=batch_size] stale is safe.
+ *       corresponding fp8 atoms regardless of source tile contents,
+ *       so leaving stale rows for `tok >= batch_size` is safe.
  */
 template <typename Dims, std::size_t DestTok, std::size_t DestK>
 __device__ inline void moe_load_bf16_input_tile(
@@ -886,12 +886,14 @@ namespace moe_monokernel {
 //
 // TMA+WGMMA up-projection for BS<=8. Only variant of the BS8 up-proj
 // kernel: the cp.async reference path has been removed. Replaces the
-// prefetch-warp `cp.async` loaders for BOTH the bf16 activation tile and
-// the fp8 expert-weight tile with `cp.async.bulk.tensor.2d` issued by a
-// single TMA launcher thread (warp 8, lane 0). Completion of each tile
-// is signalled via SHM mbarriers (`bar_w[2]`, `bar_a[2]`); consumer
-// warps wait with `mbarrier.try_wait.parity` instead of
-// `cuda::pipeline_consumer_wait_prior`.
+// prefetch-warp `cp.async` loaders for the fp8 expert-weight tile with
+// `cp.async.bulk.tensor.2d` issued by a single TMA launcher thread
+// (warp 8, lane 0). Completion is signalled via SHM mbarrier `bar_w[2]`;
+// consumer warps wait with `mbarrier.try_wait.parity` instead of
+// `cuda::pipeline_consumer_wait_prior`.  The activation operand is
+// sourced from `fp8_act_full` (populated by Phase 1 + Phase 2 of
+// `moe_kernel_topk_BS8`); no per-K-step bf16-input TMA or `bar_a` arm
+// fires from this helper.
 //
 // Descriptors are built host-side in the torch binding wrapper and passed
 // to the top-level kernel as `__grid_constant__ CUtensorMap const`
@@ -912,7 +914,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& up_weights_desc,
     CUtensorMap const& activations_desc,
     std::uint32_t up_block_idx = 0xffffffffu, std::uint32_t expert_start = 0,
-    std::uint32_t expert_stride = 1, bool external_priming = false) {
+    std::uint32_t expert_stride = 1) {
   static_assert(Dims::BS <= 8);
   using CoreDims = MoECoreDims<Dims>;
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
@@ -924,21 +926,25 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   (void)activations_in;
   (void)expert_weights_up;
 
-  // `external_priming = true` means the caller has already performed:
-  //   * `mbarrier_init` on all 4 barriers + release-fence
-  //   * the first expert's Step A (arm bar_a[0] + bf16_in[0] TMA at k=0)
-  //   * a block-wide `__syncthreads()` to publish both.
+  // Caller contract (post topk-bs8-tma-prefetch-quant-fusion):
+  //   * The Phase-1 routing-window TMA (in `moe.cu`) has already
+  //     fetched the full BF16 input tile into `bf16_in_full`.
+  //   * Phase 2 has run `routing_phase_quantize` and a block-wide
+  //     `__syncthreads()`, so `fp8_act_full[k_block]` and
+  //     `act_scale[token][k_block]` are visible to every calc warp
+  //     for `k_block in [0, K_BLOCKS_TOTAL)`.
+  //   * `bar_w[0..1]` have been initialized and release-fenced.
   //
-  // Stage A pipeline (always-external-priming path):
+  // Stage A pipeline:
   //   * Pre-loop: helper arms bar_w[0] + TMAs w[0] of expert_start at k=0.
-  //   * K-loop (QUANT-first): iter s QUANT waits bar_a[s%2], quantizes;
-  //                            iter s COMPUTE waits bar_w[s%2], WGMMA +
-  //                            scale-apply, and launcher arms the
-  //                            NEXT slot (intra-expert s+1 or next
-  //                            expert's k=0 stitch).
-  //   * One __syncthreads() per iteration (between QUANT and COMPUTE).
-  //   * No priming block, no per-expert Step A, no tail prefetch — the
-  //     cross-expert mbarrier chain carries tiles forward automatically.
+  //   * K-loop: iter s waits bar_w[s%2], runs WGMMA +
+  //             scale-apply (B operand from `fp8_act_full`), and the
+  //             launcher arms the NEXT slot's bar_w + weight TMAs
+  //             (intra-expert s+1 or next expert's k=0 stitch).
+  //   * No bar_a, no bf16 TMAs, no QUANT half, no QUANT/COMPUTE
+  //     __syncthreads() — the activation operand is already in
+  //     `fp8_act_full` for the entire K range (Req 3.1, 3.2, 3.3,
+  //     3.6, 3.7, 3.12).
 
   // ── Compile-time constants (v1) ─────────────────────────────────────
   // Byte-for-byte mirror of the `cp.async` reference variant's constants
@@ -1004,53 +1010,37 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
   // ── Phase-3 preamble ──────────────────────────────────────────────────
   //
-  // Entry contract (Stage A — external priming is mandatory):
-  //   * All four mbarriers (bar_w[0..1], bar_a[0..1]) are initialized
-  //     with arrival_count=1 and release-fenced.
-  //   * bar_a[0] is armed + a TMA for bf16_in[0] at k=0 is in flight
-  //     (from Phase-1 greedy prefetch in moe.cu).
-  //   * A block-wide __syncthreads() has already published the init to
-  //     every consumer warp.
+  // Entry contract (post-fusion):
+  //   * `bar_w[0..1]` are initialized (arrival_count=1) and
+  //     release-fenced by the kernel prologue in `moe.cu`.
+  //   * Phase 1 + Phase 2 have populated `bf16_in_full` and then
+  //     `fp8_act_full` + `act_scale[token][k_block]` for every
+  //     `k_block ∈ [0, K_BLOCKS_TOTAL)`; the Phase-2 trailing
+  //     `__syncthreads()` published those writes to all warps.
+  //   * `bar_a[0..1]` are NOT initialized by `moe.cu`'s prologue —
+  //     they are reused by the down-projection in Phase 4 and
+  //     re-initialized in the down-proj prologue.
   //
-  // The helper never re-initializes barriers.  If `external_priming`
-  // is false (legacy call sites), the helper falls back to the old
-  // behaviour; we keep the branch for signature parity but on the only
-  // live call site `external_priming` is always true.
-  if (!external_priming) {
-    if (is_tma_launcher_thread<Dims>()) {
-      mbarrier_init(&shm->bar_w[0], 1u);
-      mbarrier_init(&shm->bar_w[1], 1u);
-      mbarrier_init(&shm->bar_a[0], 1u);
-      mbarrier_init(&shm->bar_a[1], 1u);
-      fence_mbarrier_init_release_cluster();
-    }
-    __syncthreads();
-  }
+  // This helper never re-initializes barriers and never issues
+  // bf16-input TMAs; the K-loop reads FP8 activations directly from
+  // `fp8_act_full` (Req 3.4).
 
   // Stage A requires an even K_TILES so the end-of-K-loop launcher arm
   // lands on `next_slot = K_TILES % 2 = 0`.  That slot-0 stitch is what
-  // the next expert's iter-0 QUANT/COMPUTE waits on; an odd K_TILES
-  // would land the stitch on slot 1, breaking the cross-expert
-  // mbarrier chain.  At K_STEP_UP=128 (default) HIDDEN_STATES=2048 →
-  // K_TILES=16; at K_STEP_UP=256 → K_TILES=8; both satisfy the
-  // invariant.
+  // the next expert's iter-0 COMPUTE waits on; an odd K_TILES would
+  // land the stitch on slot 1, breaking the cross-expert mbarrier
+  // chain.  At K_STEP_UP=128 (default) HIDDEN_STATES=2048 → K_TILES=16;
+  // at K_STEP_UP=256 → K_TILES=8; both satisfy the invariant.
   static_assert(K_TILES % 2 == 0,
                 "Stage-A pipeline requires K_TILES to be even so the "
                 "end-of-loop stitch arms the same slot that the next "
-                "expert's iter-0 QUANT waits on.");
+                "expert's iter-0 COMPUTE waits on.");
 
   // ── Pre-loop: arm bar_w[0] + TMA w[0] of expert_start at k=0 ──────────
   //
-  // bar_w[0] is not pre-armed by the caller (only bar_a[0] is).  The
-  // helper fires the first expert's weight TMA here, in parallel with
-  // the still-in-flight Phase-1 bf16_in[0] TMA, so the iter-0 COMPUTE
-  // can start the moment both barriers flip.
-  //
-  // For K_STEP > K_STEP_WGMMA the slot holds K_SUBSTEPS_UP back-to-back
-  // 128×128 SWZ128 atoms stacked along the K axis (one TMA per atom);
-  // bar_w[0] is armed once with the TOTAL tx_bytes so a single
-  // `mbarrier.try_wait.parity` on the calc side drains all atoms.
-  //
+  // bar_w[0] is not pre-armed by the caller; this helper fires the
+  // first expert's weight TMA here.  iter-0 COMPUTE waits on
+  // bar_w[0] before issuing WGMMAs.
   // For subsequent experts inside the same helper invocation, the
   // previous expert's K-loop stitch (at s=K_TILES-1 COMPUTE) arms
   // bar_w[0] + TMAs w[0] of the next expert.  No pre-loop work there.
@@ -1060,10 +1050,13 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // there is no spin-forever deadlock.
   constexpr uint32_t UP_W_TX_BYTES_PER_SUBSTEP = 16384u;  // 128×128 fp8 atom
   constexpr uint32_t UP_W_TX_BYTES_TOTAL =
-      UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;            // 16 KB / 32 KB
-  constexpr uint32_t UP_A_TX_BYTES_PER_SUBSTEP = 2048u;  // 8 tok × 128 K bf16
-  constexpr uint32_t UP_A_TX_BYTES_TOTAL =
-      UP_A_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 2 KB / 4 KB
+      UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 16 KB / 32 KB
+  // The bf16-input TMA + `bar_a` arm have been removed from this
+  // helper (Req 3.7).  Phase-1 + Phase-2 in `moe.cu` populate
+  // `fp8_act_full` once per kernel invocation; the K-loop reads it
+  // directly.  The legacy `UP_A_TX_BYTES_*` constants live in the
+  // kernel prologue for now (until task 12 removes the legacy
+  // hoisted Step A entirely).
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     const uint32_t first_id = shmem->experts[expert_start].id;
@@ -1089,14 +1082,14 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     const uint32_t next_id =
         has_next_e ? shmem->experts[e + expert_stride].id : 0u;
 
-    // Per-expert parity state.  bar_{w,a}[0] are always pre-armed at the
-    // start of each expert (by Phase-1 greedy / helper pre-loop / prior
-    // expert's stitch), so register 0 correctly expects physical 1 on
-    // the first try_wait.parity.  bar_{w,a}[1] are first armed inside
+    // Per-expert parity state.  bar_w[0] is always pre-armed at the
+    // start of each expert (by the helper pre-loop above for
+    // expert_start, or by the prior expert's stitch for subsequent
+    // experts), so register 0 correctly expects physical 1 on
+    // the first try_wait.parity.  bar_w[1] is first armed inside
     // this expert's iter 0 COMPUTE, so register 0 expects physical 1
     // on iter 1's first wait.
     uint32_t parity_w[2] = {0, 0};
-    uint32_t parity_a[2] = {0, 0};
 
     // Reset per-expert accumulators.
     final_d0 = final_d1 = final_d2 = final_d3 = 0.f;
@@ -1113,83 +1106,47 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   #endif
     }
 
-    // ── Main K-loop (Stage A: QUANT-first, mbarrier-only sync) ─────────
+    // Publish the per-expert `up_scale` write from the prefetch
+    // warp (above) to the calc warps that consume it inside the
+    // K-loop scale-apply.  The legacy QUANT/COMPUTE sync used to
+    // serve this purpose; it is removed by Req 3.6 / 3.12.  This
+    // sync sits OUTSIDE the K-loop, so R3.12 ("at most one
+    // __syncthreads() per outer K-step iteration") is preserved.
+    __syncthreads();
+
+    // ── Main K-loop (FP8-direct: COMPUTE-only, mbarrier-only sync) ─────
     //
     // Pipeline per iteration:
-    //   QUANT half (calc):  wait bar_a[s%2]; bf16_in[s%2] → fp8_act[s%2].
-    //   __syncthreads()  ← publishes fp8_act + act_scale to calc warps,
-    //                       and (on iter 0) publishes up_scale from the
-    //                       prefetch warp's synchronous load above.
     //   COMPUTE half:
     //     calc:      wait bar_w[s%2]; K_SUBSTEPS × (4× WGMMA + scale-apply).
-    //     launcher:  arm + TMA the NEXT slot's K_SUBSTEPS weight + bf16
-    //                atoms (UP_W_TX_BYTES_TOTAL + UP_A_TX_BYTES_TOTAL
-    //                bytes total).  Both are issued here so the launcher
-    //                is guaranteed to run AFTER the calc warp's wait on
-    //                bar_w[cur_slot] has completed (the __syncthreads()
-    //                between QUANT and COMPUTE ensures this).  Issuing
-    //                the weight TMA in QUANT instead would create a race:
-    //                the launcher could arm bar_w[next_slot] before the
-    //                calc warp's wait on bar_w[next_slot] from the
-    //                previous iteration has returned, causing an illegal
-    //                double-arm (arrival counter goes negative).
+    //                B operand reads `fp8_act_full[s * K_SUBSTEPS + kk]`
+    //                — single-buffer FP8 produced once per kernel
+    //                invocation by Phase 2's `routing_phase_quantize`
+    //                and published by the Phase-2 trailing
+    //                `__syncthreads()` in `moe.cu` (Req 3.4, 3.5).
+    //     launcher:  arm + TMA the NEXT slot's K_SUBSTEPS weight atoms
+    //                (UP_W_TX_BYTES_TOTAL bytes total).  No bar_a arm
+    //                and no bf16-input TMA (Req 3.7).
     //                target = (s+1, current expert) for intra-expert
     //                         steps, or (0, next expert) on the last
     //                         step when a next expert is scheduled.
     //                When no next step and no next expert, skip — the
     //                trailing barriers are left idle; Phase 4 reinits.
-    //   (no trailing sync — the next iter's QUANT re-establishes order
-    //    via try_wait.parity on bar_a, and COMPUTE via bar_w.)
+    //   No QUANT half, no QUANT/COMPUTE __syncthreads() (Req 3.1, 3.2,
+    //   3.3, 3.6, 3.12).  The next iter's COMPUTE wait on
+    //   bar_w[next_slot] re-establishes acquire ordering for the
+    //   weight TMA's async writes.
     for (uint32_t s = 0; s < K_TILES; ++s) {
       const uint32_t cur_slot = s & 1;
       const uint32_t next_slot = (s + 1) & 1;
       const bool has_next_s = (s + 1 < K_TILES);
 
-      // ───── QUANT half ───────────────────────────────────────────────
-      if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-        // Wait on activation tile arrival. Gated by SKIP_PREFETCH (not
-        // SKIP_CALC) because the launcher below also skips the matching
-        // `arrive_expect_tx` when SKIP_PREFETCH is defined; skipping
-        // the wait on the calc side avoids a spin-forever deadlock.
-        // Under SKIP_CALC (launcher still issues TMAs) the wait stays
-        // so traces capture the full barrier-stall cost.
-        while (!mbarrier_try_wait_parity(&shm->bar_a[cur_slot],
-                                         parity_a[cur_slot])) {
-        }
-        parity_a[cur_slot] ^= 1;
-  #endif
-
-  #ifndef MONO_PROFILE_SKIP_CALC_UP
-        // Each calc warp `w ∈ {0..7}` quantizes token `w`; warps
-        // whose `tok >= batch_size` get zero-filled `fp8_act` and
-        // `act_scale = 1.0` inside `moe_streaming_quantize_k128`
-        // (ragged-batch isolation matches the cp.async reference
-        // byte-for-byte on tokens `[0, batch_size)`).
-        //
-        // For K_STEP > K_STEP_WGMMA the slot holds K_SUBSTEPS_UP
-        // back-to-back 128-K bf16 / fp8 atoms; the quantize helper
-        // takes one [T_TILE][128] bf16 atom plus its [8][T_TILE][16]
-        // fp8 atom per call, with the per-128-K block scale written
-        // to `act_scale[tok][s * K_SUBSTEPS + kk]`.
-        const uint32_t tok = warp;
-    #pragma unroll
-        for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-          moe_streaming_quantize_k128<Dims>(
-              shm->bf16_in[cur_slot][kk], shm->fp8_act[cur_slot][kk], tok,
-              batch_size, &shmem->act_scale[tok][s * K_SUBSTEPS + kk]);
-        }
-  #endif
-      }
-
-      __syncthreads();
-
       // ───── COMPUTE half ─────────────────────────────────────────────
       if (is_calc) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-        // Wait on weight tile arrival.  Same gating rationale as the
-        // bar_a wait above — compiled in/out together with the
-        // launcher's arm.
+        // Wait on weight tile arrival.  Compiled in/out together with
+        // the launcher's arm; under SKIP_PREFETCH the launcher elides
+        // the arm so skipping the wait avoids a spin-forever deadlock.
         while (!mbarrier_try_wait_parity(&shm->bar_w[cur_slot],
                                          parity_w[cur_slot])) {
         }
@@ -1212,8 +1169,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         // `w_wgmma[slot]`: 128 rows × 128 K-bytes = 16 KB.
         constexpr uint32_t K_SUBSTEP_W_BYTES = 16384u;
 
-        // Per-substep activation base: kk-th 1024-B SWZ128 atom inside
-        // the activation slot (addressed via `fp8_act[slot][kk]`).
+        // Per-substep activation base: B operand reads
+        // `fp8_act_full[s * K_SUBSTEPS + kk]` (single buffer covering
+        // all K substeps; produced once per kernel invocation by
+        // Phase 2's `routing_phase_quantize`).
 
         // Chain 4 WGMMAs per K-substep, each consuming K=32 (= 2
         // consecutive K-chunks of 16 from the fp8 activation tile).
@@ -1224,10 +1183,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
           // A new `wgmma.fence` is required at the start of every group
           // of dependent WGMMAs (one fence ↔ one commit-group/wait-group
-          // pair below).  Folding the fence outside the kk loop relies
-          // on a single commit+wait pair covering all substeps, which
-          // would force the compiler to emit a single "supergroup" of
-          // WGMMAs without intermediate scale-apply ordering — incorrect.
+          // pair below).
           wgmma_fence();
 
           // Per-substep weight base: kk-th 128-row substep atom + this
@@ -1236,12 +1192,19 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
               (const void*)((const char*)a_slot_base + kk * K_SUBSTEP_W_BYTES +
                             wg_offset_bytes);
 
+          // Single-buffer activation atom for this (s, kk):
+          //   fp8_act_full[s * K_SUBSTEPS + kk][...]
+          // Replaces the legacy `fp8_act[cur_slot][kk]` indexing
+          // (Req 3.4).  `cur_slot` is unused for the activation
+          // operand and remains in scope only for the weight tile.
+          const uint32_t kblk = s * K_SUBSTEPS + kk;
+
     #pragma unroll
           for (uint32_t j = 0; j < WGMMAS_PER_SUBSTEP; ++j) {
             const void* a_ptr =
                 (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
             const void* b_ptr =
-                (const void*)&shm->fp8_act[cur_slot][kk][j * 2][0][0];
+                (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
             uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
             uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
             wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
@@ -1253,25 +1216,12 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
           // ── Scale-apply at the K=128 boundary (per-substep) ──────────
           //
-          // HOT-PATH BRANCH HYGIENE (ptxas C7520 fix).  The chain of 4
-          // `wgmma.mma_async` above, and the one that will fire on the
-          // next K-substep, must not be separated by any *within-warp*
-          // divergent control flow.  When they are, ptxas inserts a
-          // WG.AR (warp-group arrive-release) fence into the divergent
-          // path and emits a C7520 perf warning.  Both former offenders
-          // (lane-divergent batch_size predicate and within-warp
-          // gate/up branch) are folded into unconditional reads — the
-          // quantize path zero-fills out-of-range tokens and writes
-          // `act_scale[tok][...] = 1.0f`, so the WGMMA sees a zero
-          // B-operand and the scale-apply is numerically irrelevant
-          // for those lanes.
-          //
           // Scale indices for outer step `s`, substep `kk`:
           //   * activation: `act_scale[tok][s * K_SUBSTEPS + kk]`
           //   * weight:     `up_scale[0][s * K_SUBSTEPS + kk + ws_off]`
-          // For K_STEP_UP=K_STEP_WGMMA (legacy 128-K step) K_SUBSTEPS=1
-          // and the index collapses to the original `s` form.
-          const uint32_t kblk = s * K_SUBSTEPS + kk;
+          // Indexing matches the legacy form (Req 3.5); the values
+          // are now produced by `routing_phase_quantize` instead of
+          // by the per-K-step `moe_streaming_quantize_k128` call.
           const uint32_t ws_off = is_gate_half ? 0u : UP_SCALE_COLS;
           const float ws = shm->up_scale[0][kblk + ws_off];
           const uint32_t tok_02 = (lane % 4) * 2;
@@ -1287,26 +1237,26 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   #endif
       }
 
-      // Launcher runs IN PARALLEL with the WGMMA above.  Both weight
-      // and bf16 TMAs are issued here (not in QUANT) to avoid a
-      // double-arm race: the __syncthreads() between QUANT and COMPUTE
-      // guarantees the calc warp's wait on bar_w[cur_slot] from the
-      // previous iteration has completed before the launcher arms
-      // bar_w[next_slot] for the next iteration.
+      // Launcher runs IN PARALLEL with the WGMMA above.  Only the
+      // weight TMA + bar_w arm remain; the bf16-input TMA + bar_a
+      // arm have been removed (Req 3.7).  The activation operand is
+      // sourced from `fp8_act_full`, which is produced once per
+      // kernel invocation by Phase 2 — there is nothing to fetch
+      // per K-step on the activation side.
       //
       // For K_STEP > K_STEP_WGMMA the launcher issues K_SUBSTEPS_UP
-      // back-to-back TMAs per slot (one per 128-K substep, stacked
-      // along the K axis in SHM).  Both barriers are armed once with
+      // back-to-back weight TMAs per slot (one per 128-K substep,
+      // stacked along the K axis in SHM).  bar_w is armed once with
       // the TOTAL tx_bytes so a single `mbarrier.try_wait.parity` on
       // the calc side drains all atoms.
       //
       // Compiled out under MONO_PROFILE_SKIP_PREFETCH_UP; the matching
-      // calc-warp waits on bar_{w,a}[next_slot] in the next iteration
-      // are also compiled out so there is no spin-forever deadlock.
+      // calc-warp wait on bar_w[next_slot] in the next iteration is
+      // also compiled out so there is no spin-forever deadlock.
       if (is_tma_launcher_thread<Dims>()) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
         if (has_next_s) {
-          // Intra-expert: fetch (s+1) tiles of the CURRENT expert.
+          // Intra-expert: fetch (s+1) tile of the CURRENT expert.
           const uint32_t next_k_start = (s + 1) * K_STEP;
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
@@ -1320,19 +1270,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                 /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
                 /*bar=*/&shm->bar_w[next_slot]);
           }
-          mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                    /*tx_bytes=*/UP_A_TX_BYTES_TOTAL);
-    #pragma unroll
-          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_bf16_input_tile(
-                activations_desc,
-                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                &shm->bf16_in[next_slot][kk][0][0], &shm->bar_a[next_slot]);
-          }
         } else if (has_next_e) {
-          // End-of-expert stitch: fetch iter-0 tiles of the NEXT expert.
-          // For K_TILES even, `next_slot == 0` — matches the next
-          // expert's iter-0 cur_slot.
+          // End-of-expert stitch: fetch iter-0 weight tile of the
+          // NEXT expert.  For K_TILES even, `next_slot == 0` —
+          // matches the next expert's iter-0 cur_slot.
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/UP_W_TX_BYTES_TOTAL);
     #pragma unroll
@@ -1345,25 +1286,35 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                 /*dest_slot=*/&shm->w_wgmma[next_slot][kk * W_UP_M][0],
                 /*bar=*/&shm->bar_w[next_slot]);
           }
-          mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                    /*tx_bytes=*/UP_A_TX_BYTES_TOTAL);
-    #pragma unroll
-          for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-            tma_load_bf16_input_tile(activations_desc,
-                                     /*k_start=*/kk * K_STEP_WGMMA,
-                                     &shm->bf16_in[next_slot][kk][0][0],
-                                     &shm->bar_a[next_slot]);
-          }
         }
           // Else: last expert's last iteration — leave barriers idle.
   #endif
       }
 
-      // NO trailing __syncthreads() — the next iter's QUANT/COMPUTE
-      // waits on mbarriers re-establish acquire ordering for any async
-      // writes, and the next iter's QUANT→COMPUTE sync re-establishes
-      // thread visibility for generic writes (up_scale, act_scale,
-      // fp8_act).
+      // ── Inter-iteration sync ──
+      //
+      // The launcher arms `bar_w[next_slot]` at iter s.  Two
+      // iterations later (iter s+2), the launcher arms the SAME
+      // `bar_w[next_slot]` again (because the slot index repeats every
+      // 2 iters in the ping-pong).  For the second arm not to
+      // double-arm an mbarrier whose current phase is still pending,
+      // the calc-warp consume of that slot at iter s+1 must complete
+      // BEFORE iter s+2's launcher arm runs.
+      //
+      // The legacy QUANT/COMPUTE __syncthreads() served this role.
+      // Without it, the launcher (a single warp-8-lane-0 thread that
+      // never waits) can race ahead through all K_TILES launcher
+      // arms before any calc warp consumes its bar_w wait.  This
+      // single end-of-iter sync re-establishes ordering: every iter,
+      // all warps (including launcher and calc) rendezvous at the
+      // sync, so the launcher cannot arm the next-slot mbarrier until
+      // the calc warps' wait on the same slot has completed.
+      //
+      // R3.12 allows one __syncthreads() per outer K-step iteration;
+      // this sync publishes the launcher's `mbarrier_arrive_expect_tx`
+      // (a producer-side state mutation on bar_w) to the calc warps
+      // that will issue `try_wait_parity` against it next iter.
+      __syncthreads();
     }  // end K-loop
 
     MONO_PHASE_TIMESTAMP_IF(t_up_after_expert0_kloop, e == expert_start);
