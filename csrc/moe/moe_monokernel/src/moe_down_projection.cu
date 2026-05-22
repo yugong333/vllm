@@ -142,15 +142,15 @@ __device__ inline void moe_request_down_expert(
  * @brief Per-expert activation-scale loader (down-projection, TMA path).
  *
  * Loads ALL `T_TILE × (Dims::N / 64)` per-token activation scales for
- * the current expert into `a_down_scale[tok][col_block]`.  Called ONCE
+ * the current expert into `a_down_scale[col_block][tok]`.  Called ONCE
  * per expert at the top of the per-expert loop, NOT per K-step.  This
  * is the hoisted-out-of-K-loop variant: the K-loop's WGMMA scale-apply
- * indexes `a_down_scale[tok][s * K_SUBSTEPS_DOWN * 2 + 2 * kk + half]`
+ * indexes `a_down_scale[s * K_SUBSTEPS_DOWN * 2 + 2 * kk + half][tok]`
  * directly, removing the per-K-step cp.async + pipe drain that the
  * older variant required.
  *
  * Rank-indexing invariant (R11.3, R12.9):
- *   `a_down_scale[rank][col_block]` must match the scale for the token
+ *   `a_down_scale[col_block][rank]` must match the scale for the token
  *   whose fp8 payload sits at `a_down_wgmma[slot][?][rank][kc][ki]`.
  *   That fp8 payload is loaded by the bulk-per-expert TMA from GM rows
  *   `[expert_slot_start[id], expert_slot_start[id] + routed_count)`
@@ -177,17 +177,17 @@ __device__ inline void moe_request_down_expert(
  * @param shmem         SHM struct (reads `expert_routed_count`,
  *                      `expert_slot_start`).
  * @param id            Current expert id.
- * @param dest_scale    SHM `a_down_scale[T_TILE][N/64]`.
+ * @param dest_scale    SHM `a_down_scale[N/64][T_TILE]`.
  *
  * @note Prefetch-warp only.  Caller MUST ensure a `__syncthreads()`
  *       before the K-loop reads `a_down_scale`.
  */
-template <typename Dims, std::size_t ScaleTok, std::size_t ScaleHalves,
+template <typename Dims, std::size_t ScaleHalves, std::size_t ScaleTok,
           unsigned RunPw = 0u>
 __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
     const MoEGemmSpec<Dims>* __restrict__ spec,
     const MoE_SHM<Dims>* __restrict__ shmem, std::uint32_t id,
-    S_element (&dest_scale)[ScaleTok][ScaleHalves]) {
+    S_element (&dest_scale)[ScaleHalves][ScaleTok]) {
   using CoreDims = MoECoreDims<Dims>;
   static_assert(ScaleTok == CoreDims::T_TILE,
                 "down-proj activation scale tile must have T_TILE=8 tokens");
@@ -213,7 +213,12 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
 
   // Strided loop over the (slot_row, half) plane.  Total entries =
   // T_TILE * SCALE_COLS = 8 * 8 = 64 for Qwen3.5; one warp's 32 lanes
-  // do 2 loads each (stride 32).
+  // do 2 loads each (stride 32).  GM `temp_act_scale` is `[row][half]`
+  // (row-major, written by the up-proj epilogue) but SHM
+  // `a_down_scale` is `[half][row]` (chosen for bank-conflict-free
+  // reads in the down-proj WGMMA scale-apply, see comment on the SHM
+  // declaration in `MoE_SHM::U::TinyDataWGMMA_TMA`).  This loop
+  // transposes on the fly.
   constexpr unsigned TOTAL = (unsigned)(ScaleTok * ScaleHalves);
   for (unsigned i = thread; i < TOTAL; i += 32u) {
     const unsigned slot_row = i / SCALE_COLS;  // 0..T_TILE-1
@@ -221,12 +226,12 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
 
     if (slot_row < routed_count) {
       const uint32_t source_row = expert_start + slot_row;
-      dest_scale[slot_row][half] =
+      dest_scale[half][slot_row] =
           spec->temp_act_scale[source_row * SCALE_COLS + half];
     } else {
       // Unused rank — see preamble in the BS8 down-proj kernel for
       // why the value doesn't matter.  Set to 0 for cleanliness.
-      dest_scale[slot_row][half] = 0.f;
+      dest_scale[half][slot_row] = 0.f;
     }
   }
 }
@@ -1048,9 +1053,10 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         moe_load_down_wgmma_weight_scale_tile<Dims>(
             expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
       }
-      moe_load_down_wgmma_act_scale_per_expert<Dims, CoreDims::T_TILE,
-                                               Dims::N / 64u, /*RunPw=*/0u>(
-          spec, shmem, id, shm->a_down_scale);
+      moe_load_down_wgmma_act_scale_per_expert<Dims, Dims::N / 64u,
+                                               CoreDims::T_TILE,
+                                               /*RunPw=*/0u>(spec, shmem, id,
+                                                             shm->a_down_scale);
   #endif
     }
 
@@ -1320,15 +1326,23 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           const std::uint32_t tok_13 = (lane % 4) * 2 + 1;
 
           // Activation scales are now hoisted to a per-expert
-          // single-buffer `a_down_scale[tok][global_half]`.  The global
+          // single-buffer `a_down_scale[global_half][tok]`.  The global
           // 64-K half index for outer step `s`, substep `kk`, half
           // `half ∈ {0, 1}` is `s * K_SUBSTEPS_DOWN * 2 + kk * 2 +
           // half` (= `s * (K_STEP_DOWN/64) + 2*kk + half`).
+          //
+          // Layout note: the legacy `[tok][global_half]` layout caused
+          // a 2-way bank conflict on these LDS sites because the row
+          // stride along `tok` was 32 B = 8 banks and lane groups
+          // {0,4} mapped to the same bank.  The transpose to
+          // `[global_half][tok]` (matching `MoE_SHM::act_scale`) puts
+          // every (tok_02 ∈ {0,2,4,6}) lookup on a distinct bank
+          // within one 32-B row → conflict-free.
           const std::uint32_t base_half = s * K_SUBSTEPS_DOWN * 2u + 2u * kk;
-          const float as_lo_02 = shm->a_down_scale[tok_02][base_half + 0u];
-          const float as_hi_02 = shm->a_down_scale[tok_02][base_half + 1u];
-          const float as_lo_13 = shm->a_down_scale[tok_13][base_half + 0u];
-          const float as_hi_13 = shm->a_down_scale[tok_13][base_half + 1u];
+          const float as_lo_02 = shm->a_down_scale[base_half + 0u][tok_02];
+          const float as_hi_02 = shm->a_down_scale[base_half + 1u][tok_02];
+          const float as_lo_13 = shm->a_down_scale[base_half + 0u][tok_13];
+          const float as_hi_13 = shm->a_down_scale[base_half + 1u][tok_13];
 
           // Global 128-K block index along Dims::N for this (s, kk):
           //   global_kblock = (s * K_STEP_DOWN + kk * K_STEP_WGMMA) / 128
