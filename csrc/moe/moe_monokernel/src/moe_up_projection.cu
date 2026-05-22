@@ -795,8 +795,8 @@ __device__ inline void moe_up_projection_topk(
           float bws1 = get_up_block_scale<Dims>(expert_scales_up, id,
                                                 base_row + thread / 4 + Dims::N,
                                                 full_k_col);
-          float as0 = shmem->act_scale[tok0][full_k_col / ACT_BLOCK];
-          float as1 = shmem->act_scale[tok1][full_k_col / ACT_BLOCK];
+          float as0 = shmem->act_scale[full_k_col / ACT_BLOCK][tok0];
+          float as1 = shmem->act_scale[full_k_col / ACT_BLOCK][tok1];
           d0 += md0 * bws0 * as0;
           d1 += md1 * bws0 * as1;
           d2 += md2 * bws1 * as0;
@@ -905,6 +905,109 @@ namespace moe_monokernel {
 // (SHM layout, barrier arming, warp-role allocation) and requirements
 // R1.1, R2.1, R6.1.
 //
+
+// ── Per-(token, lane) SiLU + fp8 quantization + writeback body ─────────
+//
+// Factored out of the up-proj epilogue so the same body can run
+// (a) on calc warps inline for the LAST expert in a block's per-expert
+// loop (no future iter-0 to defer to) and (b) on prefetch warps as
+// "deferred work for the previous expert" at iter-0 of the next
+// expert, overlapped with calc warps' WGMMA.  The two paths differ
+// only in the (warp → tok) mapping, not in the per-(tok, lane) work.
+//
+// Caller contract:
+//   * `wgmma_out` MUST have been written by the producing expert's
+//     end-of-K-loop final_d store and published to the calling warps.
+//     - Calc-warp inline path (last expert): the `__syncthreads()`
+//       AFTER the wgmma_out write covers this.
+//     - Deferred prefetch path (non-last experts): the same sync —
+//       which sits at the bottom of expert e's loop body — also gates
+//       iter-0 of expert e+1 where this helper is invoked.
+//   * `lane` MUST be in [0, 32); `tok` MUST be in [0, BS).  Out-of-
+//     range tokens must be filtered by the caller.
+//   * All 32 lanes of the warp MUST call this in lockstep with the
+//     same `tok` so the warp-reduce in the body sees all 64 cols.
+//   * `id` is the producing expert's id (the one whose final_d sits
+//     in `wgmma_out`), NOT necessarily the current iter's expert.
+//
+// Hazard: writes only `spec->temp_fp8` / `spec->temp_act_scale` (GM)
+// and reads `wgmma_out` + `shmem->topk_ids_flat` + `shm->sorted_slot`
+// (SHM).  No writes to SHM that calc warps touch in the K-loop, so
+// the prefetch-warp variant runs concurrently with calc warps' iter-0
+// WGMMA without contention.
+template <typename Dims>
+__device__ __forceinline__ void up_silu_quant_writeback_one_token(
+    MoE_SHM<Dims>* __restrict__ shmem, MoEGemmSpec<Dims>* __restrict__ spec,
+    typename MoE_SHM<Dims>::U::TinyDataWGMMA_TMA* __restrict__ shm,
+    std::uint32_t id, std::uint32_t tok, std::uint32_t col_in_half,
+    std::uint32_t lane, std::uint32_t base_row_up, std::uint32_t effective_bid,
+    std::uint32_t top_k, std::uint32_t batch_size) {
+  constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
+
+  // Uniform-across-warp: find this token's top-K match for the
+  // current expert.  All 32 lanes of the warp agree on these.
+  bool store = false;
+  float rw = 0.f;
+  std::uint32_t dest_row = 0;
+  if (tok < batch_size) {
+    for (std::uint32_t k = 0; k < top_k; ++k) {
+      if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
+        store = true;
+        rw = shmem->topk_weights_flat[tok * MAX_TOPK + k];
+        const std::uint32_t pair = tok * top_k + k;
+        dest_row = shm->sorted_slot[pair];
+        break;
+      }
+    }
+  }
+
+  // Compute val1 / val2 on every lane of the warp (needed so that the
+  // subsequent warp-reduce sees all 64 cols of this up-block).
+  const float gate1 = shm->partial_result.wgmma_out[col_in_half][tok];
+  const float up1 = shm->partial_result.wgmma_out[col_in_half + 32][tok];
+  const float gate2 = shm->partial_result.wgmma_out[col_in_half + 64][tok];
+  const float up2 = shm->partial_result.wgmma_out[col_in_half + 96][tok];
+
+  float val1 = rw * up1 * gate1 / (1.0f + __expf(-gate1));
+  float val2 = rw * up2 * gate2 / (1.0f + __expf(-gate2));
+
+  const std::uint32_t out_col_1 = base_row_up + col_in_half;
+  const std::uint32_t out_col_2 = base_row_up + 32 + col_in_half;
+  const bool write1 = store && (out_col_1 < Dims::N);
+  const bool write2 = store && (out_col_2 < Dims::N);
+
+  if (!write1) val1 = 0.f;
+  if (!write2) val2 = 0.f;
+
+  // Warp-reduce max(|val1|, |val2|) across the 32 lanes → max over all
+  // 64 output cols of this up-block for this token.
+  float local_max = fmaxf(fabsf(val1), fabsf(val2));
+  float block_max = warp_reduce_max_float(local_max);
+  if (block_max < __FLT_MIN__) block_max = 1.0f;
+
+  constexpr float FP8_MAX = 448.0f;
+  constexpr float FP8_MAX_INV = 1.0f / 448.0f;
+  const float block_scale = block_max * FP8_MAX_INV;
+  const float inv_scale = FP8_MAX / block_max;
+
+  const AQ_element q1 = (AQ_element)(val1 * inv_scale);
+  const AQ_element q2 = (AQ_element)(val2 * inv_scale);
+
+  if (store && tok < batch_size) {
+    if (write1) {
+      spec->temp_fp8[dest_row * Dims::N + out_col_1] = q1;
+    }
+    if (write2) {
+      spec->temp_fp8[dest_row * Dims::N + out_col_2] = q2;
+    }
+    if (lane == 0) {
+      constexpr std::uint32_t SCALE_COLS =
+          MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
+      spec->temp_act_scale[dest_row * SCALE_COLS + effective_bid] = block_scale;
+    }
+  }
+}
+
 template <typename Dims>
 __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     const A_element* __restrict__ activations_in,
@@ -917,7 +1020,6 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     std::uint32_t expert_stride = 1) {
   static_assert(Dims::BS <= 8);
   using CoreDims = MoECoreDims<Dims>;
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
   // `activations_in` / `expert_weights_up` are retained on the parameter
   // list for signature parity with the `cp.async` reference but are not
@@ -972,11 +1074,27 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   constexpr uint64_t A_LBO = 16ULL;
   constexpr uint64_t A_SBO = 1024ULL;
   constexpr uint32_t A_SWIZZLE = 1u;
-  // B operand (K-major, N=8): 1 N-block, LBO=128 between K-core-matrices.
+  // B operand (K-major, N=8): 1 N-block, LBO between K-core-matrices.
   // Always SWIZZLE_NONE — the activation tile is 8-token × 128-K bf16
   // and small enough that bank-conflict cost is bounded.
-  constexpr uint64_t B_LBO = 128;
-  constexpr uint64_t B_SBO = 128;  // unused (only 1 N-block for N=8)
+  //
+  // `B_LBO` = bytes between successive 8-row × 16-byte WGMMA core
+  // matrices along K = the byte stride between successive kc atoms in
+  // `fp8_act_full`'s `[FP8_NUM_CHUNKS][T_TILE_PADDED][FP8_K_CHUNK]`
+  // per-kblk layout (see comment on `fp8_act_full` in `moe_internal.h`
+  // for the kc-padding design).  The pad widens each kc atom from 128
+  // B (T_TILE=8) to 144 B (T_TILE_PADDED=9), and the 9th token row of
+  // every kc atom is unused — the WGMMA core matrix is still rows
+  // [0..7] × bytes [0..15] (= 128 B contiguous) at the head of each
+  // atom, and `B_LBO = 144` steps over the unused 9th row to land on
+  // the next kc atom's core matrix.
+  constexpr uint64_t B_LBO =
+      static_cast<uint64_t>(
+          MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
+      static_cast<uint64_t>(
+          MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
+                                                                  // 144 B
+  constexpr uint64_t B_SBO = B_LBO;  // unused (only 1 N-block for N=8)
 
   const unsigned thread_in_block = threadIdx.x;
   const unsigned warp = thread_in_block / 32;  // 0..11
@@ -1226,8 +1344,13 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           const float ws = shm->up_scale[0][kblk + ws_off];
           const uint32_t tok_02 = (lane % 4) * 2;
           const uint32_t tok_13 = tok_02 + 1;
-          const float as_02 = shmem->act_scale[tok_02][kblk];
-          const float as_13 = shmem->act_scale[tok_13][kblk];
+          // SHM `act_scale` is laid out as `[blk][tok]` (see comment on
+          // its declaration in `MoE_SHM`); the index swap from the
+          // legacy `[tok][blk]` form is cosmetic at the source level
+          // but eliminates the 4-way bank conflict NCU flagged on
+          // these LDS sites.
+          const float as_02 = shmem->act_scale[kblk][tok_02];
+          const float as_13 = shmem->act_scale[kblk][tok_13];
           final_d0 += chunk_d0 * ws * as_02;
           final_d1 += chunk_d1 * ws * as_13;
           final_d2 += chunk_d2 * ws * as_02;
@@ -1349,33 +1472,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     //   tok          = warp     (0..7) — one token per warp
     //   col_in_half  = lane     (0..31)
     //
-    // Each lane computes BOTH halves:
-    //   val1 = SiLU(WG0 gate, WG0 up) at out_col_1 = base_row_up + col_in_half
-    //   val2 = SiLU(WG1 gate, WG1 up) at out_col_2 = base_row_up + 32 +
-    //   col_in_half
-    //
-    // The warp-reduce of max(|val1|, |val2|) across the 32 lanes yields
-    // the per-token block max over all 64 output cols of this up-block.
-    //
-    // block_scale = block_max / 448
-    // inv_scale   = 448 / block_max
-    // q1 = (AQ_element)(val1 * inv_scale)   (saturating round-to-nearest-even)
-    // q2 = (AQ_element)(val2 * inv_scale)
-    //
-    // Writes:
-    //   spec->temp_fp8[dest_row * N + out_col_1] = q1
-    //   spec->temp_fp8[dest_row * N + out_col_2] = q2
-    //   (lane 0 only) spec->temp_act_scale[dest_row * (N/64) + up_block_idx]
-    //                 = block_scale
-    //
-    // Destination row: `dest_row = shm->sorted_slot[pair]` —
-    // expert-sorted row in the reorganized temp_fp8, consumed by the
-    // Phase-4 bulk-per-expert TMA (spec R11.3, R11.4).
-    //
-    // Guards: store && tok < batch_size && out_col < Dims::N.
-    // (The warp-reduce requires all 32 lanes to participate, so we
-    //  compute val1/val2 on every lane but zero out-of-range lanes'
-    //  contributions to the max and skip their writes.)
+    // Each lane computes BOTH halves: see
+    // `up_silu_quant_writeback_one_token` for the per-(tok, lane)
+    // body.
     //
     // NOTE: no write to spec->temp_bf16 on the WGMMA path — the scalar
     // path retains that behavior unchanged elsewhere.
@@ -1384,88 +1483,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // `tok` from warp id, `col_in_half` from lane id.
       const uint32_t tok = warp;          // 0..7, one per calc warp
       const uint32_t col_in_half = lane;  // 0..31
-
-      // Uniform-across-warp: find this token's top-K match for the
-      // current expert.  All 32 lanes of the warp agree on these.
-      bool store = false;
-      float rw = 0.f;
-      uint32_t dest_row = 0;
-      if (tok < batch_size) {
-        for (uint32_t k = 0; k < top_k; ++k) {
-          if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
-            store = true;
-            rw = shmem->topk_weights_flat[tok * MAX_TOPK + k];
-            const uint32_t pair = tok * top_k + k;
-            // Expert-sorted reorganization (spec R11.3): Phase 4's
-            // bulk-per-expert TMA expects each expert's routed tokens
-            // to occupy a contiguous run of rows in spec->temp_fp8.
-            dest_row = shm->sorted_slot[pair];
-            break;
-          }
-        }
-      }
-
-      // Compute val1 / val2 on every lane of the warp (needed so that
-      // the subsequent warp-reduce sees all 64 cols of this up-block).
-      const float gate1 = shm->partial_result.wgmma_out[col_in_half][tok];
-      const float up1 = shm->partial_result.wgmma_out[col_in_half + 32][tok];
-      const float gate2 = shm->partial_result.wgmma_out[col_in_half + 64][tok];
-      const float up2 = shm->partial_result.wgmma_out[col_in_half + 96][tok];
-
-      float val1 = rw * up1 * gate1 / (1.0f + __expf(-gate1));
-      float val2 = rw * up2 * gate2 / (1.0f + __expf(-gate2));
-
-      const uint32_t out_col_1 = base_row_up + col_in_half;
-      const uint32_t out_col_2 = base_row_up + 32 + col_in_half;
-      const bool write1 = store && (out_col_1 < Dims::N);
-      const bool write2 = store && (out_col_2 < Dims::N);
-
-      // Out-of-range lanes must not influence block_max; zero their
-      // contributions.  (Also zero everything when !store or
-      // tok >= batch_size so block_max is meaningful on skipped warps
-      // — although we won't write either way.)
-      if (!write1) val1 = 0.f;
-      if (!write2) val2 = 0.f;
-
-      // Warp-reduce max(|val1|, |val2|) across the 32 lanes → max over
-      // all 64 output cols of this up-block for this token.
-      float local_max = fmaxf(fabsf(val1), fabsf(val2));
-      float block_max = warp_reduce_max_float(local_max);
-      if (block_max < __FLT_MIN__) block_max = 1.0f;
-
-      constexpr float FP8_MAX = 448.0f;
-      constexpr float FP8_MAX_INV = 1.0f / 448.0f;
-      const float block_scale = block_max * FP8_MAX_INV;
-      const float inv_scale = FP8_MAX / block_max;
-
-      // Saturating round-to-nearest-even fp32 → fp8 e4m3 conversion
-      // (matches __nv_fp8x4_e4m3 with __NV_SATFINITE).
-      const AQ_element q1 = (AQ_element)(val1 * inv_scale);
-      const AQ_element q2 = (AQ_element)(val2 * inv_scale);
-
-      if (store && tok < batch_size) {
-        // Token-major layout for `temp_fp8`:
-        //   byte_off(row, col) = row * N + col
-        // Matches the SWZ128 Major::K B-operand canonical form
-        // (`tok * 128 + kc * 16 + ki`) once the down-proj TMA applies
-        // the 8-row × 128-byte XOR swizzle at write time into SHM
-        // `a_down_wgmma[tok][kc][ki]`.
-        if (write1) {
-          spec->temp_fp8[dest_row * Dims::N + out_col_1] = q1;
-        }
-        if (write2) {
-          spec->temp_fp8[dest_row * Dims::N + out_col_2] = q2;
-        }
-        // Lane 0 of each warp writes the per-(dest_row, up_block_idx)
-        // scale once.  All lanes in the warp hold the same block_scale
-        // after the warp-reduce, so picking lane 0 is arbitrary.
-        if (lane == 0) {
-          constexpr uint32_t SCALE_COLS =
-              MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
-          spec->temp_act_scale[dest_row * SCALE_COLS + effective_bid] =
-              block_scale;
-        }
-      }
+      up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, id, tok,
+                                              col_in_half, lane, base_row_up,
+                                              effective_bid, top_k, batch_size);
   #endif
     }
 

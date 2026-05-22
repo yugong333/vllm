@@ -949,20 +949,38 @@ struct MoE_SHM {
       // fp8_act covering all K substeps").  Indexed by `k_block ∈
       // [0, K_BLOCKS_TOTAL)`; the up-proj K-loop reads
       // `fp8_act_full[s * UP_K_SUBSTEPS + kk][...]` with no slot
-      // alternation.  Layout per `k_block`: `[FP8_ACT_NUM_CHUNKS]
-      // [T_TILE][FP8_ACT_K_CHUNK]` — same atom shape as the now-
-      // removed legacy `fp8_act` slot.
+      // alternation.  Layout per `k_block`:
+      //   `[FP8_ACT_NUM_CHUNKS][T_TILE_PADDED][FP8_ACT_K_CHUNK]`
+      // where `T_TILE_PADDED = T_TILE + 1 = 9`.  The 9th token-row in
+      // each kc atom is unused padding — its purpose is to break the
+      // 128-byte kc stride that caused an 8-way bank conflict on the
+      // routing-quantize STS (lanes with the same `t%4` were targeting
+      // the same bank across kc steps because `kc*128 B = 0 mod 32
+      // banks`).  With the pad, the kc stride becomes
+      // `T_TILE_PADDED * FP8_ACT_K_CHUNK = 9 * 16 = 144 B = 36 banks
+      // mod 32 = 4`, so kc=0..7 write to disjoint banks within each
+      // `t%4` lane group → conflict-free.
       //
-      // Sizing (Qwen3.5, K_BLOCKS_TOTAL=16): 16 × 8 × 8 × 16 = 16 KB.
+      // The matching WGMMA B descriptor for the up-proj K-loop is
+      // updated from `B_LBO = 128` to `B_LBO = T_TILE_PADDED *
+      // FP8_ACT_K_CHUNK = 144` to step across the new kc stride.  The
+      // 8-row × 16-byte WGMMA core matrix at the head of each kc atom
+      // is still 128 B contiguous (rows 0..7) and the unused 9th row
+      // is skipped by the LBO step.
+      //
+      // Sizing (Qwen3.5, K_BLOCKS_TOTAL=16):
+      //   * Old: 16 × 8 × 8 × 16 = 16 KB.
+      //   * New: 16 × 8 × 9 × 16 = 18 KB (+2 KB).
       //
       // The BS-dependent extent (`FP8_ACT_FULL_K_BLOCKS`) collapses
       // to 1 for `Dims::BS > 8` so the BS64 path's `MoE_SHM<Dims>`
       // size stays byte-identical to the pre-optimization baseline
       // (Req 7.1).  See the BF16_IN_FULL_BS / BF16_IN_FULL_K
       // comment above K_BLOCKS_TOTAL for the rationale.
+      static constexpr uint32_t FP8_ACT_T_TILE_PADDED = CoreDims::T_TILE + 1u;
       alignas(1024)
           AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
-                                 [CoreDims::T_TILE][FP8_ACT_K_CHUNK];
+                                 [FP8_ACT_T_TILE_PADDED][FP8_ACT_K_CHUNK];
 
       static constexpr uint32_t W_WGMMA_M =
           128;  // M dim of weight tile (up-proj)
@@ -1078,12 +1096,21 @@ struct MoE_SHM {
                           // up-block per token, full reduction dim)
       // Per-token activation scales for the WHOLE expert, loaded once
       // at the top of the per-expert loop (NOT per K-step).  The K-loop
-      // indexes this as `a_down_scale[tok][s * K_SUBSTEPS_DOWN * 2 +
-      // 2 * kk + half]` to pick the half covering the current 64-K
+      // indexes this as `a_down_scale[s * K_SUBSTEPS_DOWN * 2 + 2 * kk +
+      // half][tok]` to pick the half covering the current 64-K
       // sub-block.  Hoisting to per-expert removes the per-K-step
       // cp.async + pipe drain that was the only consumer of the
       // `cuda::pipeline` in the down-proj path.
-      S_element a_down_scale[CoreDims::T_TILE][DOWN_ACT_HALVES_PER_EXPERT];
+      //
+      // Layout note (bank-conflict avoidance, 2026-05): the inner index
+      // is `tok` for the same reason as `MoE_SHM::act_scale` above —
+      // the WGMMA scale-apply broadcasts each `(global_half, tok)` pair
+      // across the 8 four-lane groups in a warp, so a `[half][tok]`
+      // layout puts every read on a distinct bank within one 32-B row,
+      // eliminating the 2-way bank conflict the legacy `[tok][half]`
+      // layout produced (32-B row stride mod 32 banks lined `tok=0,4`
+      // up on the same bank).
+      S_element a_down_scale[DOWN_ACT_HALVES_PER_EXPERT][CoreDims::T_TILE];
 
       static constexpr uint32_t W_DOWN_SCALE_COLS =
           shm_down_scale_cols<Dims>::value;
@@ -1304,12 +1331,29 @@ struct MoE_SHM {
 
   // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
-  // act_scale[tok][blk] = max(|x_tok[blk*128..(blk+1)*128-1]|)/448
+  // act_scale[blk][tok] = max(|x_tok[blk*128..(blk+1)*128-1]|)/448
+  //
   // Per-token block-wise activation quantization scales for up-projection.
+  //
+  // Layout note (bank-conflict avoidance, 2026-05): the inner index is
+  // `tok` so the row stride along `blk` is `Dims::BS * sizeof(float) = 32 B
+  // = 8 banks` (for BS=8).  The up-proj WGMMA scale-apply broadcasts a
+  // single `(blk, tok)` pair across the 8 four-lane groups in a warp, so
+  // every lane-group reads the same `blk` row but a different `tok`
+  // word.  With this layout each `tok ∈ {0,2,4,6}` (resp. {1,3,5,7})
+  // lands on a distinct bank within the same row → conflict-free.  The
+  // legacy `[Dims::BS][ACT_SCALE_BLOCKS]` layout had a 64-B row stride
+  // (= 16 banks); for BS=8 the four toks read from the same warp lane
+  // mapped to the same bank, producing a 4-way conflict per LDS that
+  // NCU flagged as the dominant excessive-wavefront source.  The
+  // transposed layout costs the same 512 B and updates only the SHM
+  // index pattern — `MoEGemmSpec<Dims>::act_scale` (GM staging) keeps
+  // its `[BS][BLK]` layout because the BS64 path uses GM coalesced
+  // writes and there's no bank-conflict concern in DRAM.
   static constexpr uint32_t ACT_BLOCK_SIZE = 128;
   static constexpr uint32_t ACT_SCALE_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
-  S_element act_scale[Dims::BS][ACT_SCALE_BLOCKS];
+  S_element act_scale[ACT_SCALE_BLOCKS][Dims::BS];
 
   // Unique experts active in this batch, with their sorted token ranges.
   // Filled by prepare_moe_topk_BS8 (BS8) or prepare_moe_topk_BSx_Ey (BS64).

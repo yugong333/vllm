@@ -496,7 +496,7 @@ __device__ void moe_kernel_topk_BS64(
   __syncthreads();
 
   // Step 3: quantize activations once per original token.
-  // Writes spec->activations[tok] (fp8) and shmem->act_scale[tok].
+  // Writes spec->activations[tok] (fp8) and shmem->act_scale[blk][tok].
   //
   // Note: Stage 3b (copy routing_weight → topk_weights_flat) was removed.
   // The down-projection now reads path.bs64.token_weights[sorted_pos]

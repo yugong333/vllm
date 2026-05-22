@@ -27,17 +27,23 @@ __device__ static inline uint32_t warp_who_has(float haystack, float needle) {
 /**
  * @brief Warp-cooperative softmax over logits distributed across threads.
  *
- * Each thread holds @p count values. On return every element of @p logits
- * is replaced by its softmax probability.
+ * Each thread holds exactly @p Count values (compile-time).  The static
+ * count is required so the loops over the per-thread `logits[]` array
+ * are fully unrollable — when the count is a runtime argument, ptxas
+ * can't prove the index pattern is static and `logits[]` ends up on
+ * the stack frame as local memory, producing the uncoalesced LDL
+ * traffic flagged by the NCU "Local Memory" rule.
  */
-__device__ static inline void warp_softmax_inplace(float* logits,
-                                                   uint32_t count) {
+template <uint32_t Count>
+__device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
   float local_max = -FLT_MAX;
-  for (uint32_t i = 0; i < count; i++) local_max = fmaxf(local_max, logits[i]);
+  #pragma unroll
+  for (uint32_t i = 0; i < Count; i++) local_max = fmaxf(local_max, logits[i]);
   float global_max = warp_reduce_max_float(local_max);
 
   float local_sum = 0.0f;
-  for (uint32_t i = 0; i < count; i++) {
+  #pragma unroll
+  for (uint32_t i = 0; i < Count; i++) {
     logits[i] = __expf(logits[i] - global_max);
     local_sum += logits[i];
   }
@@ -45,7 +51,8 @@ __device__ static inline void warp_softmax_inplace(float* logits,
     local_sum += __shfl_xor_sync(0xFFFFFFFFU, local_sum, off, 32);
 
   float inv_sum = 1.0f / local_sum;
-  for (uint32_t i = 0; i < count; i++) logits[i] *= inv_sum;
+  #pragma unroll
+  for (uint32_t i = 0; i < Count; i++) logits[i] *= inv_sum;
 }
 
 /**
@@ -95,16 +102,29 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     return;
   }
 
-  constexpr uint32_t MAX_PER_THREAD = (Dims::NUM_EXPERTS + 31) / 32;
+  // Per-thread expert slice.  Each thread owns experts at indices
+  // {tid, tid + 32, tid + 64, ...} stepping by warp size, so for
+  // NUM_EXPERTS == k * 32 every thread holds exactly k entries.
+  // The `% 32 == 0` invariant lets us replace the previous runtime-
+  // bounded fill loop (which left `scores[]`/`expert_id[]` on the
+  // stack frame as local memory and produced uncoalesced LDL
+  // traffic flagged by the NCU "Local Memory" rule) with a
+  // statically-bounded `#pragma unroll` loop.  ptxas can then
+  // promote both arrays to registers.
+  static_assert(Dims::NUM_EXPERTS % 32u == 0u,
+                "topK_BS8 requires NUM_EXPERTS to be a multiple of 32 so "
+                "every thread owns exactly NUM_EXPERTS/32 experts; this "
+                "lets the per-thread scores[]/expert_id[] arrays stay "
+                "in registers (avoiding local-memory spills).");
+  constexpr uint32_t MAX_PER_THREAD = Dims::NUM_EXPERTS / 32u;
   float scores[MAX_PER_THREAD];
   uint32_t expert_id[MAX_PER_THREAD];
-  uint32_t num_local = 0;
 
-  for (uint32_t idx = tid; idx < Dims::NUM_EXPERTS; idx += 32) {
-    scores[num_local] =
-        (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
-    expert_id[num_local] = idx;
-    num_local++;
+  #pragma unroll
+  for (uint32_t i = 0; i < MAX_PER_THREAD; ++i) {
+    const uint32_t idx = i * 32u + tid;
+    scores[i] = (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
+    expert_id[i] = idx;
   }
 
   // ── Slow path: softmax + renormalize=False ─────────────────────────────
@@ -112,11 +132,12 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   // we cannot skip the bulk expf calls.  Falls back to the original
   // warp-cooperative softmax over all experts.
   if (scoring_func == ScoringFunc::SOFTMAX && !renormalize) {
-    warp_softmax_inplace(scores, num_local);
+    warp_softmax_inplace<MAX_PER_THREAD>(scores);
     for (uint32_t k = 0; k < top_k; k++) {
       float max_val = -FLT_MAX;
       uint32_t max_expert = 0;
-      for (uint32_t i = 0; i < num_local; i++) {
+  #pragma unroll
+      for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
         if (scores[i] > max_val) {
           max_val = scores[i];
           max_expert = expert_id[i];
@@ -130,7 +151,8 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)max_expert;
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
       }
-      for (uint32_t i = 0; i < num_local; i++) {
+  #pragma unroll
+      for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
         if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
       }
     }
@@ -159,7 +181,8 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   for (uint32_t k = 0; k < top_k; k++) {
     float max_val = -FLT_MAX;
     uint32_t max_expert = 0;
-    for (uint32_t i = 0; i < num_local; i++) {
+  #pragma unroll
+    for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
       if (scores[i] > max_val) {
         max_val = scores[i];
         max_expert = expert_id[i];
@@ -171,7 +194,8 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     float winning_score = __shfl_sync(0xFFFFFFFFU, max_val, winner);
     topk_scores[k] = winning_score;
     topk_experts[k] = winning_expert;
-    for (uint32_t i = 0; i < num_local; i++) {
+  #pragma unroll
+    for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
       if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
     }
   }

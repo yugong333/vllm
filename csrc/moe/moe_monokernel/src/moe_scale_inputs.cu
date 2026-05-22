@@ -368,7 +368,7 @@ __device__ void moe_scale_activation_BS8_wgmma(
  * Scale output:
  *   act_scale_for_step    — one fp32 scale value for this (tok, k_block)
  *                            pair.  Caller supplies a pointer to the
- *                            `&shmem->act_scale[tok][k_block]` slot.
+ *                            `&shmem->act_scale[k_block][tok]` slot.
  *
  * Thread distribution: 32 threads per warp, each owning 4 K-values
  * (4 × 32 = 128 = one full 128-K substep).  Warp-reduce finds the
@@ -420,7 +420,11 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
   static_assert(Dims::BS <= 8, "Streaming quantize is for BS<=8");
   static_assert(BF16InCols == 128, "bf16_row must have 128 K cols");
   static_assert(Fp8NumChunks == 8, "fp8_act must have 8 K-chunks of 16");
-  static_assert(Fp8Tok == 8, "fp8_act must have 8 token rows");
+  static_assert(Fp8Tok == 8 || Fp8Tok == 9,
+                "fp8_act must have 8 (legacy) or 9 (kc-padded for "
+                "bank-conflict avoidance) token rows; only the first "
+                "8 are written, the 9th — when present — is unused "
+                "padding that breaks the 128-byte kc stride");
   static_assert(Fp8KInner == 16, "fp8_act inner dim must be 16");
 
   const std::uint32_t thread = get_thread<Dims>();  // 0..31
@@ -558,11 +562,11 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
  */
 template <typename Dims, std::size_t KBlocks, std::size_t Bs, std::size_t KStep,
           std::size_t Fp8KBlocks, std::size_t Fp8NumChunks, std::size_t Fp8Tok,
-          std::size_t Fp8KInner, std::size_t ScaleBs, std::size_t ScaleKBlocks>
+          std::size_t Fp8KInner, std::size_t ScaleKBlocks, std::size_t ScaleBs>
 __device__ inline void routing_phase_quantize(
     const A_element (&bf16_in_full)[KBlocks][Bs][KStep],
     AQ_element (&fp8_act_full)[Fp8KBlocks][Fp8NumChunks][Fp8Tok][Fp8KInner],
-    float (&act_scale)[ScaleBs][ScaleKBlocks], std::uint32_t batch_size) {
+    float (&act_scale)[ScaleKBlocks][ScaleBs], std::uint32_t batch_size) {
   using CoreDims = MoECoreDims<Dims>;
 
   // Scope guard — BS8 TMA+WGMMA only (Req 7.1, 7.2, 7.3, 7.6).
@@ -581,14 +585,18 @@ __device__ inline void routing_phase_quantize(
   static_assert(KStep == CoreDims::K_STEP_WGMMA,
                 "bf16_in_full inner extent must be K_STEP_WGMMA (128)");
   static_assert(Fp8NumChunks == 8, "fp8_act_full middle dim must be 8");
-  static_assert(Fp8Tok == CoreDims::T_TILE,
-                "fp8_act_full token dim must be T_TILE");
+  static_assert(Fp8Tok == CoreDims::T_TILE || Fp8Tok == CoreDims::T_TILE + 1,
+                "fp8_act_full token dim must be T_TILE (legacy) or "
+                "T_TILE+1 (padded layout that breaks the 128-byte kc "
+                "stride to avoid bank conflicts on the routing-quantize "
+                "STS — see comment on `MoE_SHM::U::TinyDataWGMMA_TMA::"
+                "fp8_act_full` for the design)");
   static_assert(Fp8KInner == 16, "fp8_act_full inner dim must be 16");
-  static_assert(ScaleBs == Dims::BS, "act_scale outer extent must be Dims::BS");
+  static_assert(ScaleBs == Dims::BS, "act_scale inner extent must be Dims::BS");
   static_assert(Fp8KBlocks == K_BLOCKS_TOTAL,
                 "fp8_act_full outer extent must be K_BLOCKS_TOTAL for BS8");
   static_assert(ScaleKBlocks == K_BLOCKS_TOTAL,
-                "act_scale inner extent must be K_BLOCKS_TOTAL");
+                "act_scale outer extent must be K_BLOCKS_TOTAL");
 
   constexpr std::uint32_t PAIRS_TOTAL = Dims::BS * K_BLOCKS_TOTAL;
   // Warps 1..11 participate (warp 0 runs prepare_moe_topk_BS8).
@@ -626,7 +634,7 @@ __device__ inline void routing_phase_quantize(
     auto& fp8_atom = fp8_act_full[kblk];
 
     moe_streaming_quantize_k128<Dims>(bf_row, fp8_atom, /*tok=*/token,
-                                      batch_size, &act_scale[token][kblk]);
+                                      batch_size, &act_scale[kblk][token]);
   }
 }
 
@@ -759,12 +767,18 @@ __device__ void moe_scale_activation_BSx(
   moe_monokernel::grid_barrier<Dims::KernelConfig::GRID_SIZE>(grid_counters,
                                                               grid_phase);
 
-  // copy per-block act_scale into shmem for fast per-token access
+  // copy per-block act_scale into shmem for fast per-token access.
+  //
+  // GM `spec->act_scale` is `[BS][BLK]` (cheap coalesced GM stores
+  // produced by the per-block quantization above) but SHM
+  // `shmem->act_scale` is `[BLK][BS]` (chosen for bank-conflict-free
+  // WGMMA scale-apply reads, see comment on the SHM declaration in
+  // `MoE_SHM`).  This loop transposes on the fly.
   for (uint32_t i = threadIdx.x; i < token_count * NUM_ACT_BLOCKS;
        i += blockDim.x) {
     uint32_t tok = i / NUM_ACT_BLOCKS;
     uint32_t blk = i % NUM_ACT_BLOCKS;
-    shmem->act_scale[tok][blk] = spec->act_scale[tok][blk];
+    shmem->act_scale[blk][tok] = spec->act_scale[tok][blk];
   }
 
   __syncthreads();
@@ -776,7 +790,7 @@ __device__ void moe_scale_activation_BSx(
       printf("[DBG64 ACT_QUANT tok=%u] act_scale (%u blocks):", tok,
              NUM_ACT_BLOCKS);
       for (uint32_t b = 0; b < NUM_ACT_BLOCKS; ++b)
-        printf(" %.6f", shmem->act_scale[tok][b]);
+        printf(" %.6f", shmem->act_scale[b][tok]);
       printf("\n");
       printf("[DBG64 ACT_QUANT tok=%u] fp8[0..7]:", tok);
       for (int i = 0; i < 8; i++)
