@@ -68,6 +68,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
          torch::kCUDA,
          &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
+
+  // Cluster variant of the BS8 TMA+WGMMA path (Hopper sm_90a).  Same
+  // schema as the BS8 TMA+WGMMA variant above; the kernel entry point
+  // carries `__cluster_dims__(8, 1, 1)` and is launched via
+  // `cudaLaunchKernelEx` so blocks of one up-group are co-resident on
+  // the same GPC (spec R1.1, R2.1, R2.2).
+  m.def(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster("
+      "Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize) -> ()");
+  m.impl(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster",
+      torch::kCUDA,
+      &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster_impl);
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

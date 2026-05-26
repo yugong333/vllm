@@ -1510,6 +1510,55 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   }  // end expert loop
 }
 
+// ── Per-expert-fused sibling for the cluster path (Step 3.4 / Step A) ──
+//
+// Wraps `moe_up_projection_BS8_allexperts_wgmma_tma` with
+// `expert_start = expert_idx` and `expert_stride = expert_count_total
+// + 1` so the internal expert loop runs exactly once.  Used only by
+// the cluster-path per-expert-fused dispatch in
+// `moe_kernel_topk_BS8`'s cluster arm; non-cluster Dims never call
+// this and the compiler does not instantiate it for them.
+//
+// HBM handoff invariant: the wrapped function still writes the
+// post-SiLU `spec->temp_fp8` + `spec->temp_act_scale` rows for the
+// current expert byte-identically to the all-experts variant — Step
+// B (3.5) is what swaps that for DSHM.
+//
+// Loss of cross-expert TMA pipelining (the existing variant
+// pre-fetches the next expert's K=0 weight tile during the current
+// expert's last K-step via the `else if (has_next_e)` stitch) is the
+// structural cost of fusion accepted at Step A; the wrapped
+// function's `has_next_e` gate evaluates to `false` because
+// `expert_stride > expert_count_total`, so the stitch is suppressed
+// automatically.
+//
+// Bar state: the all-experts variant's K-loop ends with both
+// `tiny_wgmma_tma::bar_w[0..1]` at physical phase 0 (every slot is
+// armed and waited an equal number of times because `K_TILES_UP` is
+// even and the per-expert stitch is suppressed at the loop tail).
+// The down-projection's prologue re-initializes all four bars
+// (`bar_w[0..1]`, `bar_a[0..1]`) on every per-expert call regardless
+// of inbound state.  Both directions are race-free at the cluster_sync
+// boundary because the cluster_sync is `aligned` (every cluster block
+// rendezvous on the same static instruction), so all blocks have
+// completed the prior phase's K-loop / prologue before any block
+// observes the next phase's mbarrier state.
+template <typename Dims>
+__device__ inline void moe_up_projection_BS8_oneexpert_wgmma_tma(
+    const A_element* __restrict__ activations_in,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up, std::uint32_t top_k,
+    std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& up_weights_desc,
+    CUtensorMap const& activations_desc, std::uint32_t up_block_idx,
+    std::uint32_t expert_idx, std::uint32_t expert_count_total) {
+  moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
+      activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
+      spec, shmem, up_weights_desc, activations_desc, up_block_idx,
+      /*expert_start=*/expert_idx,
+      /*expert_stride=*/expert_count_total + 1u);
+}
+
 }  // namespace moe_monokernel
 
 #endif

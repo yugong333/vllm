@@ -1081,6 +1081,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set(SRCS
        "csrc/moe/moe_monokernel/moe_wrapper.cu"
        "csrc/moe/moe_monokernel/src/moe_tma.cu")
+    # cluster variant requires `9.0a`; do not narrow the arch list — see spec R12.1.
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "9.0a")

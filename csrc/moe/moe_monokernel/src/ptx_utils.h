@@ -405,6 +405,159 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(
 #endif
 }
 
+// ── Cluster-barrier helpers (sm_90a) ──────────────────────────────────────
+//
+// Thin PTX wrappers around the `barrier.cluster.*` family used to
+// rendezvous all blocks in a Hopper thread block cluster. These are the
+// hardware-supported intra-cluster sync used by the BS8 cluster variant
+// of the MoE monokernel (`Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_
+// Cluster`) at site #2 (Phase 3 → Phase 4) in place of the software
+// `expert_barrier`.
+//
+// Caller contract (every helper):
+//   - Each helper MUST be issued exactly once per block per call site
+//     (the `aligned` qualifier means every thread of the block must
+//     reach the same static instruction; the hardware counts one arrival
+//     per block, not per thread).
+//   - SM_90a-only: on older targets the `asm volatile` is replaced by a
+//     `trap;` to fail closed at runtime.
+//
+// `cluster_sync()` is the convenience composite of arrive (release) +
+// wait (acquire) — use it when the call site needs a full
+// rendezvous-with-ordering. The split arrive / wait helpers exist for
+// call sites that want to overlap independent work between arrival and
+// the wait.
+//
+// References:
+//   - PTX ISA §9.7.12.x "barrier.cluster"
+//   - design Step 1 §1.8 / spec R6.1, R6.2.
+
+/**
+ * @brief Cluster-barrier arrive (relaxed).
+ *
+ * Emits: `barrier.cluster.arrive.relaxed.aligned;`
+ *
+ * Decrements this block's pending-arrival count on the cluster barrier
+ * without establishing release semantics on prior memory operations.
+ * Suitable when the caller separately publishes any cross-block visible
+ * writes via an explicit fence.
+ */
+__device__ static __forceinline__ void cluster_barrier_arrive_relaxed() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Cluster-barrier arrive (release semantics).
+ *
+ * Emits: `barrier.cluster.arrive.aligned;`
+ *
+ * Decrements this block's pending-arrival count on the cluster barrier
+ * and publishes prior memory writes from this block to peer blocks in
+ * the same cluster (release semantics).
+ */
+__device__ static __forceinline__ void cluster_barrier_arrive() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.arrive.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Cluster-barrier wait (acquire semantics).
+ *
+ * Emits: `barrier.cluster.wait.aligned;`
+ *
+ * Blocks until every block in the cluster has issued
+ * `barrier.cluster.arrive*` for the current phase, then makes prior
+ * peer-block writes visible to this block (acquire semantics).
+ */
+__device__ static __forceinline__ void cluster_barrier_wait() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  asm volatile("barrier.cluster.wait.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
+}
+
+/**
+ * @brief Full cluster-wide rendezvous: arrive (release) then wait
+ *        (acquire).
+ *
+ * Convenience composite of `cluster_barrier_arrive()` and
+ * `cluster_barrier_wait()`. The architecture gate is provided by the
+ * inner helpers; this wrapper is unconditional.
+ */
+__device__ static __forceinline__ void cluster_sync() {
+  cluster_barrier_arrive();
+  cluster_barrier_wait();
+}
+
+/**
+ * @brief Translate a local shared-memory pointer into a peer-block
+ *        cluster-shared pointer that loads/stores can dereference
+ *        directly (R5.6, design Step 3 §3.2).
+ *
+ * Used by Phase-4 down-projection on the cluster variant to read
+ * peer up-blocks' DSHM `cluster_temp_fp8` / `cluster_temp_act_scale`
+ * slabs without going through global memory.
+ *
+ * Three-step PTX sequence:
+ *   1. `cvta.to.shared.u32` lifts `local` (a generic pointer) into
+ *      the shared state-space u32 representation.
+ *   2. `mapa.shared::cluster.u32` translates the shared u32 +
+ *      `rank` into the peer-block cluster-shared u32 address.
+ *   3. `cvta.shared.u64` converts back to a generic 64-bit pointer
+ *      that ordinary load/store instructions can dereference.
+ *
+ * Caller contract:
+ *   - `local` MUST point to SHM owned by the calling block (i.e.,
+ *     a `__shared__` variable or a pointer derived from one); the
+ *     translation is undefined for global pointers.
+ *   - `rank` MUST be in `[0, CLUSTER_SIZE)`.  For
+ *     `rank == this_block_rank` the result is the local pointer
+ *     unchanged.  For other ranks the result aliases the peer's
+ *     SHM through the cluster proxy.
+ *   - Reads/writes through the returned pointer cross the cluster
+ *     proxy.  Callers MUST respect the
+ *     `fence.proxy.async.shared::cluster` sandwich added in
+ *     task 3.6 around the cluster_sync at site #2 — without those
+ *     fences, peer reads may observe stale bytes from before the
+ *     producer's writes.
+ *
+ * @tparam T          Pointee type (e.g. `AQ_element`, `S_element`).
+ * @param  local      Local-block SHM pointer.
+ * @param  rank       Peer rank ∈ [0, CLUSTER_SIZE).
+ * @return Generic 64-bit pointer aliasing peer block `rank`'s SHM.
+ */
+template <typename T>
+__device__ static __forceinline__ T* map_shared_rank(T* local,
+                                                     std::uint32_t rank) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  // Defer to the CUDA-runtime SM_90a intrinsic
+  // `__cluster_map_shared_rank` (declared in
+  // `<crt/sm_90_rt.hpp>`, also exposed via
+  // `cooperative_groups::cluster_group::map_shared_rank`).  The
+  // intrinsic emits the documented `cvta.to.shared` →
+  // `mapa.shared::cluster.u32` → `cvta.shared` PTX sequence with
+  // the correct operand widths for ptxas.  Earlier hand-rolled
+  // inline-PTX attempts failed ptxas validation on `cvta` operand
+  // matching — the intrinsic is the canonical way and matches the
+  // codebase's style of preferring CUDA-runtime helpers when
+  // available.
+  return static_cast<T*>(
+      __cluster_map_shared_rank(static_cast<const void*>(local), rank));
+#else
+  (void)rank;
+  asm volatile("trap;");
+  return local;
+#endif
+}
+
 // ── Hopper TMA bulk-tensor copy (sm_90a) ──────────────────────────────────
 //
 // Thin PTX wrapper around `cp.async.bulk.tensor.2d.shared::cta.global.tile.

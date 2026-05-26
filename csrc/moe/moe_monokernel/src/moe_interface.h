@@ -171,6 +171,75 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   };
 };
 
+// ── Cluster variant of the BS8 WGMMA+TMA block-wise kernel ──────────────
+// Identifies as the Hopper SM_90a thread-block-cluster variant of
+// `Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA`.  Every dimension
+// (`HIDDEN_STATES`, `K`, `N`, `BS`, `M`, `NUM_EXPERTS`,
+// `QUANT_GRAN`, `BLOCK_SCALE_ROW`, `BLOCK_SCALE_COL` and the derived
+// `*_SCALE_*` constants) is copied byte-identically from the existing
+// non-cluster variant; the only deltas live inside `KernelConfig`,
+// which adds `USE_CLUSTER = true` and `CLUSTER_SIZE = 8` so that the
+// `use_cluster<Dims>` SFINAE detector (added in moe_internal.h, see
+// design Step 1 §1.2) returns `true` for this Dims and `false` for
+// every other.  See spec design Step 1 §1.1 (R1.1, R1.2).
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    // GRID_SIZE = 120 (NOT 128) — sized to exactly match the H200
+    // cluster co-residency ceiling at K_STEP_*=256.
+    //
+    // At K_STEP=256 per-block SHM is ~172 KiB which forces
+    // `max_blocks_per_SM = 1`, so each 8-block cluster consumes
+    // 8 SMs of GPC capacity. H200's GPC topology fits exactly
+    // 15 such clusters (`cudaOccupancyMaxActiveClusters = 15`),
+    // so 15 × 8 = 120 blocks is the maximum we can launch with
+    // K_STEP=256 on this device.
+    //
+    // Trade-off: UP_GROUPS = 120 / 8 = 15 instead of 16, so the
+    // per-cluster expert loop covers experts in stride-15 (not
+    // stride-16) and 1 cluster handles 18 experts while 14 handle
+    // 17 (256 = 18 + 14*17). Slight load imbalance vs the existing
+    // variant's even 256/16=16-per-group, but acceptable for the
+    // doubled K-step's perf benefit. The kernel's
+    // `expert_stride = UP_GROUPS` derivation auto-handles the
+    // change with no code edits.
+    //
+    // R1.2 originally specified GRID_SIZE = 128; this is an
+    // explicit deviation justified by the H200 GPC-capacity
+    // measurement. If the cluster variant runs on a different
+    // SKU with a different GPC topology, the right value here may
+    // differ.
+    static constexpr std::uint32_t GRID_SIZE = 120;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    // K_STEP_*=256 perf knob (halves outer K-loop iterations at
+    // cost of doubling per-slot weight tile from 16 KiB → 32 KiB).
+    // Per-block SHM grows to ~172 KiB; we accept the 1-block-per-SM
+    // occupancy in exchange for the doubled K-step throughput.
+    static constexpr std::uint32_t K_STEP_DOWN = 256;
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_CLUSTER = true;
+    static constexpr std::uint32_t CLUSTER_SIZE = 8;
+  };
+};
+
 // Scoring function enum for routing
 enum class ScoringFunc : uint32_t {
   SIGMOID = 0,

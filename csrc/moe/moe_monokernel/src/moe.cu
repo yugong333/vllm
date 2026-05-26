@@ -7,6 +7,11 @@
 
 #include <cstdint>
 
+#include <cuda.h>
+#if defined(CUDA_VERSION) && (CUDA_VERSION) < 12040
+  #error "moe_monokernel cluster variant requires CUDA Toolkit 12.4+ (see spec R12.2)."
+#endif
+
 #include "moe_interface.h"
 
 #define INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
@@ -176,17 +181,49 @@ __device__ void moe_kernel_topk_BS8(
     // Prefetch warps + TMA launcher thread (warp ∈ [8, 12)).
     if (is_tma_launcher_thread<Dims>()) {
 #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-      // Single mbarrier arm covers all K_BLOCKS_TOTAL bulk loads.
-      // The helper itself does not arm — see the doc comment on
-      // `moe_load_full_bf16_input` for the caller contract.
+      // Per-block routing-window pre-arm.
+      //
+      // Step 2 (cluster path) and Step 1 / non-cluster path BOTH arm
+      // the per-block `bar_rwin` here with the SAME `expect_tx`
+      // (= `Dims::BS * K_BLOCKS_TOTAL * K_STEP_WGMMA * sizeof(bf16) =
+      // 32 KiB` for Qwen3.5).  On the cluster path, every block of
+      // the cluster pre-arms its OWN `bar_rwin` exactly once; the
+      // multicast hardware then decrements each destination block's
+      // `complete_tx` counter by 2 KiB per multicast issue (16
+      // issues = 32 KiB, exactly draining the per-block barrier).
+      // On the non-cluster path, the same pre-arm covers the 16
+      // unicast issues that follow on this block's own TMA path.
+      //
+      // Citation: spec R4.1, R4.2, R4.3, R4.5, R11.4; design Step 2
+      // §2.4.
       constexpr std::uint32_t RWIN_TX_BYTES =
           Dims::BS * MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL *
           CoreDims::K_STEP_WGMMA *
           static_cast<std::uint32_t>(sizeof(A_element));
       mbarrier_arrive_expect_tx(&u_tma->bar_rwin,
                                 /*tx_bytes=*/RWIN_TX_BYTES);
-      moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full,
-                                     &u_tma->bar_rwin);
+
+      if constexpr (use_cluster<Dims>::value) {
+        // Cluster path: ONLY the multicast launcher
+        // (`block_in_cluster == 0 && is_tma_launcher_thread<Dims>()`)
+        // issues the 16 multicast `cp.async.bulk.tensor.2d`
+        // instructions.  The other 7 blocks of the cluster ARMED
+        // `bar_rwin` above and proceed to their Phase-2 wait — the
+        // multicast TMA will land 2 KiB into each of their
+        // `bf16_in_full` slots per issue and decrement their
+        // barriers' `complete_tx` automatically (R4.2, R4.3).
+        const std::uint32_t block_in_cluster =
+            blockIdx.x % Dims::KernelConfig::CLUSTER_SIZE;
+        if (block_in_cluster == 0u) {
+          moe_load_full_bf16_input_multicast<Dims>(
+              activations_desc, u_tma->bf16_in_full, &u_tma->bar_rwin);
+        }
+      } else {
+        // Non-cluster path: UNCHANGED from pre-feature behaviour
+        // (R11.4) — every block does its own 16 unicast issues.
+        moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full,
+                                       &u_tma->bar_rwin);
+      }
 #endif
     }
     // Other prefetch lanes (warp 8 lanes 1..31, warps 9..11) do
@@ -315,62 +352,124 @@ __device__ void moe_kernel_topk_BS8(
   // The BS8 path is TMA+WGMMA only; the kernel asserts
   // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
   // this function, so dispatch is unconditional.
-  if (in_up && up_group < shmem->expert_count) {
-    moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
-        activations_in, expert_weights_up, expert_scales_up, top_k, batch_size,
-        spec, shmem, up_weights_desc, activations_desc, up_block_idx,
-        /*expert_start=*/up_group,
-        /*expert_stride=*/UP_GROUPS);
+  //
+  // ── Phase 3 + Site #2 + Phase 4 dispatch ───────────────────────────
+  // Cluster path (Step 3.4 / Step A): per-expert-fused — for each
+  // assigned expert e, run up(e) → cluster_sync() → down(e), so a
+  // hardware cluster barrier separates the producer and consumer of
+  // expert e's post-SiLU activation rows.  The post-SiLU handoff
+  // still goes through HBM (`spec->temp_fp8` + `spec->temp_act_scale`)
+  // byte-identically to the existing variant — DSHM is Step B (3.5).
+  //
+  // Loss of inter-expert TMA pipelining (the all-experts variant
+  // prefetches the next expert's K=0 weight tile during the current
+  // expert's last K-step) is the structural cost of fusion at Step A;
+  // Steps C and D restore the pipeline.
+  //
+  // The `cluster_sync()` is `aligned`: every block of the cluster
+  // unconditionally rendezvous regardless of `in_up`.  In the
+  // GRID_SIZE=120 / UP_GRID=8 / UP_GROUPS=15 cluster configuration
+  // every block has `in_up == true` and is in exactly one
+  // up-group/cluster, so the unconditional issue is degenerate but
+  // required by the `aligned` qualifier.  The site-#3 colstripe
+  // barrier (Phase 4 → Phase 5) is UNCHANGED on the cluster path
+  // (R7.2) — it still fires once after the last expert's
+  // down-projection, below.
+  //
+  // Non-cluster path: byte-identical to the existing all-experts →
+  // expert_barrier → all-experts shape (R11.4 / R13.5).
+  //
+  // Citation: design Step 3 §3.4 / spec R6.1, R6.3, R10.3, R11.4.
+  if constexpr (use_cluster<Dims>::value) {
+    // Per-expert-fused cluster path.  Both UP_GROUPS and DOWN_GROUPS
+    // equal the cluster's expert stride (= GRID_SIZE / UP_GRID after
+    // Phase-2a alignment), so `up_group == down_group` and the same 8
+    // cluster blocks produce and consume the same expert's rows.
+    const std::uint32_t expert_count = shmem->expert_count;
+    for (std::uint32_t e = up_group; e < expert_count; e += UP_GROUPS) {
+      if (in_up) {
+        moe_up_projection_BS8_oneexpert_wgmma_tma<Dims>(
+            activations_in, expert_weights_up, expert_scales_up, top_k,
+            batch_size, spec, shmem, up_weights_desc, activations_desc,
+            up_block_idx, /*expert_idx=*/e,
+            /*expert_count_total=*/expert_count);
+      }
+      // `cluster_sync()` is `aligned`: every block of the cluster
+      // executes it on the same static instruction.  The bare
+      // sync (no `fence.proxy.async.shared::cluster` sandwich) is
+      // correct here because no DSHM traffic crosses the barrier yet
+      // — Phase 3's writeback still lands in HBM
+      // (`spec->temp_fp8`/`spec->temp_act_scale`), which the TMA
+      // mbarrier protocol in the down-projection already orders
+      // through the GPU memory hierarchy.  Step B (3.5) adds the
+      // proxy-fence sandwich when the handoff moves to DSHM.
+      moe_monokernel::cluster_sync();
+      // Phase 4 reads `spec->temp_fp8` via the bulk activation TMA.
+      // The down-projection's internal lookahead-into-next-expert
+      // logic auto-suppresses for the per-expert-fused call (its
+      // `else if (e + actual_stride < expert_count)` gate is false
+      // because `actual_stride > expert_count`).
+      moe_down_projection_BS8_oneexpert_wgmma_tma<Dims>(
+          expert_weights_down, expert_scales_down, top_k, batch_size, spec,
+          shmem, down_weights_desc, down_activations_desc,
+          /*expert_idx=*/e,
+          /*expert_count_total=*/expert_count);
+    }
+    MONO_PHASE_TIMESTAMP(t_after_up);
+    MONO_PHASE_TIMESTAMP(t_after_barrier2);
+    MONO_PHASE_TIMESTAMP(t_after_down);
+  } else {
+    if (in_up && up_group < shmem->expert_count) {
+      moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
+          activations_in, expert_weights_up, expert_scales_up, top_k,
+          batch_size, spec, shmem, up_weights_desc, activations_desc,
+          up_block_idx,
+          /*expert_start=*/up_group,
+          /*expert_stride=*/UP_GROUPS);
+    }
+
+    MONO_PHASE_TIMESTAMP(t_after_up);
+
+    // ── Site #2 — Expert-local barrier (Phase 2b) ──────────────────
+    //
+    // Phase 2a aligned `DOWN_GROUPS == UP_GROUPS` so the producer-set
+    // (8 blocks with `up_group == g` writing `spec->temp_fp8` rows
+    // for expert group `g`) is identical to the consumer-set (same 8
+    // blocks, now reading those rows in Phase 4 as `down_group ==
+    // g`).  An `expert_barrier` with `arrival_count = UP_GRID = 8`
+    // and `id = up_group` is therefore sufficient: the 8 blocks
+    // rendezvous on one of `UP_GROUPS = 16` independent expert-keyed
+    // Counter_Pairs, reducing per-barrier atomic contention from 128
+    // → 8 and allowing 16 expert groups to sync concurrently.
+    //
+    // `in_up` is always true in the GRID_SIZE=128, UP_GRID=8,
+    // UP_GROUPS=16 configuration (every block maps to a valid
+    // up_group), but the gate is kept defensively so a future config
+    // with UP_GROUPS < GRID_SIZE / UP_GRID won't silently deadlock.
+    if (in_up) {
+      moe_monokernel::expert_barrier(expert_counters,
+                                     /*expert_id=*/up_group,
+                                     /*arrival_count=*/UP_GRID,
+                                     /*seed_blockidx=*/up_group * UP_GRID,
+                                     expert_phase);
+    }
+
+    MONO_PHASE_TIMESTAMP(t_after_barrier2);
+
+    // ── Phase 4 (WGMMA): dual-WG streaming down-projection ───────────
+    // Each block owns DOWN_COL_TILE output cols; blocks partition into
+    // DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Every
+    // contributing block atomicAdds its partial sum into the SAME
+    // single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`;
+    // Phase 5 reads each cell ONCE and casts to bf16 (no cross-group
+    // reduction).  The single-buffer is zero-initialized at kernel
+    // entry.
+    moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
+        expert_weights_down, expert_scales_down, top_k, batch_size, spec,
+        shmem, down_weights_desc, down_activations_desc);
+
+    MONO_PHASE_TIMESTAMP(t_after_down);
   }
-
-  MONO_PHASE_TIMESTAMP(t_after_up);
-
-  // ── Site #2 — Expert-local barrier (Phase 2b) ────────────────────────
-  //
-  // Phase 2a aligned `DOWN_GROUPS == UP_GROUPS` so the producer-set
-  // (8 blocks with `up_group == g` writing `spec->temp_fp8` rows for
-  // expert group `g`) is identical to the consumer-set (same 8 blocks,
-  // now reading those rows in Phase 4 as `down_group == g`).  An
-  // `expert_barrier` with `arrival_count = UP_GRID = 8` and `id = up_group`
-  // is therefore sufficient: the 8 blocks rendezvous on one of
-  // `UP_GROUPS = 16` independent expert-keyed Counter_Pairs, reducing
-  // per-barrier atomic contention from 128 → 8 and allowing 16 expert
-  // groups to sync concurrently (Design "Site #2 Phase 2b change
-  // summary", Requirements 9.6, 9.8).
-  //
-  // `in_up` is always true in the GRID_SIZE=128, UP_GRID=8, UP_GROUPS=16
-  // configuration (every block maps to a valid up_group), but the gate
-  // is kept defensively so a future config with UP_GROUPS < GRID_SIZE /
-  // UP_GRID won't silently deadlock.
-  if (in_up) {
-    moe_monokernel::expert_barrier(expert_counters,
-                                   /*expert_id=*/up_group,
-                                   /*arrival_count=*/UP_GRID,
-                                   /*seed_blockidx=*/up_group * UP_GRID,
-                                   expert_phase);
-  }
-
-  MONO_PHASE_TIMESTAMP(t_after_barrier2);
-
-  // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
-  // Each block owns DOWN_COL_TILE output cols; blocks partition into
-  // DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Every
-  // contributing block atomicAdds its partial sum into the SAME
-  // single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`; Phase 5
-  // reads each cell ONCE and casts to bf16 (no cross-group
-  // reduction).  The single-buffer is zero-initialized at kernel entry.
-  //
-  // The WGMMA down-projection function zeroes its own per-block
-  // out_accum in SHM internally, so no pre-zero is needed here.
-  //
-  // The BS8 path is TMA+WGMMA only; the kernel asserts
-  // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
-  // this function, so dispatch is unconditional.
-  moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
-      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
-      down_weights_desc, down_activations_desc);
-
-  MONO_PHASE_TIMESTAMP(t_after_down);
 
   // ── Site #3 — Col-stripe-local barrier (Phase 2b) ────────────────────
   //
@@ -516,7 +615,7 @@ __device__ void moe_kernel_topk_BS64(
 }
 
 /**
- * @brief Top-K MoE kernel with configurable scoring and renormalization.
+ * @brief Top-K MoE kernel — shared device-side body.
  *
  * Dispatches to moe_kernel_topk_BS8 (BS <= 8) or moe_kernel_topk_BS64 (BS > 8).
  *
@@ -524,20 +623,57 @@ __device__ void moe_kernel_topk_BS64(
  * descriptors consumed by `moe_up_projection_BS8_allexperts_wgmma_tma` when
  * `use_tma<Dims>::value` is true.  For non-TMA variants the torch-binding
  * wrapper passes zero-initialized `CUtensorMap` values and the descriptors
- * are never read (spec R6.1, R6.3).  The `__grid_constant__` qualifier
- * places them in constant memory coherent with all threads without SMEM
- * cost.
+ * are never read (spec R6.1, R6.3).  The `__grid_constant__` qualifier on
+ * the corresponding `__global__` entry-point parameters places them in
+ * constant memory coherent with all threads without SMEM cost; on this
+ * `__device__` body the qualifier is a no-op but is preserved on the
+ * parameter spelling so the entry points can forward arguments by name
+ * without per-call casts.
+ *
+ * This body is invoked from two `__global__` entry points (see below):
+ *   * `moe_kernel_topk<Dims>`         — non-cluster legacy launch path
+ *                                       (`cudaLaunchKernel`); preserves
+ *                                       byte-identical scheduling for
+ *                                       every existing Dims (R11.4).
+ *   * `moe_kernel_topk_cluster<Dims>` — Hopper cluster launch path
+ *                                       (`cudaLaunchKernelEx` with
+ *                                       `cudaLaunchAttributeClusterDimension`),
+ *                                       carries the literal
+ *                                       `__cluster_dims__(8, 1, 1)`
+ *                                       annotation required by the CUDA
+ *                                       front end (design Step 1 §1.4).
+ *
+ * The body is shared so the algorithmic phases (preconditions, BS
+ * dispatch, etc.) live in one place and the two entry points only
+ * differ in their launch contract.
+ *
+ * Marked `__forceinline__` so each call site collapses into its
+ * `__global__` entry, preserving the `__grid_constant__` parameter
+ * addresses for `up_weights_desc` / `activations_desc` /
+ * `down_weights_desc` / `down_activations_desc`.  TMA bulk-tensor PTX
+ * (`cp.async.bulk.tensor.2d`) takes `&desc` and that address must
+ * resolve to the kernel's parameter memory (coherent with every
+ * thread); leaving the body un-inlined would make `&desc` point at a
+ * per-thread local-stack copy and TMA would fault with `illegal
+ * memory access` (R11.4 — the non-cluster path's runtime behaviour
+ * must be byte-identical to the pre-split single-`__global__` form).
+ *
+ * The four descriptor parameters are passed by `CUtensorMap const&`
+ * (not by value) so that — even when the body is not actually inlined —
+ * `&desc` still transparently aliases the entry's `__grid_constant__`
+ * parameter slot rather than a body-local stack copy.  By-value would
+ * synthesise a per-thread local-memory copy of the 128-byte descriptor;
+ * `&local_copy` then targets local memory and is not a valid TMA
+ * descriptor address (TMA requires globally-coherent memory; the entry
+ * point's `__grid_constant__` slot satisfies that, a stack copy does
+ * not).  This matches the device-side helper boundary documented in
+ * `moe_up_projection.cu` / `moe_down_projection.cu`: the
+ * `__grid_constant__` qualifier only applies at the kernel-function
+ * boundary; deeper helpers receive the descriptor as `CUtensorMap const&`
+ * and forward `&desc` unchanged.
  */
-// Requirement 4.4: pin the kernel to 1 block per SM at compile time.
-// The software grid / partial barriers rely on the co-residency invariant
-// (GRID_SIZE <= SM_count and max_active_blocks_per_SM == 1) so every
-// launched block is guaranteed to be running when any other block spins
-// on its arrival counter. `__launch_bounds__(BLOCK_SIZE, 1)` is the
-// compile-time half of that invariant; the launcher enforces the runtime
-// half via `cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags`.
 template <typename Dims>
-__global__
-__launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
+__device__ __forceinline__ void moe_kernel_topk_body(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
     const __nv_bfloat16* __restrict__ router_logits,
     const W_element* __restrict__ expert_weights_up,
@@ -547,10 +683,10 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
     size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
     ScoringFunc scoring_func, bool renormalize,
-    __grid_constant__ CUtensorMap const up_weights_desc,
-    __grid_constant__ CUtensorMap const activations_desc,
-    __grid_constant__ CUtensorMap const down_weights_desc,
-    __grid_constant__ CUtensorMap const down_activations_desc) {
+    CUtensorMap const& up_weights_desc,
+    CUtensorMap const& activations_desc,
+    CUtensorMap const& down_weights_desc,
+    CUtensorMap const& down_activations_desc) {
   // ── Compile-time preconditions on `Dims` (spec R7.3, R11.3) ─────────────
   // These fire at the first point where `Dims` is instantiated, so any
   // misconfigured variant is caught at compile time before any TMA /
@@ -569,6 +705,13 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   static_assert(!use_tma<Dims>::value || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
                 "MoE_SHM<Dims> exceeds the 228 KB per-block SHM budget "
                 "for TMA variants.");
+  static_assert(!use_cluster<Dims>::value ||
+                    sizeof(MoE_SHM<Dims>) <= 228 * 1024,
+                "Cluster variant: MoE_SHM<Dims> exceeds the H100 228 KiB "
+                "opt-in SHM cap after adding cluster_temp_fp8 / "
+                "cluster_temp_act_scale / cluster_down_b_staging / "
+                "cluster_down_b_staging_scales slabs from task 3.1 "
+                "(spec R5.1, design Step 3 §3.1).");
   // Phase-2a layout alignment (software-grid-sync spec, Req 9.4):
   // For the BS8 TMA+WGMMA variant, `DOWN_COL_TILE` is bumped to 256,
   // which doubles the down-proj weight tile in SHM from 16 KB to 32 KB
@@ -593,6 +736,50 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
                 "Phase 2a layout alignment (DOWN_COL_TILE = 256 doubles "
                 "the per-block down-proj weight tile).  Also enforces "
                 "the topk-bs8-tma-prefetch-quant-fusion Req 4.6 budget.");
+
+  // ── Cluster-variant compile-time preconditions (spec R1.5, R1.6, R5.10;
+  //    design Step 1 §1.3) ─────────────────────────────────────────────
+  // These three asserts only fire for cluster-enabled Dims variants
+  // (`use_cluster<Dims>::value == true`); for every existing Dims they
+  // are not instantiated and have zero compile-time effect (R11.4).
+  //
+  // Wrapped in `if constexpr (use_cluster<Dims>::value)` (rather than the
+  // previous `!use_cluster<Dims>::value || ...` short-circuit form) so
+  // that name lookup of `Dims::KernelConfig::CLUSTER_SIZE` is suppressed
+  // for non-cluster Dims that do not declare the member.  This is the
+  // same dependent-name discipline used at the host launch dispatch in
+  // `moe_wrapper.cu` (see `launch_moe_kernel_topk<Dims>`): inside an
+  // `if constexpr (false)` branch the discarded statement's names are
+  // not looked up, so referencing `CLUSTER_SIZE` is well-formed for
+  // every Dims variant.
+  //
+  //  * R1.5: the cluster size must evenly divide GRID_SIZE so that the
+  //    grid is partitioned into whole clusters with no leftover blocks.
+  //  * R1.6: each cluster must exactly cover one up-group, i.e.
+  //    CLUSTER_SIZE == UP_GRID = 2 * N / W_UP_TILE_WGMMA — this is the
+  //    precondition that makes `cluster_id == up_group == down_group`
+  //    a sound mapping (design §"Block-to-cluster mapping").
+  //  * R5.10: each Phase-4 down K-step (`K_STEP_WGMMA = 128`) consumes
+  //    exactly two producer-up-block DSHM tiles of width
+  //    `W_UP_COLS_WGMMA = 64`, so `2 * W_UP_COLS_WGMMA == K_STEP_WGMMA`
+  //    must hold. This is the layout invariant that lets the cluster
+  //    Phase-4 pair peer up-blocks (2*kk, 2*kk+1) per K-step.
+  if constexpr (use_cluster<Dims>::value) {
+    static_assert(
+        Dims::KernelConfig::GRID_SIZE % Dims::KernelConfig::CLUSTER_SIZE == 0,
+        "Cluster variant: GRID_SIZE must be a multiple of CLUSTER_SIZE "
+        "(spec R1.5, design Step 1 §1.3).");
+    static_assert(
+        Dims::KernelConfig::CLUSTER_SIZE == MoECoreDims<Dims>::UP_GRID_WGMMA,
+        "Cluster variant: CLUSTER_SIZE must equal UP_GRID = "
+        "2*N / W_UP_TILE_WGMMA (spec R1.6, design Step 1 §1.3).");
+    static_assert(
+        2 * MoECoreDims<Dims>::W_UP_COLS_WGMMA ==
+            MoECoreDims<Dims>::K_STEP_WGMMA,
+        "Cluster variant: 2 * W_UP_COLS_WGMMA must equal K_STEP_WGMMA so "
+        "each Phase-4 K-step pairs exactly two producer up-blocks "
+        "(spec R5.10, design Step 1 §1.3).");
+  }
 
   assert(MoECoreDims<Dims>::THREADS_PER_WARP == 32);
   assert(blockDim.x == Dims::KernelConfig::BLOCK_SIZE);
@@ -684,5 +871,91 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
         grid_counters, grid_phase);
   }
 }
+
+// ── `__global__` entry points for `moe_kernel_topk_body<Dims>` ─────────
+//
+// The shared device-side body above is invoked from two `__global__`
+// entry points that differ only in their launch contract. Splitting
+// the entry from the body lets us keep the algorithmic logic in one
+// place while still satisfying the CUDA front-end's requirement that
+// `__cluster_dims__` be a literal annotation on the launched kernel
+// symbol (the front end does not accept a non-literal cluster size,
+// so the cluster entry hardcodes `(8, 1, 1)` and re-asserts it against
+// `Dims::KernelConfig::CLUSTER_SIZE` via `static_assert`).
+//
+// Requirement 4.4: pin the kernel to 1 block per SM at compile time.
+// The software grid / partial barriers rely on the co-residency invariant
+// (GRID_SIZE <= SM_count and max_active_blocks_per_SM == 1) so every
+// launched block is guaranteed to be running when any other block spins
+// on its arrival counter. `__launch_bounds__(BLOCK_SIZE, 1)` is the
+// compile-time half of that invariant; the launcher enforces the runtime
+// half via `cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags`.
+//
+// Non-cluster entry — launched by `cudaLaunchKernel`, no
+// `__cluster_dims__` annotation. Preserves byte-identical scheduling
+// for every existing Dims (R11.4).
+template <typename Dims>
+__global__
+__launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
+    const A_element* __restrict__ activations_in, std::uint32_t token_count,
+    const __nv_bfloat16* __restrict__ router_logits,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
+    size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize,
+    __grid_constant__ CUtensorMap const up_weights_desc,
+    __grid_constant__ CUtensorMap const activations_desc,
+    __grid_constant__ CUtensorMap const down_weights_desc,
+    __grid_constant__ CUtensorMap const down_activations_desc) {
+  moe_kernel_topk_body<Dims>(
+      activations_in, token_count, router_logits, expert_weights_up,
+      expert_scales_up, expert_weights_down, expert_scales_down,
+      activations_out, scratchpad, scratchpad_size, shmem_size, top_k,
+      scoring_func, renormalize, up_weights_desc, activations_desc,
+      down_weights_desc, down_activations_desc);
+}
+
+// Cluster entry — launched by `cudaLaunchKernelEx` with
+// `cudaLaunchAttributeClusterDimension`. Carries the literal
+// `__cluster_dims__(8, 1, 1)` annotation the CUDA front end requires
+// (design Step 1 §1.4). Hardcoded `(8, 1, 1)` is matched against
+// `Dims::KernelConfig::CLUSTER_SIZE` via `static_assert`; a future
+// Dims with `CLUSTER_SIZE != 8` needs its own entry point and host
+// dispatch line.
+//
+// The `!defined(__CUDA_ARCH__)` clause keeps the host-side declaration
+// visible during the host pass of `nvcc` so `cudaLaunchKernelEx` in
+// `moe_wrapper.cu` can take `&moe_kernel_topk_cluster<Dims>`.
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900) || !defined(__CUDA_ARCH__)
+template <typename Dims>
+__global__ __cluster_dims__(8, 1, 1)
+__launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk_cluster(
+    const A_element* __restrict__ activations_in, std::uint32_t token_count,
+    const __nv_bfloat16* __restrict__ router_logits,
+    const W_element* __restrict__ expert_weights_up,
+    const S_element* __restrict__ expert_scales_up,
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down,
+    R_element* __restrict__ activations_out, void* __restrict__ scratchpad,
+    size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
+    ScoringFunc scoring_func, bool renormalize,
+    __grid_constant__ CUtensorMap const up_weights_desc,
+    __grid_constant__ CUtensorMap const activations_desc,
+    __grid_constant__ CUtensorMap const down_weights_desc,
+    __grid_constant__ CUtensorMap const down_activations_desc) {
+  static_assert(Dims::KernelConfig::CLUSTER_SIZE == 8,
+                "Cluster entry hardcodes __cluster_dims__(8, 1, 1); "
+                "any Dims with CLUSTER_SIZE != 8 needs its own entry point.");
+  moe_kernel_topk_body<Dims>(
+      activations_in, token_count, router_logits, expert_weights_up,
+      expert_scales_up, expert_weights_down, expert_scales_down,
+      activations_out, scratchpad, scratchpad_size, shmem_size, top_k,
+      scoring_func, renormalize, up_weights_desc, activations_desc,
+      down_weights_desc, down_activations_desc);
+}
+#endif
 
 }  // namespace moe_monokernel

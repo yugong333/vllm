@@ -150,6 +150,30 @@ struct use_tma {
   static constexpr bool value = test<Dims>(0);
 };
 
+// ── Cluster opt-in detection ────────────────────────────────────────────
+// `Dims::KernelConfig::USE_CLUSTER` is optional; default to false for all
+// existing Dims variants so the current single-block (no thread-block
+// cluster) launch path stays in use.  Only the new cluster Dims variant
+// (Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster) sets
+// USE_CLUSTER=true, which keys the host wrapper's
+// `if constexpr (use_cluster<Dims>::value)` branch onto the
+// `cudaLaunchKernelEx` path with a `cudaLaunchAttributeClusterDimension`
+// attribute, and gates site-#2's hardware `cluster_sync()` swap inside
+// `moe_kernel_topk_body<Dims>`.  See spec design Step 1 §1.2 (R1.3, R1.4).
+template <typename Dims>
+struct use_cluster {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::USE_CLUSTER, bool()) {
+    return D::KernelConfig::USE_CLUSTER;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
 // ── Down-proj K-step size opt-in detection ──────────────────────────────
 // `Dims::KernelConfig::K_STEP_DOWN` is optional; default to 128 (= the
 // up-proj K_STEP_WGMMA, which also matches the SWZ128 atom width).  Set
@@ -1257,6 +1281,78 @@ struct MoE_SHM {
       // contribution".  Sized to `Dims::BS = 8` bytes — negligible
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
+
+      // ── Cluster-variant DSHM slabs (Step 3, R5.1, R5.2, R5.5, R5.6) ──
+      //
+      // Used only on the cluster path (`use_cluster<Dims>::value == true`).
+      // On non-cluster Dims the size of these fields is conditionally
+      // collapsed to 1 byte each so MoE_SHM<Dims> stays byte-identical
+      // (R11.1).
+      //
+      // Lifetime: single-buffered, one expert in flight per cluster
+      // (R5.5).  Phase 3 producer writes `cluster_temp_fp8` +
+      // `cluster_temp_act_scale` to LOCAL block SHM; the cluster
+      // barrier (Step 1's site #2) plus the
+      // `fence.proxy.async.shared::cluster` sandwich (Step 3 §3.3,
+      // added in 3.6) publish those writes to peers via the cluster
+      // proxy.  Phase 4 consumer reads peer slabs via
+      // `map_shared_rank<T>` (3.3) into local
+      // `cluster_down_b_staging` at column offsets 0/64 from two
+      // peer ranks `(2*kk_inner, 2*kk_inner + 1)` per inner WGMMA
+      // K-substep (R5.3).  Per-peer scale slabs go into
+      // `cluster_down_b_staging_scales[0]` / `[1]` (R5.4).
+      //
+      // Write-once-per-expert producer rule (R5.2): each up-block
+      // writes its own slab exactly once per expert iteration; the
+      // slab is fully consumed before the next expert's write
+      // overwrites it.
+      //
+      // Peer-readable via cluster-shared address space (R5.6):
+      // consumers translate `peer_rank ∈ [0, CLUSTER_SIZE = 8)` via
+      // `map_shared_rank<T>(local_ptr, peer_rank)`.
+      //
+      // SHM cost per block (cluster Dims only):
+      //   cluster_temp_fp8                 = 8 × 64 ×  1 B =  512 B
+      //   cluster_temp_act_scale           = 8       ×  4 B =   32 B
+      //   cluster_down_b_staging           = 8 ×128 ×  1 B = 1024 B
+      //   cluster_down_b_staging_scales    = 2 × 8  ×  4 B =   64 B
+      //                                                    ──────
+      //                                                    1632 B  (~1.6 KiB)
+      // Total `MoE_SHM<Dims>` for the cluster Dims at K_STEP_*=256
+      // stays well under the 228 KiB H100 opt-in cap (R5.1, verified
+      // by the static_assert added in task 3.2).
+      //
+      // The conditional sizing (`use_cluster<Dims>::value ? FULL : 1u`)
+      // keeps the four fields at 1 byte each on non-cluster Dims; with
+      // `alignas(16)` the actual byte cost is bounded by alignment
+      // padding (~64 B total) which is negligible and does not affect
+      // the existing `bf16_in_full == w_wgmma == w_down_wgmma`
+      // aliasing static_asserts (Req 4.1, 4.7) because these fields
+      // are placed at the TAIL of `TinyDataWGMMA_TMA`, AFTER all
+      // existing fields.
+      static constexpr uint32_t CLUSTER_TEMP_FP8_T =
+          use_cluster<Dims>::value ? CoreDims::T_TILE : 1u;
+      static constexpr uint32_t CLUSTER_TEMP_FP8_C =
+          use_cluster<Dims>::value ? CoreDims::W_UP_COLS_WGMMA : 1u;
+      static constexpr uint32_t CLUSTER_TEMP_SCALE_T =
+          use_cluster<Dims>::value ? CoreDims::T_TILE : 1u;
+      static constexpr uint32_t CLUSTER_DOWN_B_STG_T =
+          use_cluster<Dims>::value ? CoreDims::T_TILE : 1u;
+      static constexpr uint32_t CLUSTER_DOWN_B_STG_K =
+          use_cluster<Dims>::value ? CoreDims::K_STEP_WGMMA : 1u;
+      static constexpr uint32_t CLUSTER_DOWN_B_STG_SCALE_HALVES =
+          use_cluster<Dims>::value ? 2u : 1u;
+      static constexpr uint32_t CLUSTER_DOWN_B_STG_SCALE_T =
+          use_cluster<Dims>::value ? CoreDims::T_TILE : 1u;
+
+      alignas(16) AQ_element
+          cluster_temp_fp8[CLUSTER_TEMP_FP8_T][CLUSTER_TEMP_FP8_C];
+      alignas(16) S_element cluster_temp_act_scale[CLUSTER_TEMP_SCALE_T];
+      alignas(16) AQ_element
+          cluster_down_b_staging[CLUSTER_DOWN_B_STG_T][CLUSTER_DOWN_B_STG_K];
+      alignas(16) S_element
+          cluster_down_b_staging_scales[CLUSTER_DOWN_B_STG_SCALE_HALVES]
+                                       [CLUSTER_DOWN_B_STG_SCALE_T];
     } tiny_wgmma_tma;
 
     // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────

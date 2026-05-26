@@ -820,7 +820,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     const S_element* __restrict__ expert_scales_down, std::uint32_t top_k,
     std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
     MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& down_weights_desc,
-    CUtensorMap const& down_activations_desc) {
+    CUtensorMap const& down_activations_desc,
+    // Optional per-expert overrides (Step 3.4: per-expert-fused
+    // cluster path).  Sentinel values reproduce the legacy
+    // all-experts behaviour byte-identically (R11.4):
+    //   expert_start_override = 0xffffffffu → use `down_group`
+    //   expert_stride_override = 0u         → use `DOWN_GROUPS`
+    // Non-cluster callers omit both arguments and the C++ default
+    // values fold the `actual_start`/`actual_stride` selection at
+    // compile time.  The cluster per-expert-fused wrapper passes
+    // `expert_start_override = expert_idx` and
+    // `expert_stride_override = expert_count_total + 1` so the
+    // internal expert loop runs exactly once.
+    std::uint32_t expert_start_override = 0xffffffffu,
+    std::uint32_t expert_stride_override = 0u) {
   static_assert(Dims::BS <= 8,
                 "moe_down_projection_BS8_allexperts_wgmma_tma is BS<=8 only");
   using CoreDims = MoECoreDims<Dims>;
@@ -931,6 +944,19 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   const std::uint32_t down_block_idx = blockIdx.x % DOWN_GRID;
   const std::uint32_t base_col = down_block_idx * DOWN_COL_TILE;
 
+  // ── Per-expert override resolution (Step 3.4) ─────────────────────────
+  // Default behaviour (sentinels): start = down_group, stride = DOWN_GROUPS.
+  // The cluster per-expert-fused wrapper passes `expert_start_override =
+  // expert_idx` and `expert_stride_override = expert_count_total + 1` so
+  // the loop runs exactly once for that expert and the inter-expert
+  // lookahead branch (`e + actual_stride < expert_count`) is suppressed
+  // automatically.
+  const std::uint32_t actual_start =
+      (expert_start_override == 0xffffffffu) ? down_group
+                                             : expert_start_override;
+  const std::uint32_t actual_stride =
+      (expert_stride_override == 0u) ? DOWN_GROUPS : expert_stride_override;
+
   // ── Per-thread fp32 accumulators ──────────────────────────────────────
   // One m64n8k32 WGMMA holds 4 fp32 accumulators per thread (d0/d1/d2/d3).
   // The down-projection's inner K chain stacks 4 WGMMAs per K-step into a
@@ -1006,8 +1032,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   std::uint32_t parity_w[2] = {0u, 0u};
   std::uint32_t parity_a[2] = {0u, 0u};
 
-  // ── Per-expert loop (expert_start = down_group, stride = DOWN_GROUPS) ─
-  for (std::uint32_t e = down_group; e < expert_count; e += DOWN_GROUPS) {
+  // ── Per-expert loop (expert_start = down_group, stride = DOWN_GROUPS,
+  //    overridable via expert_start_override / expert_stride_override) ─
+  for (std::uint32_t e = actual_start; e < expert_count; e += actual_stride) {
     const std::uint32_t id = shmem->experts[e].id;
 
     // Per-expert (expert, token) reorganization state (R11).  These
@@ -1080,7 +1107,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // compute-side `mbarrier_try_wait_parity` on bar_{w,a}[0] inside
     // the K-loop below is also compiled out so there is no
     // spin-forever deadlock.
-    const bool need_first_expert_prime = (e == down_group);
+    const bool need_first_expert_prime = (e == actual_start);
     if (need_first_expert_prime && is_tma_launcher_thread<Dims>()) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
       // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
@@ -1181,7 +1208,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     //     (computed at end of expert e, read at iter 0 of expert e+1).
     //   * The LAST expert's accumulate is performed AFTER the expert
     //     loop (one final pass before the GM writeback).
-    const bool has_prev_expert = (e != down_group);
+    const bool has_prev_expert = (e != actual_start);
     for (std::uint32_t s = 0; s < K_TILES_DOWN; ++s) {
       const std::uint32_t read_slot = s & 1;
 
@@ -1443,7 +1470,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
             }
           }
-        } else if (e + DOWN_GROUPS < expert_count) {
+        } else if (e + actual_stride < expert_count) {
           // ── INTER-EXPERT LOOKAHEAD ────────────────────────────────
           //
           // Prefetch the NEXT expert's K=0 weight + activation tiles
@@ -1454,7 +1481,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           // SHM with the parity bookkeeping already aligned via the
           // hoisted `parity_w[]` / `parity_a[]` state.
           const std::uint32_t lookahead_slot = (s + 1) & 1;  // == 0
-          const std::uint32_t next_e = e + DOWN_GROUPS;
+          const std::uint32_t next_e = e + actual_stride;
           const std::uint32_t next_id = shmem->experts[next_e].id;
           const std::uint32_t next_routed_count =
               static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
@@ -1548,7 +1575,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       __syncthreads();
     }  // end K-loop
 
-    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_kloop, e == down_group);
+    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_kloop, e == actual_start);
 
     // ── End-of-expert: write final_d → partial_result.down_out[DCT][8] ─
     //
@@ -1611,7 +1638,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   #endif
     __syncthreads();
 
-    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
+    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == actual_start);
   }  // end expert loop
 
   // ── Final accumulate for the LAST expert in this block's group ────────
@@ -1632,7 +1659,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // down_group), `e_started` stays false and the accumulate is
   // skipped — `down_out` was never written for this block.
   #ifndef MONO_PROFILE_SKIP_CALC_DOWN
-  if (expert_count > down_group) {
+  if (expert_count > actual_start) {
     for (unsigned tok_col = thread_in_block;
          tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
       const unsigned tok = tok_col / DOWN_COL_TILE;
@@ -1673,6 +1700,54 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     atomicAdd(gm_partial + tok * Dims::HIDDEN_STATES + base_col + col,
               shm->out_accum[tok][col]);
   }
+}
+
+// ── Per-expert-fused sibling for the cluster path (Step 3.4 / Step A) ──
+//
+// Wraps `moe_down_projection_BS8_allexperts_wgmma_tma` with the
+// optional `expert_start_override = expert_idx` and
+// `expert_stride_override = expert_count_total + 1` arguments so the
+// internal expert loop runs exactly once.  Used only by the
+// cluster-path per-expert-fused dispatch in `moe_kernel_topk_BS8`'s
+// cluster arm; non-cluster Dims never call this.
+//
+// HBM handoff invariant: the wrapped function still reads
+// `spec->temp_fp8` (via the bulk activation TMA) and
+// `spec->temp_act_scale` for the current expert byte-identically to
+// the all-experts variant — Step B (3.5) is what swaps that for DSHM.
+//
+// Loss of inter-expert lookahead (the existing variant prefetches the
+// NEXT expert's K=0 weight + activation TMAs into the freed slot at
+// `s = K_TILES_DOWN - 1`) is the structural cost of fusion accepted
+// at Step A; the wrapped function's
+// `else if (e + actual_stride < expert_count)` gate evaluates to
+// `false` because `actual_stride > expert_count`, so the lookahead is
+// suppressed automatically.
+//
+// One side-effect to be aware of: this sibling re-runs the
+// per-block prologue (zero `out_accum`, re-init `bar_w[0..1]` /
+// `bar_a[0..1]`, fence, `__syncthreads()`) on every per-expert
+// invocation.  That cost (4 mbarrier inits + 1 SHM zero pass per
+// expert) is the structural overhead of fusion at Step A.  The
+// `out_accum` zero is benign for correctness because each per-expert
+// call's atomicAdd writes into HBM at the bottom; subsequent calls
+// re-zero before any new atomicAdd would observe stale data.  The
+// `__syncthreads()` is per-block, not cluster-wide, so it does not
+// race with the cluster-level `cluster_sync()` in the kernel-level
+// per-expert loop.
+template <typename Dims>
+__device__ inline void moe_down_projection_BS8_oneexpert_wgmma_tma(
+    const W_element* __restrict__ expert_weights_down,
+    const S_element* __restrict__ expert_scales_down, std::uint32_t top_k,
+    std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
+    MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& down_weights_desc,
+    CUtensorMap const& down_activations_desc, std::uint32_t expert_idx,
+    std::uint32_t expert_count_total) {
+  moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(
+      expert_weights_down, expert_scales_down, top_k, batch_size, spec, shmem,
+      down_weights_desc, down_activations_desc,
+      /*expert_start_override=*/expert_idx,
+      /*expert_stride_override=*/expert_count_total + 1u);
 }
 
 }  // namespace moe_monokernel
