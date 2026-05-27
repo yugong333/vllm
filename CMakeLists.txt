@@ -1213,6 +1213,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     #   SKIP_CALC_DOWN      : down-proj calc warps compiled out
     #   SKIP_PREFETCH_DOWN  : down-proj prefetches compiled out
     #
+    # Profile-only flag — kernel output WILL BE INCORRECT (do not use
+    # for accuracy testing):
+    #
+    #   SKIP_UP_EPILOGUE    : up-proj end-of-expert epilogue (wgmma_out
+    #                          SHM publish + sync + SiLU+fp8 quant
+    #                          writeback) elided.  Use to confirm
+    #                          via NCU PM-sampling whether the
+    #                          cross-expert "yellow + blue both idle"
+    #                          dip is attributable to the epilogue or
+    #                          to something else (cross-expert TMA
+    #                          wait, scale load, etc.).  WGMMA
+    #                          accumulators are kept alive via a
+    #                          volatile-sink so the K-loop does not
+    #                          collapse to a no-op.
+    #
     # Example — measure pure down-proj prefetch / TMA-wait cost (calc
     # path is "free", remaining time is data movement + barrier stalls):
     #
@@ -1225,14 +1240,67 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH_DOWN")
 
+    # Example — confirm the up-proj end-of-expert epilogue is the
+    # source of the cross-expert "yellow + blue both idle" dip in
+    # NCU PM-sampling profiles.  Output is INCORRECT under this flag
+    # (do not run accuracy tests); compare two NCU runs (with and
+    # without the flag) and inspect whether the inter-expert gap
+    # disappears.  If yes — the epilogue is the bottleneck.  If no —
+    # look elsewhere (cross-expert TMA wait, scale loader, etc.).
+    #
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_UP_EPILOGUE")
+
+    # A/B test the inline vs deferred up-proj epilogue.  When this
+    # flag is defined, the per-expert SiLU+fp8-quant writeback runs
+    # on prefetch warps at iters 0/1 of the NEXT expert (4 prefetch
+    # warps × 1 token per iter, 8 tokens total).  Calc warps run
+    # iter-0/iter-1 WGMMAs in parallel.  The LAST expert has no
+    # next iter-0 to defer to and runs its writeback inline after
+    # the expert loop.  Output is CORRECT under this flag (numerics
+    # preserved); only the placement of the helper changes.
+    #
+    # Use to A/B-test against the inline path with the same
+    # phase-timing instrumentation enabled — `t_up_after_expert0_*`
+    # and `t_up_e1_iter0_*` capture the per-stage cost in both
+    # configurations.
+    #
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_DEFER_UP_EPILOGUE")
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_DEFER_UP_EPILOGUE")
+
+    # Staggered-TMA up-proj weight pipeline.  When this flag is
+    # defined, the up-proj K-loop uses a 2-iter lookahead (bar_w[4]
+    # + w_wgmma[4] + parity_w[4]) instead of the default 1-iter
+    # lookahead (bar_w[2] + w_wgmma[2]).  The launcher fires
+    # iter-(s+2) at iter `s`, and the cross-expert "stitch" splits
+    # into two arms at e0's last two K-iters (iter K_TILES-2 fetches
+    # next expert's iter-0; iter K_TILES-1 fetches next expert's
+    # iter-1).  This gives DRAM more time to drain between the
+    # cross-expert TMAs and the next expert's iter-1 weight TMA,
+    # eliminating the iter-1 wait stretch observed at every
+    # cross-expert boundary in the default pipeline.
+    #
+    # Output is CORRECT under this flag (numerics preserved); only
+    # the TMA scheduling changes.  SHM cost: 0 (`w_wgmma[4]` is
+    # unioned with `w_down_wgmma` at 128 KB, which already
+    # dominates the union; widening `w_wgmma` from 64 KB to 128 KB
+    # is therefore free in SHM terms).
+    #
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_BARW_4DEEP")
+    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+      APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_BARW_4DEEP")
+
     # Phase-timing instrumentation — uncomment to enable per-phase
     # clock64() timestamps written by block 0, thread 0.  Read back
     # from Python via the scratchpad's `phase_timestamps` struct at the
     # tail of MoEGemmSpec.  Kernel output is CORRECT (no skip flags);
     # overhead is negligible (7 clock64 reads + 7 GM stores total).
     #
-    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-      APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
   else()
     if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
       message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "

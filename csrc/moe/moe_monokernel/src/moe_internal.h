@@ -89,9 +89,23 @@
           spec->phase_timestamps.field = clock64();          \
         }                                                    \
       } while (0)
+    // Like MONO_PHASE_TIMESTAMP_IF but with a caller-chosen recording
+    // thread.  Use when the timestamp must be taken from a thread
+    // OTHER than calc-warp 0 lane 0 — e.g. warp 8 lane 0 (= the
+    // first prefetch warp, also the TMA launcher) for measuring
+    // prefetch-warp deferred work.  `tid_pred` is the literal
+    // `threadIdx.x` value of the recording thread (e.g. `8u * 32u`
+    // for warp 8 lane 0).
+    #define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred)        \
+      do {                                                            \
+        if ((cond) && blockIdx.x == 0 && threadIdx.x == (tid_pred)) { \
+          spec->phase_timestamps.field = clock64();                   \
+        }                                                             \
+      } while (0)
   #else
     #define MONO_PHASE_TIMESTAMP(field) ((void)0)
     #define MONO_PHASE_TIMESTAMP_IF(field, cond) ((void)0)
+    #define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred) ((void)0)
   #endif
 
 namespace moe_monokernel {
@@ -455,19 +469,110 @@ struct MoEGemmSpec {
     int64_t t_after_prepare_phaseB;
     int64_t t_after_prepare_phaseC;
     int64_t t_after_routing;
-    // Up-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
-    //   t_up_after_preloop : after the pre-loop bar_w[0] arm + first
-    //                        weight TMA, before the expert loop.
-    //   t_up_after_expert0_kloop : after the K-loop completes for the
-    //                              FIRST expert this block processes
-    //                              (e == expert_start).  Excludes the
-    //                              wgmma_out → __syncthreads write.
-    //   t_up_after_expert0_writeback : after the FIRST expert's SiLU +
-    //                                  fp8 writeback + tail
-    //                                  __syncthreads.
+    // Up-projection sub-phases (block 0 — calc warp 0 lane 0):
+    //   t_up_after_preloop          : after pre-loop bar_w[0] arm,
+    //                                 before the expert loop.
+    //
+    //   ── First expert K-loop (e == expert_start) ──
+    //   t_up_e0_iter0_after_wait    : after iter-0 bar_w wait
+    //                                 (cross-expert TMA arrival).
+    //   t_up_e0_iter0_after_compute : after iter-0 K-substep WGMMAs
+    //                                 + scale-apply complete.
+    //   t_up_e0_iter1_after_wait    : after iter-1 bar_w wait
+    //                                 (steady-state TMA wait).
+    //   t_up_e0_iter1_after_compute : after iter-1 compute.
+    //   t_up_after_expert0_kloop    : after expert 0's K-loop ends
+    //                                 (= last WGMMA's final scale-
+    //                                 apply complete).
+    //
+    //   ── First expert epilogue (e == expert_start) ──
+    //   t_up_after_expert0_wgmma_out: after the wgmma_out SHM store
+    //                                 + publish __syncthreads.
+    //   t_up_after_expert0_writeback: after the SiLU+fp8-quant
+    //                                 writeback + trailing
+    //                                 __syncthreads at the bottom
+    //                                 of expert 0's loop body.
+    //
+    //   ── Second expert iter 0 / iter 1 (e == expert_start + stride) ──
+    //   t_up_e1_iter0_after_wait    : after iter-0 bar_w wait of
+    //                                 expert 1.  Δ to
+    //                                 `t_up_after_expert0_writeback`
+    //                                 = the cross-expert "gap"
+    //                                 from the end of expert 0's
+    //                                 epilogue to the start of
+    //                                 expert 1's first WGMMA.
+    //   t_up_e1_iter0_after_compute : after expert 1's iter-0
+    //                                 compute.
+    //   t_up_e1_iter1_after_wait    : after expert 1's iter-1
+    //                                 wait.
+    //   t_up_e1_iter1_after_compute : after expert 1's iter-1
+    //                                 compute.
     int64_t t_up_after_preloop;
+    int64_t t_up_e0_iter0_after_wait;
+    int64_t t_up_e0_iter0_after_compute;
+    int64_t t_up_e0_iter1_after_wait;
+    int64_t t_up_e0_iter1_after_compute;
     int64_t t_up_after_expert0_kloop;
+    int64_t t_up_after_expert0_wgmma_out;
     int64_t t_up_after_expert0_writeback;
+    int64_t t_up_e1_iter0_after_wait;
+    int64_t t_up_e1_iter0_after_compute;
+    int64_t t_up_e1_iter1_after_wait;
+    int64_t t_up_e1_iter1_after_compute;
+    // ── Prefetch-warp deferred SiLU body (only meaningful when
+    // MONO_PROFILE_DEFER_UP_EPILOGUE is defined; recorded on
+    // threadIdx.x == 256, i.e. warp 8 lane 0). ──
+    //
+    // Bracketed timestamps around the deferred SiLU+quant writeback
+    // body for the PREVIOUS expert (expert 0), running on prefetch
+    // warps inside expert 1's K-loop.  Tokens are split across two
+    // K-loop iterations:
+    //   iter 0 (s == 0): tokens [0..3]
+    //   iter 1 (s == 1): tokens [4..7]
+    //
+    //   t_up_e1_pf_iter0_before_silu : warp 8 lane 0 immediately
+    //                                  before the helper call at
+    //                                  iter 0.
+    //   t_up_e1_pf_iter0_after_silu  : same thread immediately
+    //                                  after.  Δ = 4-warp parallel
+    //                                  per-iter SiLU body cost.
+    //   t_up_e1_pf_iter1_before_silu : same for iter 1 (tokens
+    //                                  4..7).
+    //   t_up_e1_pf_iter1_after_silu  : same.
+    //
+    // Comparing the (after_silu - before_silu) Δ on each iter
+    // against the calc-warp `(after_compute - after_wait)` Δ for
+    // the same iter tells us whether the PF body fits inside the
+    // calc compute window:
+    //   * PF Δ ≤ calc Δ → PF hidden, calc is the long pole.
+    //   * PF Δ > calc Δ → calc waits for PF at the inter-iter
+    //                     sync, PF is the long pole.
+    int64_t t_up_e1_pf_iter0_before_silu;
+    int64_t t_up_e1_pf_iter0_after_silu;
+    int64_t t_up_e1_pf_iter1_before_silu;
+    // ── Iter-1 PF body section breakdown ──────────────────────────────
+    //
+    // Recorded on warp 8 lane 0 (= threadIdx.x == 256) inside the
+    // INLINED iter-1 deferred SiLU body for tokens 4..7.  Each
+    // timestamp marks the END of a section; the Δs measure the
+    // section costs.  Only meaningful when both
+    // MONO_PROFILE_PHASE_TIMING and MONO_PROFILE_DEFER_UP_EPILOGUE
+    // are defined.
+    //
+    //   Section A — topk scan + SHM lookups (`topk_ids_flat`,
+    //     `topk_weights_flat`, `sorted_slot`)
+    //   Section B — 4 wgmma_out SHM reads (gate1/up1/gate2/up2)
+    //   Section C — SiLU compute (2× `__expf` SFU ops + the
+    //     `rw * up * gate / (1 + exp(-gate))` chain)
+    //   Section D — warp-reduce-max + fp8 quantize (5-stage
+    //     `__shfl_xor_sync` chain + `inv_scale` reciprocal)
+    //   Section E — GM stores (2 fp8 byte stores + 1 fp32 scale
+    //     store)
+    int64_t t_up_e1_pf_iter1_after_topk_lookup;
+    int64_t t_up_e1_pf_iter1_after_wgmma_read;
+    int64_t t_up_e1_pf_iter1_after_silu_compute;
+    int64_t t_up_e1_pf_iter1_after_warp_reduce;
+    int64_t t_up_e1_pf_iter1_after_silu;
     int64_t t_after_up;
     int64_t t_after_barrier2;
     // Down-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
@@ -1081,9 +1186,25 @@ struct MoE_SHM {
         alignas(1024) A_element
             bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
                         [BF16_IN_FULL_K];  // 32 KB (Phase 1/2)
+  #ifdef MONO_PROFILE_BARW_4DEEP
+        // Up-proj weight slots (BARW_4DEEP variant): 4 slots for the
+        // 2-iter lookahead pipeline.  At iter `s` the launcher
+        // arms+TMAs slot `(s+2) & 3`; calc waits on `bar_w[s & 3]`.
+        // Slots wrap modulo 4 every 4 iters, and the calc-side
+        // wait at iter `s+1` provides the publish acquire on slot
+        // `(s+1) & 3` before iter `s+3`'s arm targets the same slot
+        // (3-iter wraparound > 2-iter calc/launcher gap).
+        //
+        // SHM cost: same as the 2-slot variant, because the union
+        // is dominated by `w_down_wgmma` at 128 KB.
+        alignas(1024)
+            W_element w_wgmma[4][W_WGMMA_M_TOTAL]
+                             [W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
+  #else
         alignas(1024) W_element
             w_wgmma[2][W_WGMMA_M_TOTAL]
                    [W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
+  #endif
         alignas(1024) W_element
             w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
                         [CoreDims::K_STEP_WGMMA];  // 128 wide × M
@@ -1130,7 +1251,26 @@ struct MoE_SHM {
         T_element
             down[CoreDims::W_DOWN_TILE / 2 + CoreDims::CALC_WARP_COUNT / 2]
                 [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
-        T_element wgmma_out[128][CoreDims::T_TILE];
+        // wgmma_out: bank-conflict-free row stride.
+        //
+        // Reader access pattern (in `up_silu_quant_writeback_one_token`):
+        // every lane in a warp reads `wgmma_out[col_in_half + offset][tok]`
+        // with `col_in_half = lane` (0..31) and `tok = warp` (uniform).
+        // Address = base + lane*(row_stride_bytes) + tok*4.  With the
+        // natural row stride of 8 floats = 32 bytes = 8 banks, lane k's
+        // bank is `(lane*8 + tok) mod 32`, which collapses 32 lanes into
+        // only 4 distinct banks → 8-way bank conflict on every LDS (4
+        // LDS per (lane, tok) for gate1/up1/gate2/up2).
+        //
+        // Padding the row stride to 9 floats = 36 bytes makes the bank
+        // index `(lane*9 + tok) mod 32`, which is bijective over 32
+        // lanes (gcd(9, 32) = 1) → conflict-free reads.  The 9th column
+        // is unused.
+        //
+        // SHM cost: 128 × 1 × 4 = 512 extra bytes for `wgmma_out`, but
+        // the union is dominated by `down_out[256][8] = 8 KB`, so the
+        // total union footprint is unchanged.
+        T_element wgmma_out[128][CoreDims::T_TILE + 1];
         T_element down_out[CoreDims::DOWN_COL_TILE][CoreDims::T_TILE];
       } partial_result;
 
@@ -1148,6 +1288,24 @@ struct MoE_SHM {
       // before the 4 sub-tile TMAs that populate `w_wgmma[slot]`; WGMMA
       // consumers poll via `mbarrier.try_wait.parity` (R3.1, R3.3, R3.5).
       //
+      // ── Sized for the deepest lookahead the up-proj K-loop uses ──
+      //
+      // The default 1-deep lookahead (steady-state pipeline) only uses
+      // slots [0, 1].  The 2-deep lookahead variant (gated on
+      // `MONO_PROFILE_BARW_4DEEP`) uses all four slots to stagger the
+      // cross-expert stitch one iter earlier, giving DRAM more time to
+      // drain between the stitch and the next expert's iter-1 weight
+      // TMA.  The down-proj path (which has its own pipeline structure)
+      // re-initializes only slots [0, 1] in its prologue and leaves
+      // slots [2, 3] untouched — they aren't waited on by the down-proj
+      // K-loop, so leaving them un-init is safe.
+      //
+      // Note on SHM impact: `w_wgmma` is unioned with `w_down_wgmma` at
+      // 128 KB (DOWN_COL_TILE=256, K_STEP_DOWN=256), which dominates
+      // the union regardless of `w_wgmma`'s slot count.  Widening
+      // `w_wgmma[2]` to `w_wgmma[4]` (also gated on the same macro,
+      // see below) does not increase the union size.
+      //
       // Down-projection activation-tile mbarriers (one per double-
       // buffer slot).  Used EXCLUSIVELY by the down-projection
       // (Phase 4): the down-proj launcher arms `bar_a[slot]` before
@@ -1161,7 +1319,11 @@ struct MoE_SHM {
       //
       // `alignas(16)` satisfies R11.4 and the 16-byte alignment that the
       // SM90 `mbarrier.*.shared::cta.b64` instructions require.
-      alignas(16) uint64_t bar_w[2];  // 16 B
+  #ifdef MONO_PROFILE_BARW_4DEEP
+      alignas(16) uint64_t bar_w[4];  // 32 B (2-deep lookahead)
+  #else
+      alignas(16) uint64_t bar_w[2];  // 16 B (1-deep lookahead)
+  #endif
       alignas(16) uint64_t bar_a[2];  // 16 B
 
       // ── NEW: routing-window mbarrier (Req 1.5, 1.6) ─────────────────
@@ -1257,6 +1419,32 @@ struct MoE_SHM {
       // contribution".  Sized to `Dims::BS = 8` bytes — negligible
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
+  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
+      // Per-expert per-token cached top-k INDEX for the up-proj
+      // SiLU+fp8 quant writeback under DEFER.  For each token `tok`,
+      // holds the smallest `k ∈ [0, top_k)` such that
+      // `topk_ids_flat[tok*MAX_TOPK + k] == id`, or sentinel `0xFF`
+      // if no such `k` exists (token does not route through this
+      // expert).
+      //
+      // Computed once per expert by 8 calc threads at the K-loop
+      // tail (no extra sync — published by the existing wgmma_out
+      // publish `__syncthreads()`).  Read by the deferred SiLU body
+      // on prefetch warps inside the next expert's K-loop iters
+      // 0/1, replacing the 8-iter scan.
+      //
+      // ── Why DEFER-only ──
+      // The inline path also does the topk scan but every (lane, tok)
+      // pair is broadcasting the same SHM bytes — bank-conflict-free,
+      // cheap.  The deferred path runs the scan CONCURRENTLY with
+      // calc-warp WGMMA which contends for SHM banks; that's where
+      // the scan stretches from ~0.05 µs to ~0.46 µs.  The cache
+      // replaces the contended scan with a single `[tok]` byte read
+      // from a hot SHM cacheline.
+      //
+      // SHM cost: 8 bytes per block (Dims::BS = 8).
+      uint8_t up_rank_for_tok[Dims::BS];
+  #endif
     } tiny_wgmma_tma;
 
     // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────
