@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import IntEnum
+import contextlib
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -316,24 +317,25 @@ def moe_monokernel_topk(
         "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
     if M <= 8:
-        # BS8 uses the TMA+WGMMA kernel with SWIZZLE_128B on both weight
-        # sides.  The up-projection weights must be repacked via
-        # `interleave_for_tma_wgmma_up` (gate/up row interleave so one
-        # 128x128 TMA fetches a full WGMMA A-tile); the down-projection
-        # weights are passed raw — the TMA hardware applies the
-        # core-matrix XOR swizzle at write time.  The repack is cached
-        # on the weight tensor's `_tma_interleaved_up` attribute so
-        # subsequent calls with the same weights are free; model loaders
-        # can also apply the transform ahead of time.
-        from interleave_weights import interleave_for_tma_wgmma_up
+        # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with
+        # SWIZZLE_128B on both weight sides.  The up-projection weights
+        # must be repacked via `interleave_for_tma_wgmma_up_v2` (gate/up
+        # PAIR interleave so silu(gate)*up is a per-lane register op
+        # after the WGMMA); the down-projection weights are passed raw —
+        # the TMA hardware applies the core-matrix XOR swizzle at write
+        # time.  The repack is cached on the weight tensor's
+        # `_tma_interleaved_up_v2` attribute so subsequent calls with the
+        # same weights are free; model loaders can also apply the
+        # transform ahead of time.
+        from interleave_weights import interleave_for_tma_wgmma_up_v2
 
-        up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up", None)
+        up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up_v2", None)
         if up_interleaved is None:
-            up_interleaved = interleave_for_tma_wgmma_up(expert_weights_up).contiguous()
-            try:
-                expert_weights_up._tma_interleaved_up = up_interleaved
-            except (AttributeError, RuntimeError):
-                pass
+            up_interleaved = interleave_for_tma_wgmma_up_v2(
+                expert_weights_up
+            ).contiguous()
+            with contextlib.suppress(AttributeError, RuntimeError):
+                expert_weights_up._tma_interleaved_up_v2 = up_interleaved
 
         torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
             activations_in,

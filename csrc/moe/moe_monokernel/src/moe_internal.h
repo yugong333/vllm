@@ -164,6 +164,33 @@ struct use_tma {
   static constexpr bool value = test<Dims>(0);
 };
 
+// ── Pair_Layout opt-in detection ────────────────────────────────────────
+// `Dims::KernelConfig::USE_PAIR_LAYOUT` is optional; default to false for
+// all existing Dims variants so the V1 (Stripe_Layout) up-proj epilogue
+// stays in use and remains PTX byte-identical to the prior_spec_baseline.
+// Only the new V2 Dims variant (Dims_BS8_*_WGMMA_TMA_PAIR) sets
+// USE_PAIR_LAYOUT=true, switching the up-proj epilogue and the device-
+// side TMA loader's `global_row` mapping to the gate/up-paired layout
+// described in the `up-proj-gate-up-pair-layout` design.
+//
+// Mirrors `use_wgmma` / `use_tma` above: `test(int)` returns the
+// `D::KernelConfig::USE_PAIR_LAYOUT` constant when the field exists;
+// the `test(...)` fallback returns `false` for variants that don't
+// declare it.
+template <typename Dims>
+struct use_pair_layout {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::USE_PAIR_LAYOUT, bool()) {
+    return D::KernelConfig::USE_PAIR_LAYOUT;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
 // ── Down-proj K-step size opt-in detection ──────────────────────────────
 // `Dims::KernelConfig::K_STEP_DOWN` is optional; default to 128 (= the
 // up-proj K_STEP_WGMMA, which also matches the SWZ128 atom width).  Set
@@ -594,6 +621,57 @@ struct MoEGemmSpec {
     int64_t t_down_after_all_experts;
     int64_t t_after_down;
     int64_t t_after_barrier3;
+    // ── V2+DEFER calc-warp epilogue breakdown (expert 0) ──────────────
+    //
+    // Recorded on warp 0 lane 0 (= threadIdx.x == 0) inside the
+    // V2+DEFER calc-warp epilogue at the K-loop tail of expert 0.
+    // Only meaningful when both MONO_PROFILE_PHASE_TIMING and
+    // MONO_PROFILE_DEFER_UP_EPILOGUE are defined; otherwise the
+    // slots stay at 0 (tolerated by the offset auto-detect).  Placed
+    // BEFORE t_after_phase5 so the auto-detect's last-field anchor
+    // stays on the always-written t_after_phase5.
+    //
+    // Brackets the calc-warp work that V2+DEFER leaves ON the calc
+    // warps (everything else is deferred to PF):
+    //   t_up_e0_defer_after_rwlookup : after the up_rank_for_tok
+    //       cache read + topk_weights_flat read for both tokens.
+    //   t_up_e0_defer_after_combine  : after the per-lane
+    //       silu(gate)*up*rw register combine (2× __expf).
+    //   t_up_e0_defer_after_store    : after the 2 post_silu_scratch
+    //       SHM stores.
+    //   t_up_e0_defer_after_snapshot : after the 8-thread
+    //       up_rank_for_tok -> up_rank_for_tok_prev snapshot.
+    // Deltas:
+    //   rwlookup = after_rwlookup - t_up_after_expert0_kloop
+    //   combine  = after_combine  - after_rwlookup
+    //   store    = after_store    - after_combine
+    //   snapshot = after_snapshot - after_store
+    int64_t t_up_e0_defer_after_rwlookup;
+    int64_t t_up_e0_defer_after_combine;
+    int64_t t_up_e0_defer_after_store;
+    int64_t t_up_e0_defer_after_snapshot;
+    // ── Cross-expert GAP breakdown (e0 → e1) ──────────────────────────
+    //
+    // Recorded on warp 0 lane 0 (= threadIdx.x == 0) at the K-loop top
+    // of expert 1.  Splits the "writeback end → e1 iter0 wait end" GAP
+    // into its three sub-phases:
+    //   t_up_e1_after_scale_cache  : after the calc-warp
+    //       up_rank_for_tok cache populate (the PF warp's up_scale
+    //       SHM load runs in parallel).  Δ to t_up_after_expert0_
+    //       writeback = scale-load + cache-populate cost.
+    //   t_up_e1_after_publish_sync : after the publish __syncthreads
+    //       that makes up_scale + the cache visible block-wide.  Δ
+    //       from t_up_e1_after_scale_cache = the barrier cost
+    //       (includes waiting for the PF warp's scale load).
+    //   (bar_w wait = t_up_e1_iter0_after_wait - this)
+    int64_t t_up_e1_after_scale_cache;
+    int64_t t_up_e1_after_publish_sync;
+    // Cross-expert GAP sub-split: after the scale block (cp.async
+    // wait/prefetch on PF warps; no-op on calc warps) but BEFORE the
+    // rank-cache populate.  Lets us separate the scale-handling cost
+    // from the rank-populate scan cost within GAP-a.  Recorded on
+    // warp 0 lane 0 (calc) at e1's K-loop top.
+    int64_t t_up_e1_after_scale_block;
     int64_t t_after_phase5;
   } phase_timestamps;
 };
@@ -1186,25 +1264,19 @@ struct MoE_SHM {
         alignas(1024) A_element
             bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
                         [BF16_IN_FULL_K];  // 32 KB (Phase 1/2)
-  #ifdef MONO_PROFILE_BARW_4DEEP
-        // Up-proj weight slots (BARW_4DEEP variant): 4 slots for the
-        // 2-iter lookahead pipeline.  At iter `s` the launcher
-        // arms+TMAs slot `(s+2) & 3`; calc waits on `bar_w[s & 3]`.
-        // Slots wrap modulo 4 every 4 iters, and the calc-side
-        // wait at iter `s+1` provides the publish acquire on slot
-        // `(s+1) & 3` before iter `s+3`'s arm targets the same slot
-        // (3-iter wraparound > 2-iter calc/launcher gap).
+        // Up-proj weight slots: 4 slots for the 4-deep weight TMA
+        // lookahead pipeline.  At iter `s` the launcher arms+TMAs slot
+        // `(s+2) & 3`; calc waits on `bar_w[s & 3]`.  Slots wrap modulo
+        // 4 every 4 iters, and the calc-side wait at iter `s+1`
+        // provides the publish acquire on slot `(s+1) & 3` before iter
+        // `s+3`'s arm targets the same slot (3-iter wraparound > 2-iter
+        // calc/launcher gap).
         //
-        // SHM cost: same as the 2-slot variant, because the union
-        // is dominated by `w_down_wgmma` at 128 KB.
+        // SHM cost: same as a 2-slot variant, because the union is
+        // dominated by `w_down_wgmma` at 128 KB.
         alignas(1024)
             W_element w_wgmma[4][W_WGMMA_M_TOTAL]
                              [W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
-  #else
-        alignas(1024) W_element
-            w_wgmma[2][W_WGMMA_M_TOTAL]
-                   [W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
-  #endif
         alignas(1024) W_element
             w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
                         [CoreDims::K_STEP_WGMMA];  // 128 wide × M
@@ -1272,6 +1344,104 @@ struct MoE_SHM {
         // total union footprint is unchanged.
         T_element wgmma_out[128][CoreDims::T_TILE + 1];
         T_element down_out[CoreDims::DOWN_COL_TILE][CoreDims::T_TILE];
+        // pair_layout_reduce: cross-warp reduce-max scratch for the
+        // V2 (Pair_Layout) up-projection epilogue.
+        //
+        // Indexing: pair_layout_reduce[wg_idx][warp_in_wg][tok], where
+        //   wg_idx       ∈ [0, 2)  — warpgroup id (0..1)
+        //   warp_in_wg   ∈ [0, 4)  — warp within the WG
+        //   tok          ∈ [0, T_TILE)  (= 8 for BS8)
+        //
+        // Each warp's lane 0 stores its per-warp per-token block-max
+        // here; after a __syncthreads() every lane reads the 4 warp
+        // maxes for its WG and computes the per-token global block
+        // max for the fp8 quantize step (see design.md "Component 5:
+        // Cross-Warp Reduce SHM Scratch").
+        //
+        // Size: 2 × 4 × T_TILE × 4 B = 256 B for T_TILE == 8 — far
+        // below the 8 KB union dominator (`down_out[256][8]`), so the
+        // union total is unchanged.
+        //
+        // Aliasing safety:
+        //   * V2 (USE_PAIR_LAYOUT == true) does NOT use `wgmma_out`
+        //     — the cross-warp reduce path lives entirely in
+        //     registers + this scratch, so the bytes that V1's
+        //     `wgmma_out` view occupies are reusable for V2's
+        //     `pair_layout_reduce`.
+        //   * V1 (USE_PAIR_LAYOUT == false) does NOT use
+        //     `pair_layout_reduce` — V1's epilogue stores fp32
+        //     post-SiLU values via `wgmma_out` and never touches
+        //     this view, so V1's PTX/byte image is unaffected.
+        //   * `up` and `down` are owned by the K-loop body and the
+        //     down-proj path respectively; both finish their use of
+        //     the union before either V1's `wgmma_out` or V2's
+        //     `pair_layout_reduce` is written, so neither view
+        //     conflicts with them either.
+        //   * `down_out` is the BS8 down-projection's writeback
+        //     scratch (Phase 4), which runs after the up-proj
+        //     epilogue's __syncthreads, so it cannot alias-conflict
+        //     with `pair_layout_reduce` at runtime.
+        T_element pair_layout_reduce[2][4][CoreDims::T_TILE];
+        // post_silu_scratch: per-lane post-SiLU fp32 scratch for the
+        // V2 + `MONO_PROFILE_DEFER_UP_EPILOGUE` (V2+DEFER) up-proj
+        // epilogue.
+        //
+        // Shape: [128][T_TILE + 1].  Outer extent 128 = 4 calc warps
+        //   × 32 lanes (one fp32 per lane row), inner extent
+        //   T_TILE + 1 holds the T_TILE per-token values plus a
+        //   padding column to avoid bank conflicts on the PF-warp
+        //   read pattern (`post_silu_scratch[col][tok]` with
+        //   col = lane, tok = warp; the 9-float row stride makes
+        //   `(lane * 9 + tok) mod 32` bijective over 32 lanes,
+        //   gcd(9, 32) = 1, mirroring the wgmma_out trick).
+        //
+        // Bytes: 128 × (T_TILE + 1) × sizeof(T_element) = 128 × 9 ×
+        //   4 = 4608 B (~4 KB) for T_TILE == 8.  Far below the 8 KB
+        //   union dominator (`down_out[256][T_TILE]`).
+        //
+        // Producer / consumer (V2 + DEFER only):
+        //   * Producer: calc warps' per-lane register combine at the
+        //     K-loop tail of expert `e` writes 2 fp32 values per
+        //     lane per (d_half, d_idx) into post_silu_scratch (see
+        //     design.md "Component 5" and tasks 6.3 / 6.4).
+        //   * Consumer: prefetch warps (warps 8..11) at iters 0/1 of
+        //     expert `e + 1` read 32 fp32 post-SiLU values per token
+        //     for warp-reduce-max + fp8 quantize + GM store.
+        //
+        // Aliasing safety:
+        //   * V2 + DEFER (use_pair_layout<Dims>::value == true AND
+        //     MONO_PROFILE_DEFER_UP_EPILOGUE defined) writes
+        //     post_silu_scratch on calc warps and reads it on PF
+        //     warps in the next expert's iters 0/1.  In this mode
+        //     the kernel does NOT use:
+        //       - `wgmma_out`: V2 has no SHM round-trip for the
+        //         WGMMA D-matrix; the per-lane combine writes
+        //         directly to post_silu_scratch from registers.
+        //       - `pair_layout_reduce`: the cross-warp reduce-max
+        //         no longer happens on calc warps; instead, PF
+        //         warps read post_silu_scratch and warp-reduce-max
+        //         per token (one warp per token), so the in-place
+        //         block-max scratch is unused.
+        //     This makes post_silu_scratch a clean alias of the V2
+        //     `wgmma_out` slot.
+        //   * V1 (use_pair_layout<Dims>::value == false) does NOT
+        //     use post_silu_scratch.  Its bytes alias V1's
+        //     `wgmma_out` region, so V1's PTX/byte image is
+        //     unaffected.
+        //   * V2 inline (no DEFER) does NOT use post_silu_scratch
+        //     either — the per-lane combine, reduce-max, and quant
+        //     all run on calc warps in registers, with `pair_layout
+        //     _reduce` carrying the cross-warp block-max.
+        //   * `up`, `down`, and `down_out` are owned by other
+        //     phases (K-loop body / down-proj path / Phase 4
+        //     writeback) that are __syncthreads-separated from the
+        //     V2+DEFER producer/consumer pair, so none of them can
+        //     alias-conflict with post_silu_scratch at runtime.
+        //
+        // The 8 KB `down_out[256][T_TILE]` view remains the union
+        // dominator, so `sizeof(MoE_SHM<Dims>)` is byte-identical
+        // to Phase 3.1.
+        T_element post_silu_scratch[128][CoreDims::T_TILE + 1];
       } partial_result;
 
       static constexpr uint32_t OUT_ACCUM_ROW_PAD = 1;
@@ -1288,11 +1458,9 @@ struct MoE_SHM {
       // before the 4 sub-tile TMAs that populate `w_wgmma[slot]`; WGMMA
       // consumers poll via `mbarrier.try_wait.parity` (R3.1, R3.3, R3.5).
       //
-      // ── Sized for the deepest lookahead the up-proj K-loop uses ──
+      // ── Sized for the 4-deep weight TMA lookahead ──
       //
-      // The default 1-deep lookahead (steady-state pipeline) only uses
-      // slots [0, 1].  The 2-deep lookahead variant (gated on
-      // `MONO_PROFILE_BARW_4DEEP`) uses all four slots to stagger the
+      // The up-proj K-loop uses all four slots to stagger the
       // cross-expert stitch one iter earlier, giving DRAM more time to
       // drain between the stitch and the next expert's iter-1 weight
       // TMA.  The down-proj path (which has its own pipeline structure)
@@ -1302,9 +1470,8 @@ struct MoE_SHM {
       //
       // Note on SHM impact: `w_wgmma` is unioned with `w_down_wgmma` at
       // 128 KB (DOWN_COL_TILE=256, K_STEP_DOWN=256), which dominates
-      // the union regardless of `w_wgmma`'s slot count.  Widening
-      // `w_wgmma[2]` to `w_wgmma[4]` (also gated on the same macro,
-      // see below) does not increase the union size.
+      // the union regardless of `w_wgmma`'s slot count.  The 4-slot
+      // `w_wgmma[4]` (see above) does not increase the union size.
       //
       // Down-projection activation-tile mbarriers (one per double-
       // buffer slot).  Used EXCLUSIVELY by the down-projection
@@ -1319,11 +1486,7 @@ struct MoE_SHM {
       //
       // `alignas(16)` satisfies R11.4 and the 16-byte alignment that the
       // SM90 `mbarrier.*.shared::cta.b64` instructions require.
-  #ifdef MONO_PROFILE_BARW_4DEEP
-      alignas(16) uint64_t bar_w[4];  // 32 B (2-deep lookahead)
-  #else
-      alignas(16) uint64_t bar_w[2];  // 16 B (1-deep lookahead)
-  #endif
+      alignas(16) uint64_t bar_w[4];  // 32 B (4-deep weight lookahead)
       alignas(16) uint64_t bar_a[2];  // 16 B
 
       // ── NEW: routing-window mbarrier (Req 1.5, 1.6) ─────────────────
@@ -1419,32 +1582,96 @@ struct MoE_SHM {
       // contribution".  Sized to `Dims::BS = 8` bytes — negligible
       // SHM overhead.
       uint8_t rank_for_tok[Dims::BS];
-  #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
       // Per-expert per-token cached top-k INDEX for the up-proj
-      // SiLU+fp8 quant writeback under DEFER.  For each token `tok`,
-      // holds the smallest `k ∈ [0, top_k)` such that
+      // SiLU+fp8 quant writeback.  For each token `tok`, holds the
+      // smallest `k ∈ [0, top_k)` such that
       // `topk_ids_flat[tok*MAX_TOPK + k] == id`, or sentinel `0xFF`
       // if no such `k` exists (token does not route through this
       // expert).
       //
-      // Computed once per expert by 8 calc threads at the K-loop
-      // tail (no extra sync — published by the existing wgmma_out
-      // publish `__syncthreads()`).  Read by the deferred SiLU body
-      // on prefetch warps inside the next expert's K-loop iters
-      // 0/1, replacing the 8-iter scan.
+      // ── Two consumers (mutually exclusive in default builds) ──
+      //   1. V1 (`use_pair_layout<Dims>::value == false`) +
+      //      `MONO_PROFILE_DEFER_UP_EPILOGUE`: populated once per
+      //      expert by 8 calc threads at the K-loop tail (no extra
+      //      sync — published by the existing wgmma_out publish
+      //      `__syncthreads()`); read by the deferred SiLU body on
+      //      prefetch warps inside the NEXT expert's K-loop iters
+      //      0/1, replacing the 8-iter scan.
+      //   2. V2 (`use_pair_layout<Dims>::value == true`): populated
+      //      at the TOP of each expert's K-loop (before the existing
+      //      up_scale[0] publish `__syncthreads()` — that same sync
+      //      publishes the cache); read by the per-lane Pair_Layout
+      //      epilogue at the K-loop tail to apply the routing weight
+      //      `rw` and pick the writeback row.  Always-on for V2 so
+      //      the per-lane combine in registers can do an O(1) cache
+      //      read instead of an 8-iter scan over `topk_ids_flat`.
       //
-      // ── Why DEFER-only ──
-      // The inline path also does the topk scan but every (lane, tok)
-      // pair is broadcasting the same SHM bytes — bank-conflict-free,
-      // cheap.  The deferred path runs the scan CONCURRENTLY with
-      // calc-warp WGMMA which contends for SHM banks; that's where
-      // the scan stretches from ~0.05 µs to ~0.46 µs.  The cache
-      // replaces the contended scan with a single `[tok]` byte read
-      // from a hot SHM cacheline.
+      // ── Why V1+inline doesn't need it ──
+      // The V1 inline path also does the topk scan but every
+      // (lane, tok) pair broadcasts the same SHM bytes — bank-
+      // conflict-free, cheap.  The deferred path runs the scan
+      // CONCURRENTLY with calc-warp WGMMA which contends for SHM
+      // banks; that's where the scan stretches from ~0.05 µs to
+      // ~0.46 µs.  The cache replaces the contended scan with a
+      // single `[tok]` byte read from a hot SHM cacheline.  V2
+      // benefits the same way: the per-lane combine reads the
+      // cache once per (lane, tok) pair instead of scanning topk.
       //
-      // SHM cost: 8 bytes per block (Dims::BS = 8).
-      uint8_t up_rank_for_tok[Dims::BS];
-  #endif
+      // ── Conditional extent (BS64 byte-identity) ──
+      // The cache is allocated (`UP_RANK_FOR_TOK_LEN = Dims::BS`) when
+      // `use_pair_layout<Dims>::value` is true (the BS8 V2 path);
+      // otherwise the extent collapses to 0 so the BS64 path's
+      // `tiny_wgmma_tma` size and PTX stay byte-identical.  The field
+      // sits at the END of the struct, so its presence/absence does
+      // not shift any other field's offset.
+      //
+      // SHM cost: +8 bytes for the BS8 V2 path (Dims::BS = 8);
+      // 0 bytes for BS64.
+      static constexpr uint32_t UP_RANK_FOR_TOK_LEN =
+          (use_pair_layout<Dims>::value ? Dims::BS : 0u);
+      uint8_t up_rank_for_tok[UP_RANK_FOR_TOK_LEN];
+      // V2 (and V1+DEFER) only: per-token routing weight `rw`,
+      // precomputed at the cache-populate site so the up-proj
+      // epilogue reads a single independent SHM float instead of the
+      // 2-deep dependent chain `up_rank_for_tok[tok]` ->
+      // `topk_weights_flat[tok*MAX_TOPK + k]` (the address depends on
+      // the rank `k`, so the second load can't issue until the first
+      // returns).  The populate loop already holds `k` in a register
+      // when it writes `up_rank_for_tok`, so computing `rw` there is
+      // free of an extra dependent load AND runs on calc warps that
+      // are otherwise idle during the PF warp's up_scale GM load.
+      //
+      // Holds the fp32 routing weight for the token's match against
+      // the current expert, or 0.0f when the token does not route to
+      // this expert (sentinel `up_rank_for_tok[tok] == 0xFF`).  Same
+      // conditional extent as `up_rank_for_tok` so BS64 stays
+      // byte-identical.
+      static constexpr uint32_t UP_RW_FOR_TOK_LEN = UP_RANK_FOR_TOK_LEN;
+      S_element up_rw_for_tok[UP_RW_FOR_TOK_LEN];
+      // V2+DEFER only: previous expert's `up_rank_for_tok` snapshot.
+      //
+      // The PF body of expert e+1 (running at iters 0/1 of e+1's
+      // K-loop) needs expert e's per-token rank to look up the
+      // correct row in `sorted_slot` when draining expert e's
+      // post_silu_scratch.  However, the V2 cache populate at e+1's
+      // K-loop top (followed by the up_scale publish sync) overwrites
+      // `up_rank_for_tok` with e+1's ranks BEFORE the PF body runs —
+      // so the PF body reads e+1's ranks instead of e's.
+      //
+      // Fix: at the calc-warp epilogue of expert e (just before the
+      // inter-expert sync), 8 calc threads copy
+      // `up_rank_for_tok[tok] -> up_rank_for_tok_prev[tok]`.  The
+      // existing inter-expert `__syncthreads()` then publishes that
+      // snapshot to PF warps for the next expert's iters 0/1.  PF
+      // body reads `up_rank_for_tok_prev[tok]` instead of
+      // `up_rank_for_tok[tok]`.
+      //
+      // Extent: Dims::BS bytes for the BS8 V2 path, 0 otherwise.
+      // Field sits at the END of the struct so its
+      // presence/absence does not shift any other field's offset.
+      static constexpr uint32_t UP_RANK_FOR_TOK_PREV_LEN =
+          (use_pair_layout<Dims>::value ? Dims::BS : 0u);
+      uint8_t up_rank_for_tok_prev[UP_RANK_FOR_TOK_PREV_LEN];
     } tiny_wgmma_tma;
 
     // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────

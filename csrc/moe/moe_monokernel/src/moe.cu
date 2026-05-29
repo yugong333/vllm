@@ -122,8 +122,7 @@ __device__ void moe_kernel_topk_BS8(
     // so a consumer will never block on an uninitialized parity.
     mbarrier_init(&u_tma->bar_w[0], 1u);
     mbarrier_init(&u_tma->bar_w[1], 1u);
-#ifdef MONO_PROFILE_BARW_4DEEP
-    // 2-deep up-proj weight pipeline: slots 2 and 3 hold lookahead
+    // 4-deep up-proj weight pipeline: slots 2 and 3 hold lookahead
     // tiles `(s+2) & 3` issued at iter `s`.  Initializing them in
     // the prologue (rather than re-initializing in the up-proj
     // helper) reuses the existing fence_mbarrier_init_release_cluster
@@ -132,7 +131,6 @@ __device__ void moe_kernel_topk_BS8(
     // down-proj re-init and stay armed-or-idle accordingly.
     mbarrier_init(&u_tma->bar_w[2], 1u);
     mbarrier_init(&u_tma->bar_w[3], 1u);
-#endif
     // Phase-1 routing-window mbarrier (Req 1.6). Single mbarrier with
     // arrival_count = 1 and tx_bytes = BS * K_BLOCKS_TOTAL *
     // K_STEP_WGMMA * sizeof(A_element) (= 32 KB for Qwen3.5). Armed by

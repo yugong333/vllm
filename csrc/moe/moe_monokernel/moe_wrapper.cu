@@ -30,17 +30,6 @@
 // bottom of this file).
 static_assert(
     offsetof(moe_monokernel::MoEGemmSpec<
-                 moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
-             temp_fp8) ==
-        moe_monokernel::MoEGemmSpec<
-            moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::
-            TEMP_FP8_OFFSET,
-    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
-    "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
-    "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
-    "MoEGemmSpec<Dims> (spec R13.3).");
-static_assert(
-    offsetof(moe_monokernel::MoEGemmSpec<
                  moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>,
              temp_fp8) ==
         moe_monokernel::MoEGemmSpec<
@@ -50,6 +39,17 @@ static_assert(
     "Dims_BS64_E256_Qwen3_5_35B_BlockFP8. Do not insert fields before "
     "temp_fp8; grid_barrier / partial_barrier belong at the tail of "
     "MoEGemmSpec<Dims> (spec R13.3).");
+static_assert(
+    offsetof(moe_monokernel::MoEGemmSpec<
+                 moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
+             temp_fp8) ==
+        moe_monokernel::MoEGemmSpec<
+            moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::
+            TEMP_FP8_OFFSET,
+    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
+    "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert "
+    "fields before temp_fp8; grid_barrier / partial_barrier belong at the "
+    "tail of MoEGemmSpec<Dims> (spec R13.3).");
 
 /**
  * @brief Macro that expands to a kernel call wrapper for moe_kernel_topk with
@@ -272,13 +272,16 @@ MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
     moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
 
-// TMA + WGMMA + SWIZZLE_128B variant of the BS8 path — the only BS8
-// implementation.  Selects the TMA-based weight + activation load path
-// in Phase 3 via `KernelConfig::USE_TMA = true`.  Up-projection weights
-// must be repacked via `interleave_for_tma_wgmma_up` (gate/up row
-// interleave for single-issue TMA); down-projection weights are passed
-// raw row-major (the TMA hardware applies the core-matrix XOR swizzle
-// at write time).
+// Pair_Layout V2 of the BS8 TMA + WGMMA path
+// (`up-proj-gate-up-pair-layout` spec R9.4).  This is the ONLY BS8
+// implementation: TMA-based weight + activation load (Phase 3,
+// `KernelConfig::USE_TMA = true`), 4-deep weight TMA lookahead, a
+// deferred up-projection epilogue, and the gate/up pair layout
+// (`KernelConfig::USE_PAIR_LAYOUT = true`).  Up-projection weights
+// must be repacked via `interleave_for_tma_wgmma_up_v2` in Python
+// (gate/up pair interleave for single-issue TMA); down-projection
+// weights are passed raw row-major (the TMA hardware applies the
+// core-matrix XOR swizzle at write time).
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl,
     moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA)

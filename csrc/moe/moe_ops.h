@@ -80,19 +80,11 @@ void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
     bool renormalize);
-// WGMMA variant of the BS8 kernel — the only BS8 implementation. Switches
-// Phase 3 (up-proj) to wgmma.mma_async.
-void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl(
-    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
-    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
-// TMA + WGMMA variant of the BS8 kernel.  Same shape as the WGMMA reference
-// kernel above; selects the TMA-based weight + activation load path in
-// Phase 3 (spec R8.1, R8.2).
+// Pair_Layout V2 of the BS8 TMA + WGMMA path
+// (`up-proj-gate-up-pair-layout` spec R9.4).  This is the only BS8 TMA
+// implementation: TMA-based weight + activation load, 4-deep weight TMA
+// lookahead, deferred up-projection epilogue, and the gate/up pair
+// layout (`KernelConfig::USE_PAIR_LAYOUT = true`).
 void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
     const torch::Tensor& activations_in, const torch::Tensor& router_logits,
     const torch::Tensor& expert_weights_up,

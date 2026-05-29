@@ -117,17 +117,21 @@ struct Dims_BS64_E256_Qwen3_5_35B_BlockFP8 {
 //     WGMMA descriptors reference them directly.
 //
 // The rest of the kernel (BS8 down-proj, BS64 paths) is unchanged.
-// ── BS8 WGMMA kernel (TMA + SWIZZLE_128B) ───────────────────────────────
-// Single BS8 variant: TMA + WGMMA with SWIZZLE_128B on both weight sides.
+// ── BS8 WGMMA kernel — Pair_Layout V2 (gate/up paired in M dim) ─────────
+// The single BS8 TMA + WGMMA + SWIZZLE_128B variant.
+//
 // Callers MUST NOT pre-interleave the weights for canonical Major::K
 // byte order — the TMA hardware applies the 8-row × 128-byte core-matrix
-// XOR swizzle at write time.
+// XOR swizzle at write time.  Up-projection weights MUST be repacked via
+// `interleave_for_tma_wgmma_up_v2` (gate/up PAIR interleave) so a single
+// 128×128 TMA fetches one full WGMMA A-tile in the pair layout.  Down-
+// projection weights are passed RAW row-major `[E, K, N]`.  Activation B
+// operands always use SWIZZLE_NONE.
 //
-// Up-projection weights MUST be repacked via
-// `interleave_for_tma_wgmma_up` (gate/up row interleave) so a single
-// 128×128 TMA fetches one full WGMMA A-tile.  Down-projection weights
-// are passed RAW row-major `[E, K, N]`.  Activation B operands always
-// use SWIZZLE_NONE.
+// `KernelConfig::USE_PAIR_LAYOUT = true` opts the up-projection kernel
+// into the Pair_Layout register-resident per-expert epilogue (see
+// design.md "Up-Projection Gate/Up Pair Layout").  Selection is via the
+// `use_pair_layout<Dims>` SFINAE helper in moe_internal.h.
 struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -150,24 +154,12 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     static constexpr std::uint32_t GRID_SIZE = 128;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
     static constexpr bool USE_WGMMA = true;
-    // Enables the TMA-based weight + activation load path in Phase 3 of
-    // the BS8 WGMMA up-projection kernel.
     static constexpr bool USE_TMA = true;
-    // Down-projection outer K-step width (must be a multiple of 128).
-    // Default 128 matches the SWZ128 atom K-width and reproduces the
-    // legacy single-substep behaviour.  Set to 256 to halve the number
-    // of outer K-iterations (Dims::N / K_STEP_DOWN), at the cost of
-    // doubling the per-slot weight tile in SHM.  See `down_k_step` in
-    // moe_internal.h for the cost breakdown.
     static constexpr std::uint32_t K_STEP_DOWN = 256;
-    // Up-projection outer K-step width (must be a multiple of 128).
-    // Default 128 matches the SWZ128 atom K-width and reproduces the
-    // legacy single-substep behaviour.  Set to 256 to halve the number
-    // of outer K-iterations (Dims::HIDDEN_STATES / K_STEP_UP), at the
-    // cost of doubling the per-slot bf16/fp8 activation tile and the
-    // per-slot weight tile in SHM.  See `up_k_step` in moe_internal.h
-    // for the cost breakdown.
     static constexpr std::uint32_t K_STEP_UP = 256;
+    // Opts into the Pair_Layout up-projection epilogue, selected via the
+    // `use_pair_layout<Dims>` SFINAE helper.
+    static constexpr bool USE_PAIR_LAYOUT = true;
   };
 };
 

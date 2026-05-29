@@ -1185,6 +1185,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # Uncomment the next line to enable debug printf in the monokernel:
     # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   PROPERTIES COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
+    # NOTE: use APPEND, not set_source_files_properties — see the
+    # `IMPORTANT` warning further down (line ~1133).  Enable
+    # transiently to debug the V2+DEFER post_silu_scratch staging
+    # (`up-proj-gate-up-pair-layout` Phase 6.5).  Disabled now that
+    # the up_rank_for_tok_prev snapshot fix is verified correct.
+    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+    #   APPEND PROPERTY COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
 
     # Focused WGMMA input/output debug: prints the A (weight) and B
     # (activation) SHM tiles for block 0, expert 0, first K-step, plus
@@ -1251,47 +1258,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_UP_EPILOGUE")
 
-    # A/B test the inline vs deferred up-proj epilogue.  When this
-    # flag is defined, the per-expert SiLU+fp8-quant writeback runs
-    # on prefetch warps at iters 0/1 of the NEXT expert (4 prefetch
-    # warps × 1 token per iter, 8 tokens total).  Calc warps run
-    # iter-0/iter-1 WGMMAs in parallel.  The LAST expert has no
-    # next iter-0 to defer to and runs its writeback inline after
-    # the expert loop.  Output is CORRECT under this flag (numerics
-    # preserved); only the placement of the helper changes.
-    #
-    # Use to A/B-test against the inline path with the same
-    # phase-timing instrumentation enabled — `t_up_after_expert0_*`
-    # and `t_up_e1_iter0_*` capture the per-stage cost in both
-    # configurations.
-    #
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_DEFER_UP_EPILOGUE")
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_DEFER_UP_EPILOGUE")
+    # The per-expert up-proj SiLU+fp8-quant writeback is now
+    # UNCONDITIONALLY deferred: it runs on prefetch warps at iters 0/1
+    # of the NEXT expert (4 prefetch warps × 1 token per iter, 8 tokens
+    # total).  Calc warps run iter-0/iter-1 WGMMAs in parallel.  The
+    # LAST expert has no next iter-0 to defer to and runs its writeback
+    # inline after the expert loop.  This is part of the single BS8
+    # design (V2 Pair_Layout + 4-deep weight TMA lookahead + deferred
+    # epilogue) and no longer behind a compile-time flag.
 
-    # Staggered-TMA up-proj weight pipeline.  When this flag is
-    # defined, the up-proj K-loop uses a 2-iter lookahead (bar_w[4]
-    # + w_wgmma[4] + parity_w[4]) instead of the default 1-iter
-    # lookahead (bar_w[2] + w_wgmma[2]).  The launcher fires
-    # iter-(s+2) at iter `s`, and the cross-expert "stitch" splits
-    # into two arms at e0's last two K-iters (iter K_TILES-2 fetches
-    # next expert's iter-0; iter K_TILES-1 fetches next expert's
-    # iter-1).  This gives DRAM more time to drain between the
-    # cross-expert TMAs and the next expert's iter-1 weight TMA,
-    # eliminating the iter-1 wait stretch observed at every
-    # cross-expert boundary in the default pipeline.
-    #
-    # Output is CORRECT under this flag (numerics preserved); only
-    # the TMA scheduling changes.  SHM cost: 0 (`w_wgmma[4]` is
-    # unioned with `w_down_wgmma` at 128 KB, which already
-    # dominates the union; widening `w_wgmma` from 64 KB to 128 KB
-    # is therefore free in SHM terms).
-    #
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_BARW_4DEEP")
-    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-      APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_BARW_4DEEP")
+    # The up-proj K-loop UNCONDITIONALLY uses a 4-deep weight TMA
+    # lookahead (bar_w[4] + w_wgmma[4] + parity_w[4]).  The launcher
+    # fires iter-(s+2) at iter `s`, and the cross-expert "stitch"
+    # splits into two arms at e0's last two K-iters (iter K_TILES-2
+    # fetches next expert's iter-0; iter K_TILES-1 fetches next
+    # expert's iter-1).  This gives DRAM more time to drain between the
+    # cross-expert TMAs and the next expert's iter-1 weight TMA.  SHM
+    # cost: 0 (`w_wgmma[4]` is unioned with `w_down_wgmma` at 128 KB,
+    # which already dominates the union).
 
     # Phase-timing instrumentation — uncomment to enable per-phase
     # clock64() timestamps written by block 0, thread 0.  Read back

@@ -51,10 +51,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
          &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
 
-  // TMA + WGMMA variant of the BS8 kernel — the only BS8 implementation.
-  // Selects USE_TMA=true via KernelConfig.  Callers must pre-interleave
-  // up-projection weights via `interleave_for_tma_wgmma_up` (Python).
-  // Down-projection weights are passed RAW — the TMA hardware applies
+  // Pair_Layout V2 of the BS8 TMA + WGMMA path
+  // (`up-proj-gate-up-pair-layout` spec R9.4).  This is the only BS8
+  // TMA op: USE_TMA=true, 4-deep weight TMA lookahead, deferred
+  // up-projection epilogue, and KernelConfig::USE_PAIR_LAYOUT = true
+  // (gate/up pair layout).  Callers must pre-interleave up-projection
+  // weights via `interleave_for_tma_wgmma_up_v2` (Python).  Down-
+  // projection weights are passed RAW — the TMA hardware applies
   // SWIZZLE_128B at write time.
   m.def(
       "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(Tensor "

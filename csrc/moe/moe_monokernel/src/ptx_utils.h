@@ -64,6 +64,35 @@ __device__ static inline void copy128(
   cuda::memcpy_async(&dest, &source, shape4, pipeline);
 }
 
+// ── Lightweight cp.async scalar helpers (sm_80+) ──────────────────────────
+//
+// Used for small, latency-sensitive prefetches (e.g. the per-expert
+// block-scale tile in the up-projection K-loop) where we want to issue
+// a non-blocking 4-byte global→shared copy and overlap its DRAM latency
+// with compute, then drain it with a commit/wait_group pair.  Distinct
+// from the `cuda::pipeline`-based `copy128` above so the scale prefetch
+// doesn't share a pipeline object with the activation loader.
+//
+// `cp_async_cg_4` issues a single 4-byte `cp.async.ca.shared.global`.
+// `cp_async_commit_group` checkpoints all cp.async issued since the last
+// commit. `cp_async_wait_all` blocks until every committed group lands.
+__device__ static inline void cp_async_cg_4(void* smem_dst,
+                                            const void* gmem_src) {
+  const std::uint32_t smem_addr =
+      static_cast<std::uint32_t>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr),
+               "l"(gmem_src));
+}
+
+__device__ static inline void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <std::uint32_t N>
+__device__ static inline void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+
 // ── Hopper WGMMA (sm_90a) helpers ─────────────────────────────────────────
 //
 // These thin wrappers expose the `wgmma.mma_async` family of instructions
