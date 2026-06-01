@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -29,6 +30,11 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
+from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
+    interleave_for_tma_wgmma_up_v2,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
@@ -588,11 +594,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # Scratchpad for MoE monokernel fast path (Qwen3.5-35B FP8 block-wise)
         # Layout: BS x E x N fp8 + BS x E x N/2 fp8 + BS x HIDDEN fp16
         # with BS=1024: 4MB + <1MB + 10MB < 4M x 4byte
-        self.moe_monokernel_scratchpad = torch.empty(
+        #
+        # Allocate ZEROED (not empty): the software grid/partial barriers in
+        # the monokernel (src/moe_grid_barrier.h) spin on counter slots that
+        # live at the tail of this scratchpad and MUST start at 0 on first
+        # use (self-maintaining via ping-pong reset thereafter). The kernel
+        # is launched standalone (non-cooperative) so it can be captured into
+        # a CUDA Graph; the wrapper's one-shot cudaMemsetAsync would be
+        # *recorded* (not executed) if it first runs during graph capture,
+        # leaving the counters uninitialized and deadlocking the barrier
+        # spin. Zeroing here guarantees valid counters before the first
+        # (capture-time) launch. Matches test_monokernel_accuracy.py.
+        self.moe_monokernel_scratchpad = torch.zeros(
             (1024, 4096),
             dtype=torch.float32,
             device="cpu",
         )
+        # Whether this layer is eligible for the MoE monokernel fast path.
+        # Determined after weight loading in process_weights_after_loading.
+        self._use_moe_monokernel = False
 
         # Set weight key and activation key for kernel compatibility
         if self.block_quant:
@@ -844,6 +864,58 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
         )
 
+        # Decide whether the MoE monokernel fast path is eligible for this
+        # layer. The monokernel only supports the Qwen3.5-35B FP8 block-wise
+        # shape (E=256, K=2048, N=2*512=1024) with top_k>1, and requires the
+        # raw (unshuffled) block-wise FP8 weight layout. Only the TRITON
+        # backend preserves that layout (convert_to_fp8_moe_kernel_format is a
+        # no-op there); backends like DEEPGEMM repack the weights and scales,
+        # so they are not eligible. Larger batches (M>64) fall back to the
+        # modular kernel inside apply_monolithic.
+        #
+        # Gated by VLLM_USE_MOE_MONOKERNEL (default on); set it to 0 to force
+        # the standard TRITON fused-MoE backend for A/B benchmarking.
+        self._use_moe_monokernel = (
+            envs.VLLM_USE_MOE_MONOKERNEL
+            and self.block_quant
+            and self.fp8_backend == Fp8MoeBackend.TRITON
+            and getattr(layer, "global_num_experts", 0) == 256
+            and layer.w13_weight.size(1) == 1024
+            and layer.w13_weight.size(2) == 2048
+            and getattr(layer, "top_k", 1) > 1
+        )
+        if self._use_moe_monokernel:
+            logger.info(
+                "MoE monokernel fast path ENABLED for %s "
+                "(E=256, N=1024, K=2048, top_k=%d, backend=%s)",
+                getattr(layer, "prefix", "<no-prefix>"),
+                getattr(layer, "top_k", 1),
+                self.fp8_backend.value,
+            )
+            # Pre-compute the BS8 (M<=8) gate/up PAIR interleave now, at
+            # load time, so the ~512 MiB/layer repack is reserved BEFORE
+            # vLLM's memory profiling sizes the KV cache. The repack is
+            # cached on the weight tensor's `_tma_interleaved_up_v2`
+            # attribute; the monokernel op checks that attribute first, so
+            # the decode-time path becomes a cache hit with no allocation.
+            # (The BS64 / prefill path uses the raw weights and needs no
+            # interleave.)
+            up_interleaved = interleave_for_tma_wgmma_up_v2(
+                layer.w13_weight
+            ).contiguous()
+            with contextlib.suppress(AttributeError, RuntimeError):
+                layer.w13_weight._tma_interleaved_up_v2 = up_interleaved
+
+            # Move the monokernel scratchpad to the weight device now, at
+            # load time. Doing the host->device move lazily inside
+            # apply_monolithic would run during CUDA graph capture, where a
+            # pageable H2D copy synchronizes the stream (illegal during
+            # capture -> hang) and the buffer would not have a stable
+            # address for graph replay.
+            self.moe_monokernel_scratchpad = self.moe_monokernel_scratchpad.to(
+                layer.w13_weight.device
+            )
+
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -885,6 +957,55 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def supports_eplb(self) -> bool:
         return True
 
+    @property
+    def is_monolithic(self) -> bool:
+        # Route eligible layers through apply_monolithic so the MoE monokernel
+        # fast path (which does its own routing from router_logits) can run.
+        # Otherwise defer to the base-class decision (driven by the selected
+        # modular kernel).
+        if getattr(self, "_use_moe_monokernel", False):
+            return True
+        return super().is_monolithic
+
+    def _apply_modular_fallback(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Route + run the standard modular kernel.
+
+        Used when the monokernel fast path is enabled for this layer but the
+        current batch does not satisfy the kernel's constraints (e.g. M > 64
+        during prefill).
+        """
+        assert self.moe_kernel is not None
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=layer.top_k,
+            use_grouped_topk=layer.use_grouped_topk,
+            renormalize=layer.renormalize,
+            topk_group=layer.topk_group,
+            num_expert_group=layer.num_expert_group,
+            custom_routing_function=layer.custom_routing_function,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        return self.moe_kernel.apply(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts_input=None,
+        )
+
     def apply_monolithic(
         self,
         layer: RoutedExperts,
@@ -893,6 +1014,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.is_monolithic
+
+        # MoE monokernel fast path (Qwen3.5-35B FP8 block-wise, E=256,
+        # N=1024, K=2048, top_k>1). The kernel only supports M<=64; larger
+        # batches (e.g. prefill) fall back to the modular kernel.
+        if getattr(self, "_use_moe_monokernel", False):
+            M = x.size(0)
+            if M <= 8:
+                # Scratchpad was moved to the weight device at load time
+                # (see process_weights_after_loading) so no host->device
+                # copy happens here — that would be illegal during CUDA
+                # graph capture.
+                top_k = layer.top_k
+                scoring_func = getattr(layer, "scoring_func", "softmax")
+                renormalize = getattr(layer, "renormalize", True)
+                return torch.ops.vllm.moe_monokernel_topk(
+                    x,
+                    router_logits,
+                    layer.w13_weight,
+                    getattr(layer, f"w13_{self.weight_scale_name}"),
+                    layer.w2_weight,
+                    getattr(layer, f"w2_{self.weight_scale_name}"),
+                    self.moe_monokernel_scratchpad,
+                    top_k,
+                    scoring_func,
+                    renormalize,
+                )
+            # Fall back to the modular kernel for large batches.
+            return self._apply_modular_fallback(layer, x, router_logits)
+
         assert self.moe_kernel is not None
         return self.moe_kernel.apply_monolithic(
             x,
