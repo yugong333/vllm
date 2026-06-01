@@ -26,10 +26,10 @@ Usage:
     python test_monokernel_accuracy.py                      # defaults to 'coder'
     python test_monokernel_accuracy.py --model coder        # Qwen3-Coder-30B-A3B
     python test_monokernel_accuracy.py --model qwen3.5      # (when available)
-    python test_monokernel_accuracy.py --model coder --no-perf
 """
 
 import argparse
+import contextlib
 import functools
 import os
 import sys
@@ -49,25 +49,27 @@ for _cand in (_here, os.path.join(_here, "vllm")):
         sys.path.insert(0, _cand)
         break
 
-import torch
-import torch.nn.functional as F
-import vllm._moe_C  # noqa
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+import vllm._moe_C  # noqa: E402,F401
 
-import vllm._custom_ops as ops
-import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.model_executor.layers.fused_moe.activation import (
+import vllm._custom_ops as ops  # noqa: E402
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk  # noqa: E402
+from vllm.model_executor.layers.fused_moe.activation import (  # noqa: E402
     MoEActivation,
     apply_moe_activation,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import (
+from vllm.model_executor.layers.fused_moe.fused_moe import (  # noqa: E402
     _get_config_dtype_str,
     _get_config_quant_dtype,
     dispatch_fused_moe_kernel,
     moe_align_block_size,
     try_get_optimal_moe_config,
 )
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.triton_utils import tl
+from vllm.model_executor.layers.fused_moe.utils import (  # noqa: E402
+    moe_kernel_quantize_input,
+)
+from vllm.triton_utils import tl  # noqa: E402
 
 # ── Model registry ──────────────────────────────────────────────────────────
 # Each entry maps a CLI name → dims + the torch op that dispatches to the
@@ -92,7 +94,7 @@ MODELS = {
         # Hopper cluster + DSHM + multicast-TMA variant of the BS8 path
         # (see `.kiro/specs/monokernel-cluster-multicast`). Selected via
         # the `--cluster` CLI flag; only meaningful on sm_90a.
-        "op_bs8_cluster": "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster",
+        "op_bs8_cluster": "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster",  # noqa: E501
         "op_bs64": "moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8",
     },
     "coder": {
@@ -182,10 +184,8 @@ def get_model_op(model_cfg, M, use_cluster=False):
                 cached_up = interleave_for_tma_wgmma_up_v2(
                     expert_weights_up
                 ).contiguous()
-                try:
+                with contextlib.suppress(AttributeError, RuntimeError):
                     setattr(expert_weights_up, cache_attr, cached_up)
-                except (AttributeError, RuntimeError):
-                    pass
 
             activations_out = torch.zeros_like(activations_in)
             sf = (
@@ -642,7 +642,7 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         scoring_func="softmax",
         renormalize=True,
     )
-    torch.accelerator.synchronize
+    torch.accelerator.synchronize()
 
     # ── WGMMA reference dump ─────────────────────────────────────────────
     # The kernel's WGMMA_INPUT_DEBUG printf dumps the A (weight) and B
@@ -663,7 +663,6 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         # Dequantize the first K=32 slab of expert_0's weights (first 64
         # rows: 32 gate rows + 32 up rows at offset N_HALF).
         w_fp8_slab = w13_fp8[expert_0_id]  # [2*N_HALF, K]
-        s13_slab = s13[expert_0_id]  # [up_rows, up_cols]
         # Gate rows [0..31] × K [0..31]
         w_gate_fp8 = w_fp8_slab[0:32, 0:32].float()
         # Up rows [N_HALF..N_HALF+31] × K [0..31]
@@ -775,7 +774,7 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     tri_out, tri_gemm1, tri_silu, tri_gemm2 = triton_with_intermediates(
         x, topk_w, topk_ids, w13_fp8, s13, w2_fp8, s2, N_HALF, K, E
     )
-    torch.accelerator.synchronize
+    torch.accelerator.synchronize()
 
     # ── 0. Routing ───────────────────────────────────────────────────────
     print(f"\n{sep}")
@@ -1056,10 +1055,7 @@ def main():
     N_HALF = model_cfg["N_HALF"]
     K = model_cfg["K"]
 
-    if args.cluster:
-        variant_tag = "  [WGMMA+TMA+CLUSTER]"
-    else:
-        variant_tag = "  [WGMMA+TMA]"
+    variant_tag = "  [WGMMA+TMA+CLUSTER]" if args.cluster else "  [WGMMA+TMA]"
 
     banner = "#" * 72
     print(banner)
@@ -1136,7 +1132,7 @@ def main():
     print(f"  {'-' * 12}  {'-' * 8}  {'-' * 9}  {'-' * 7}  {'-' * 6}")
     all_pass = True
     for label, r in acc_results.items():
-        ok = r["cuda_py"] > 0.99 if not (r["cuda_py"] != r["cuda_py"]) else False
+        ok = r["cuda_py"] > 0.99 if r["cuda_py"] == r["cuda_py"] else False
         if not ok:
             all_pass = False
         print(

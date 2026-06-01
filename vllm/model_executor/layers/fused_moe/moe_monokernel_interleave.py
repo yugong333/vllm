@@ -25,6 +25,8 @@ re-exports these functions for backwards compatibility with the standalone
 benchmark / accuracy scripts.
 """
 
+import contextlib
+
 import torch
 
 
@@ -99,10 +101,8 @@ def interleave_for_tma_wgmma_up(w_fp8: torch.Tensor) -> torch.Tensor:
     stripes = torch.stack([gate_lo, up_lo, gate_hi, up_hi], dim=2)
     result = stripes.reshape(E, blocks * 128, K).contiguous()
 
-    try:
+    with contextlib.suppress(AttributeError):
         w_fp8._tma_interleaved_up = result
-    except AttributeError:
-        pass
 
     return result
 
@@ -172,7 +172,8 @@ def interleave_for_tma_wgmma_up_v2(w_fp8: torch.Tensor) -> torch.Tensor:
     up_wg1 = up_r[:, :, 32:, :].reshape(E, blocks, 4, 8, K)
 
     # For each warp, interleave gate(8 rows) then up(8 rows) = 16 rows
-    # WG0: [gate_w0(8), up_w0(8), gate_w1(8), up_w1(8), gate_w2(8), up_w2(8), gate_w3(8), up_w3(8)]
+    # WG0: [gate_w0(8), up_w0(8), gate_w1(8), up_w1(8),
+    #       gate_w2(8), up_w2(8), gate_w3(8), up_w3(8)]
     # = 64 rows for WG0, then same for WG1 = 128 rows total per block.
     # Stack gate and up along a new axis: [E, blocks, 4warps, 2(gate/up), 8rows, K]
     wg0_interleaved = torch.stack([gate_wg0, up_wg0], dim=3)  # [E, b, 4, 2, 8, K]
@@ -186,9 +187,7 @@ def interleave_for_tma_wgmma_up_v2(w_fp8: torch.Tensor) -> torch.Tensor:
     result = torch.cat([wg0_flat, wg1_flat], dim=2)
     result = result.reshape(E, blocks * 128, K).contiguous()
 
-    try:
+    with contextlib.suppress(AttributeError, RuntimeError):
         w_fp8._tma_interleaved_up_v2 = result
-    except (AttributeError, RuntimeError):
-        pass
 
     return result
