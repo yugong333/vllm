@@ -1003,8 +1003,10 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             renormalize = getattr(layer, "renormalize", False)
             # logger.info("top_k=%d", top_k)
 
-            if top_k > 1:
-                # Use the top-K monokernel variant
+            if top_k > 1 and M <= 8:
+                # Use the top-K monokernel variant (BS8 TMA+WGMMA only —
+                # the BS64 path has been removed, so M>8 falls through to
+                # the modular kernel below).
                 logger.info("using topK variant monokernel")
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
@@ -1019,17 +1021,19 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     renormalize,
                 )
 
-            # Original top-1 sigmoid path (Llama4 Scout/Maverick)
-            # logger.info("moe_monokernel active: M=%d, E=%d, N=%d, K=%d", M, E, N, K)
-            return torch.ops.vllm.moe_monokernel(
-                x,
-                router_logits,
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                self.moe_monokernel_scratchpad,
-            )
+            if top_k == 1:
+                # Original top-1 sigmoid path (Llama4 Scout/Maverick)
+                # logger.info("moe_monokernel active: M=%d, E=%d, N=%d, K=%d",
+                #             M, E, N, K)
+                return torch.ops.vllm.moe_monokernel(
+                    x,
+                    router_logits,
+                    layer.w13_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight,
+                    layer.w2_weight_scale,
+                    self.moe_monokernel_scratchpad,
+                )
 
         # Fallback: do routing here and call the standard kernel
         assert self.moe_kernel is not None

@@ -9,20 +9,36 @@
 
 #include "src/moe.cu"
 
-// ── TEMP_FP8_OFFSET regression anchor ──────────────────────────────────────
+// ── TEMP_FP8_OFFSET regression anchor (spec R13.3) ─────────────────────────
 //
 // The host-side down-activation TMA descriptor factory below computes the
 // device pointer to `spec->temp_fp8` as
 //   `scratchpad_ptr + MoEGemmSpec<Dims>::TEMP_FP8_OFFSET`
 // so `TEMP_FP8_OFFSET` MUST stay byte-identical to
 // `offsetof(MoEGemmSpec<Dims>, temp_fp8)` for every instantiated `Dims`
-// variant.  This invariant matters when appending new barrier-counter
-// fields to the tail of `MoEGemmSpec<Dims>`: as long as every new field
-// lands AFTER `temp_fp8` (grid_barrier / partial_barrier belong at the
-// tail), the offset stays fixed and the TMA descriptor continues to
-// address the right bytes.  A future refactor that silently reorders the
-// struct layout would otherwise be caught only at runtime by corrupted
-// TMA fetches — the static_assert below makes it a compile-time error.
+// variant.  This is exactly the invariant that the software-grid-sync
+// spec (R13.3) relies on when appending new barrier-counter fields to
+// the tail of `MoEGemmSpec<Dims>`: as long as every new field lands
+// AFTER `temp_fp8` (grid_barrier / partial_barrier belong at the tail),
+// the offset stays fixed and the TMA descriptor continues to address
+// the right bytes.  A future refactor that silently reorders the struct
+// layout would otherwise be caught only at runtime by corrupted TMA
+// fetches — the static_asserts below make it a compile-time error.
+//
+// Covers both Dims variants instantiated by this TU (see the two
+// `MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION` macro invocations at the
+// bottom of this file).
+static_assert(
+    offsetof(moe_monokernel::MoEGemmSpec<
+                 moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>,
+             temp_fp8) ==
+        moe_monokernel::MoEGemmSpec<
+            moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8>::
+            TEMP_FP8_OFFSET,
+    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
+    "Dims_BS64_E256_Qwen3_5_35B_BlockFP8. Do not insert fields before "
+    "temp_fp8; grid_barrier / partial_barrier belong at the tail of "
+    "MoEGemmSpec<Dims> (spec R13.3).");
 static_assert(
     offsetof(moe_monokernel::MoEGemmSpec<
                  moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
@@ -33,7 +49,7 @@ static_assert(
     "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
     "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert "
     "fields before temp_fp8; grid_barrier / partial_barrier belong at the "
-    "tail of MoEGemmSpec<Dims>.");
+    "tail of MoEGemmSpec<Dims> (spec R13.3).");
 
 /**
  * @brief Macro that expands to a kernel call wrapper for moe_kernel_topk with
@@ -95,8 +111,8 @@ static_assert(
     const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);                   \
     const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);             \
                                                                                \
-    /* TMA descriptors for the BS8 WGMMA up-projection path and                \
-       down-projection path.  Non-TMA                                          \
+    /* TMA descriptors for the BS8 WGMMA up-projection path (spec R6.2,        \
+       R6.3) and down-projection path (spec R9.1, R9.2, R9.3).  Non-TMA        \
        variants leave these zero-initialized — the kernel parameters are     \
        always present on the signature but the TMA path is the only            \
        consumer.  TMA-enabled variants build real descriptors via the          \
@@ -188,8 +204,8 @@ static_assert(
                 fa.sharedSizeBytes, max_blocks_per_sm, sm_count,               \
                 max_blocks_per_sm * sm_count, smem_opt_in);                    \
         /* Hard co-residency assertions for the software grid barrier          \
-           "Co-residency assertions".  The seed-atomicAdd-spin-on-high-bit     \
-           protocol                                                            \
+           (spec R4.1, R4.2, R4.3 / Design Component C "Co-residency           \
+           assertions").  The seed-atomicAdd-spin-on-high-bit protocol         \
            in src/moe_grid_barrier.h is only deadlock-free when every          \
            participating block is co-resident on the GPU for the full          \
            lifetime of the kernel: (1) grid_size <= SM count so every          \
@@ -203,19 +219,20 @@ static_assert(
             dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count),  \
             "moe_monokernel requires GRID_SIZE (=",                            \
             dims::KernelConfig::GRID_SIZE, ") <= SM count (=", sm_count,       \
-            ") for software grid barrier co-residency invariant.");            \
+            ") for software grid barrier co-residency invariant "              \
+            "(spec R4.1).");                                                   \
         /*TORCH_CHECK(max_blocks_per_sm == 1,                                  \
                     "moe_monokernel requires max_active_blocks_per_SM == 1 "   \
                     "(observed ",                                              \
                     max_blocks_per_sm,                                         \
-                    ") for co-residency invariant. See "                       \
+                    ") for co-residency invariant (spec R4.2). See "           \
                     "__launch_bounds__(BLOCK_SIZE, 1) and the SHM budget "     \
                     "requirement.");*/                                         \
         _diag_printed = true;                                                  \
       }                                                                        \
     }                                                                          \
-    /* One-shot scratchpad zero-init                                           \
-       ("Scratchpad barrier counter zero-initialization").  The software       \
+    /* One-shot scratchpad zero-init (spec R13.2 / Design Component C          \
+       "Scratchpad barrier counter zero-initialization").  The software        \
        Grid_Barrier / Partial_Barrier counters live at the tail of             \
        MoEGemmSpec<Dims> inside the scratchpad, and the                        \
        seed-atomicAdd-spin-on-high-bit protocol requires the barrier slots     \
@@ -238,7 +255,8 @@ static_assert(
     }                                                                          \
     /* Standard (non-cooperative) launch.  The kernel reaches grid-wide        \
        happens-before via the software Grid_Barrier / Partial_Barrier          \
-       primitives in `src/moe_grid_barrier.h` rather than                      \
+       primitives in `src/moe_grid_barrier.h` (spec R1.1, R5.1, Design         \
+       Component C "Launch form") rather than                                  \
        `cooperative_groups::this_grid().sync()`.  Using standard               \
        `cudaLaunchKernel` is what lets the migrated kernel be captured         \
        into a CUDA Graph. */                                                   \
@@ -248,7 +266,14 @@ static_assert(
                                 kernel_args, shmem_size, stream));             \
   }
 
-// Pair_Layout V2 of the BS8 TMA + WGMMA path.  This is the ONLY BS8
+// Qwen3.5-35B FP8 block-wise (128×128) quantization (E=256, K=2048, N=512,
+// TP=1)
+MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
+    moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl,
+    moe_monokernel::Dims_BS64_E256_Qwen3_5_35B_BlockFP8)
+
+// Pair_Layout V2 of the BS8 TMA + WGMMA path
+// (`up-proj-gate-up-pair-layout` spec R9.4).  This is the ONLY BS8
 // implementation: TMA-based weight + activation load (Phase 3,
 // `KernelConfig::USE_TMA = true`), 4-deep weight TMA lookahead, a
 // deferred up-projection epilogue, and the gate/up pair layout

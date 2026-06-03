@@ -70,16 +70,6 @@ void shuffle_rows(const torch::Tensor& input_tensor,
                   torch::Tensor& output_tensor);
 
 #ifndef USE_ROCM
-// Top-K monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
-// (E=256, K=2048, N=512, TP=1)
-void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
-    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
-    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
 // Pair_Layout V2 of the BS8 TMA + WGMMA path
 // (`up-proj-gate-up-pair-layout` spec R9.4).  This is the only BS8 TMA
 // implementation: TMA-based weight + activation load, 4-deep weight TMA

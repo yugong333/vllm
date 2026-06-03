@@ -1030,7 +1030,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert self.is_monolithic
 
         # MoE monokernel fast path (Qwen3.5-35B FP8 block-wise, E=256,
-        # N=1024, K=2048, top_k>1). The kernel only supports M<=64; larger
+        # N=1024, K=2048, top_k>1). The kernel only supports M<=8; larger
         # batches (e.g. prefill) fall back to the modular kernel.
         if getattr(self, "_use_moe_monokernel", False):
             M = x.size(0)

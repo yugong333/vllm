@@ -136,8 +136,13 @@ def get_model_op(model_cfg, M, use_cluster=False):
     """
     if M <= 8 and use_cluster:
         key = "op_bs8_cluster"
+    elif M <= 8:
+        key = "op_bs8"
     else:
-        key = "op_bs8" if M <= 8 else "op_bs64"
+        raise RuntimeError(
+            f"Batch size M={M} > 8 is not supported: the BS64 monokernel "
+            f"path has been removed. Use M <= 8 (the BS8 TMA+WGMMA path)."
+        )
     op_name = model_cfg.get(key)
     if op_name is None:
         raise RuntimeError(

@@ -275,18 +275,18 @@ template <typename Dims>
 struct MoEGemmSpec {
   static constexpr uint32_t SPEC_MAX_TOPK = 8;
   // Virtual batch size: each token may be routed to up to SPEC_MAX_TOPK
-  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows.
-  // The split-phase BS8 design writes one row per (token, expert) pair
-  // into spec->temp_fp8.
+  // experts, so the sorted temp buffer must hold BS * SPEC_MAX_TOPK rows. BS <=
+  // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
+  // writes one row per (token, expert) pair into spec->temp_bf16.
   static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
 
   // TMA path uses a tighter outer-axis extent that excludes the 8-row
   // padding above.  The padding exists only to guard against off-by-one
-  // writes; the BS8 WGMMA up-proj epilogue only ever writes to rows
-  // `[0, BS * SPEC_MAX_TOPK) = [0, 64)` via `sorted_slot`.
-  // `TEMP_ROWS_TMA = BS * SPEC_MAX_TOPK` (= 64 for Qwen3.5-35B) is the
-  // value passed to `create_down_activation_tma_desc` as the outer-axis
-  // `globalDim`.
+  // writes in the scalar/BS64 paths; the BS8 WGMMA up-proj epilogue only
+  // ever writes to rows `[0, BS * SPEC_MAX_TOPK) = [0, 64)` via
+  // `sorted_slot`.  `TEMP_ROWS_TMA = BS * SPEC_MAX_TOPK` (= 64 for
+  // Qwen3.5-35B) is the value passed to `create_down_activation_tma_desc`
+  // as the outer-axis `globalDim`.
   static constexpr uint32_t TEMP_ROWS_TMA = Dims::BS * SPEC_MAX_TOPK;
 
   #ifdef DEBUG_MOE
@@ -297,6 +297,14 @@ struct MoEGemmSpec {
   #endif
   AQ_element activations[Dims::BS]
                         [Dims::HIDDEN_STATES];  //< Quantized activations
+
+  // Up-projection SiLU output (BS64 path only).
+  //
+  // The BS64 down-projection fetches this bf16 intermediate and does a
+  // bf16→fp8 quantization with per-token block-wise scales on the fly
+  // before the MMA.  Storing this in bf16 (not fp32) halves the
+  // global-memory footprint and async-copy bandwidth.
+  A_element temp_bf16[TEMP_ROWS * Dims::N];
 
   // ── WGMMA-path-only up-proj → down-proj scratchpad ───────────────────
   // Used when `use_wgmma<Dims>::value == true`.  The up-projection
@@ -313,6 +321,9 @@ struct MoEGemmSpec {
   // For Qwen3.5-35B (BS=8, top_k=8, N=512): TEMP_ROWS = 72
   //   temp_fp8       = 72 ×  512 × 1 B = 36.0 KB
   //   temp_act_scale = 72 ×    8 × 4 B =  2.25 KB
+  //
+  // These are separate from temp_bf16 (kept for the scalar path) so
+  // non-WGMMA builds are byte-identical.
   static constexpr uint32_t DOWN_ACT_BLOCK_SIZE = 64;
   static_assert(Dims::N % DOWN_ACT_BLOCK_SIZE == 0,
                 "Dims::N must be a multiple of 64 for the WGMMA down-proj "
@@ -335,9 +346,10 @@ struct MoEGemmSpec {
 
   // Down-projection block / group layout:
   //   For the BS8 TMA+WGMMA variant (`use_tma<Dims>::value == true` and
-  //   Dims::BS <= 8), `DOWN_COL_TILE = 256`.  Grids:
+  //   Dims::BS <= 8), `DOWN_COL_TILE = 256`; otherwise 128.  Grids:
   //
   //   BS8 TMA+WGMMA: DOWN_COL_TILE=256, DOWN_GRID=8, DOWN_GROUPS=16
+  //   BS64 / non-TMA: DOWN_COL_TILE=128, DOWN_GRID=16, DOWN_GROUPS=8
   //
   //   The `DOWN_GROUPS == UP_GROUPS` alignment in the BS8 TMA path is
   //   the prerequisite for the Phase-2b Expert_Barrier at site #2.
@@ -407,15 +419,22 @@ struct MoEGemmSpec {
   //     argument" and "Ping-pong reset").  No host re-zero is required
   //     across kernel invocations.
   //
-  // Call-site mapping (Design "Site #2", "Site #3"):
+  // Call-site mapping (Design "Site #1"…"Site #5"):
   //   * `grid_barrier.slot[2]` — the Phase-1 full-grid ping-pong pair.
   //     Used by:
+  //       - Site #1 (BS64 only) — top-of-kernel output zero-out
+  //         publishes to Phase 1. Eliminated for BS8 under
+  //         `if constexpr (Dims::BS > 8)` because the BS8 Phase-5
+  //         reduction `=`-writes every output element (Req 3.4, 3.5).
   //       - Sites #2, #3 (BS8) — Phase 3→4 and Phase 4→5. These are
   //         Grid_Barrier in Phase 1 and get downgraded to
   //         Expert_Barrier / ColStripe_Barrier (below) in Phase 2b.
-  //     The site #1 top-of-kernel output zero-out + grid sync is
-  //     eliminated for BS8 because the BS8 Phase-5 reduction
-  //     `=`-writes every output element (Req 3.4, 3.5).
+  //       - Site #4 (BS64) — up→down projection boundary.
+  //       - Site #5 (BS64) — `moe_scale_activation_BSx` publishes
+  //         `spec->act_scale` to every downstream reader.
+  //     All BS64 sites share the same ping-pong pair because every
+  //     block calls them in the same static order, and the phase
+  //     counter is threaded through the one `grid_phase` register.
   //
   //   * `partial_barrier.expert_slot[NUM_EXPERTS][2]` — Phase-2b
   //     Expert_Barrier counter region, one Counter_Pair per expert
@@ -853,10 +872,14 @@ struct MoECoreDims {
   // Phase 5 reads each cell once and casts to bf16 (no cross-group
   // reduction).
   //
-  // BS8 TMA+WGMMA (Phase 2a layout alignment): DOWN_COL_TILE = 256.
+  // Default (BS64, non-TMA): DOWN_COL_TILE = 128.
   //   For Qwen3.5-35B (HIDDEN_STATES=2048, GRID_SIZE=128):
-  //     DOWN_GRID   = 2048 / 256 = 8 blocks per expert
-  //     DOWN_GROUPS = 128  / 8   = 16 expert groups (== UP_GROUPS)
+  //     DOWN_GRID   = 2048 / 128 = 16 blocks per expert
+  //     DOWN_GROUPS = 128  / 16  = 8 expert groups running in parallel
+  //
+  // BS8 TMA+WGMMA (Phase 2a layout alignment): DOWN_COL_TILE = 256.
+  //   DOWN_GRID   = 2048 / 256 = 8 blocks per expert
+  //   DOWN_GROUPS = 128  / 8   = 16 expert groups (== UP_GROUPS)
   // This alignment makes the 8 blocks `[g*8, g*8+7]` form both
   // `up_group = g` and `down_group = g` for the same expert set, so
   // the producer-set of site #2 (Phase 3 → Phase 4) becomes identical
@@ -934,6 +957,25 @@ template <typename Dims>
 struct MoE_SHM {
   using CoreDims = MoECoreDims<Dims>;
   union U {
+    struct SortData {
+      std::uint32_t counters[Dims::NUM_EXPERTS][CoreDims::THREADS_PER_WARP];
+      std::uint32_t total_counts[Dims::NUM_EXPERTS];
+    } sorting;
+    struct RescaleData {
+      A_element a[CoreDims::CALC_WARP_COUNT][Dims::HIDDEN_STATES];
+    } rescale;
+    struct Gemm1Data {
+      // Full-K double-buffered activation and weight tiles.
+      // With K <= 2048 (e.g. Qwen3.5 K=2048), the full K activation tile
+      // (A_TILE × K × fp8 = 16 KB) and weight tile (W_UP_TILE × K × fp8 =
+      // 32 KB) both fit comfortably in SHM with double-buffering, removing
+      // the need for the half-K split and its triple-buffer pipeline.
+      AQ_element a[2][CoreDims::A_TILE][CoreDims::K_DIM_PADDED_A];
+      W_element w[2][CoreDims::W_UP_TILE][CoreDims::K_DIM_PADDED_W];
+      T_element partial_result[CoreDims::CALC_WARP_COUNT]
+                              [CoreDims::W_UP_TILE * CoreDims::T_TILE];
+    } gemm1;
+
     // ── TinyDataWGMMA_TMA: SHM layout for the TMA+WGMMA up-proj path ──
     //
     // Used when `use_wgmma<Dims>::value && use_tma<Dims>::value` are both
@@ -1665,12 +1707,44 @@ struct MoE_SHM {
                       offsetof(typename U::TinyDataWGMMA_TMA, w_down_wgmma),
                   "bf16_in_full must alias w_down_wgmma exactly (Req 4.7).");
 
+    // BS64 path: holds weight tiles and partial results for down-projection
+    // only (up-projection uses Gemm1Data; activations come from
+    // spec->temp_bf16)
+    //
+    // Uses the same fp8 MMA approach as BS8: SiLU output is fetched as
+    // bf16, quantized to fp8 with per-token block-wise scales, then
+    // multiplied with fp8 weights via mma_fp8_fp8 (m16n8k32).
+    struct Gemm2Data {
+      // Double-buffered bf16 staging area for SiLU output (fetched from
+      // global memory, consumed by the quantization step).
+      A_element t_bf16[2][CoreDims::T_TILE][Dims::N];
+      // Double-buffered fp8 quantized activations for MMA. Row-padded
+      // to avoid bank conflicts in the MMA inner loop — see the comment
+      // on DOWN_ROW_PADDING in MoECoreDims.
+      AQ_element
+          t_fp8[2][CoreDims::T_TILE]
+               [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(AQ_element)];
+      // Per-token per-block activation scales for the fp8 activations.
+      static constexpr uint32_t A_DOWN_SCALE_BLOCKS = (Dims::N + 127) / 128;
+      S_element t_scale[2][CoreDims::T_TILE][A_DOWN_SCALE_BLOCKS];
+
+      W_element w[2][CoreDims::W_DOWN_TILE]
+                 [Dims::N + CoreDims::DOWN_ROW_PADDING / sizeof(W_element)];
+      // Down-projection weight scales (double-buffered).
+      // Block-wise (128×128): [2][ceil(W_DOWN_TILE/128) * ceil(N/128)]
+      static constexpr uint32_t DOWN_SCALE_TILE_SIZE =
+          ((CoreDims::W_DOWN_TILE + 127) / 128) * ((Dims::N + 127) / 128);
+      S_element scale[2][DOWN_SCALE_TILE_SIZE + CoreDims::PADDING];
+      T_element partial_result[CoreDims::W_DOWN_TILE / 2 +
+                               CoreDims::CALC_WARP_COUNT / 2]
+                              [CoreDims::W_DOWN_MMA_TILE * CoreDims::T_TILE];
+    } gemm2;
   } u;
 
   static_assert(Dims::NUM_EXPERTS <= 65535,
                 "Number of experts too high, cannot store as uint16 anymore.");
 
-  // ── Common fields ────────────────────────────────────────────────────────
+  // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
   // act_scale[blk][tok] = max(|x_tok[blk*128..(blk+1)*128-1]|)/448
   //
@@ -1697,17 +1771,33 @@ struct MoE_SHM {
   S_element act_scale[ACT_SCALE_BLOCKS][Dims::BS];
 
   // Unique experts active in this batch, with their sorted token ranges.
-  // Filled by prepare_moe_topk_BS8.
+  // Filled by prepare_moe_topk_BS8 (BS8) or prepare_moe_topk_BSx_Ey (BS64).
   ExpertRef experts[Dims::NUM_EXPERTS];
   std::uint32_t expert_count;
 
   // Flat routing results: [token * MAX_TOPK + k] = expert id / routing weight
-  // for the k-th selection of that token. Written by topK_BS8.
+  // for the k-th selection of that token. Written by topK_BS8 / topK_BS64.
   // MAX_TOPK = 8 covers top_k up to 8.
   static constexpr uint32_t MAX_TOPK = 8;
   alignas(uint64_t) uint16_t
       topk_ids_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
   S_element topk_weights_flat[(Dims::BS < 8 ? 8 : Dims::BS) * MAX_TOPK];
+
+  // ── Path-specific fields ────────────────────────────────────────────────
+  // Only the BS64 path needs auxiliary per-pair arrays here.  The BS8 path
+  // iterates experts via `experts[e].id` directly and has no per-pair
+  // payload of its own.  Kept inside `union PathData` so future variants
+  // can re-add a BS8-specific struct without touching call sites.
+  union PathData {
+    // BS64: sorted virtual-batch index arrays.
+    // token_indexes_topk[sorted_pos] = original token index.
+    // token_weights[sorted_pos]      = routing_weight.
+    struct {
+      std::uint16_t
+          token_indexes_topk[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
+      S_element token_weights[Dims::BS * MAX_TOPK + MoECoreDims<Dims>::PADDING];
+    } bs64;
+  } path;
 };
 
 /**

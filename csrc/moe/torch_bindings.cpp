@@ -39,18 +39,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
 #ifndef USE_ROCM
-  // Top-K Monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
-  m.def(
-      "moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(Tensor "
-      "activations_in,"
-      "Tensor router_logits,"
-      "Tensor expert_weights_up, Tensor expert_scales_up,"
-      "Tensor expert_weights_down, Tensor expert_scales_down,"
-      "Tensor! activations_out, Tensor! scratchpad,"
-      "int top_k, int scoring_func, bool renormalize) -> ()");
-  m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
-         &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
-
   // Pair_Layout V2 of the BS8 TMA + WGMMA path
   // (`up-proj-gate-up-pair-layout` spec R9.4).  This is the only BS8
   // TMA op: USE_TMA=true, 4-deep weight TMA lookahead, deferred

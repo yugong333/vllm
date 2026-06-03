@@ -305,7 +305,10 @@ def moe_monokernel_topk(
     assert expert_weights_down.dtype is torch.float8_e4m3fn
     assert expert_scales_down.dtype is torch.float32
 
-    assert M <= 64
+    assert M <= 8, (
+        f"moe_monokernel_topk: unsupported batch size M={M}. "
+        "Only the BS8 (M<=8) TMA+WGMMA path is supported."
+    )
 
     # Allocate output tensor (separate from input for top-K accumulation)
     activations_out = torch.zeros_like(activations_in)
@@ -316,56 +319,39 @@ def moe_monokernel_topk(
         f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
         "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
     )
-    if M <= 8:
-        # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with
-        # SWIZZLE_128B on both weight sides.  The up-projection weights
-        # must be repacked via `interleave_for_tma_wgmma_up_v2` (gate/up
-        # PAIR interleave so silu(gate)*up is a per-lane register op
-        # after the WGMMA); the down-projection weights are passed raw —
-        # the TMA hardware applies the core-matrix XOR swizzle at write
-        # time.  The repack is cached on the weight tensor's
-        # `_tma_interleaved_up_v2` attribute so subsequent calls with the
-        # same weights are free; model loaders can also apply the
-        # transform ahead of time.
-        from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
-            interleave_for_tma_wgmma_up_v2,
-        )
+    # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with
+    # SWIZZLE_128B on both weight sides.  The up-projection weights
+    # must be repacked via `interleave_for_tma_wgmma_up_v2` (gate/up
+    # PAIR interleave so silu(gate)*up is a per-lane register op
+    # after the WGMMA); the down-projection weights are passed raw —
+    # the TMA hardware applies the core-matrix XOR swizzle at write
+    # time.  The repack is cached on the weight tensor's
+    # `_tma_interleaved_up_v2` attribute so subsequent calls with the
+    # same weights are free; model loaders can also apply the
+    # transform ahead of time.
+    from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
+        interleave_for_tma_wgmma_up_v2,
+    )
 
-        up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up_v2", None)
-        if up_interleaved is None:
-            up_interleaved = interleave_for_tma_wgmma_up_v2(
-                expert_weights_up
-            ).contiguous()
-            with contextlib.suppress(AttributeError, RuntimeError):
-                expert_weights_up._tma_interleaved_up_v2 = up_interleaved
+    up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up_v2", None)
+    if up_interleaved is None:
+        up_interleaved = interleave_for_tma_wgmma_up_v2(expert_weights_up).contiguous()
+        with contextlib.suppress(AttributeError, RuntimeError):
+            expert_weights_up._tma_interleaved_up_v2 = up_interleaved
 
-        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
-            activations_in,
-            router_logits,
-            up_interleaved,
-            expert_scales_up,
-            expert_weights_down,
-            expert_scales_down,
-            activations_out,
-            scratchpad,
-            top_k,
-            scoring_func_int,
-            renormalize,
-        )
-    else:
-        torch.ops._moe_C.moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(
-            activations_in,
-            router_logits,
-            expert_weights_up,
-            expert_scales_up,
-            expert_weights_down,
-            expert_scales_down,
-            activations_out,
-            scratchpad,
-            top_k,
-            scoring_func_int,
-            renormalize,
-        )
+    torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
+        activations_in,
+        router_logits,
+        up_interleaved,
+        expert_scales_up,
+        expert_weights_down,
+        expert_scales_down,
+        activations_out,
+        scratchpad,
+        top_k,
+        scoring_func_int,
+        renormalize,
+    )
 
     return activations_out
 

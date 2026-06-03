@@ -6,9 +6,13 @@
  * through the Driver API (`cuTensorMapEncodeTiled`), which runs on the CPU
  * to populate a 128-byte POD descriptor.  The returned descriptors are later
  * passed to the device as `__grid_constant__ CUtensorMap const` kernel
- * parameters.
+ * parameters (see spec R5 / R6).
  *
- * Implements the factories declared in `moe_tma.h`.
+ * Implements the factories declared in `moe_tma.h`.  See the spec
+ * requirements:
+ *   - R5.1, R5.2, R5.5, R5.6, R1.4 (weight descriptor)
+ *   - R5.3, R5.4, R5.5, R5.6, R2.4, R12.4 (activation descriptor)
+ *   - R12.1, R12.3 (CUDA 12.0+ / Driver API header)
  *
  * Unlike the other `.cu` files in this directory (which are `#include`d into
  * `moe.cu` for whole-program inlining), this file is a standalone host-side
@@ -113,7 +117,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
   //
   // For `rank = 2`, `globalStrides` is a length-1 array giving the byte
   // stride between successive rows along the outer axis; for bf16 (2 B/elem)
-  // the row stride is `K_hidden * 2` bytes.
+  // the row stride is `K_hidden * 2` bytes (R5.4, R12.4).
   constexpr uint32_t kRank = 2;
   uint64_t global_dim[kRank] = {
       static_cast<uint64_t>(K_hidden),
@@ -137,7 +141,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
       CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  // On failure, raise a TORCH_CHECK naming the failing tensor so the
+  // R5.5: on failure, raise a TORCH_CHECK naming the failing tensor so the
   // Python stack trace points directly at "activations".
   TORCH_CHECK(res == CUDA_SUCCESS,
               "cuTensorMapEncodeTiled failed for activations: CUresult=",

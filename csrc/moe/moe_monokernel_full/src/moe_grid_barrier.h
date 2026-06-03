@@ -35,7 +35,8 @@ namespace moe_monokernel {
  * Every calling thread in every participating block blocks until all
  * `GRID_SIZE_STATIC` blocks have arrived at this call.  On exit every
  * global-memory write issued by any block before the call is visible
- * to every global-memory read issued by any block after the call.
+ * to every global-memory read issued by any block after the call
+ * (Req 2.1, 2.6).
  *
  * Protocol (design Component A, "Protocol" and "Fence discipline"):
  *
