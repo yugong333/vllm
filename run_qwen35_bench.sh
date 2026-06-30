@@ -58,17 +58,18 @@ set -uo pipefail
 # -----------------------------
 # Configuration
 # -----------------------------
-REPO_DIR="$HOME/vllm"
-# Resolve the venv: prefer the historical /opt/vllm-venv, but fall back to the
-# in-repo venv_vllm (the /opt symlink has been removed before — see notes). An
-# explicit VENV_ACTIVATE env var overrides both.
+# Resolve the repo from this script's own location so the in-repo venv is used
+# regardless of where the script is invoked from.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the venv: prefer the in-repo venv_vllm. An explicit VENV_ACTIVATE env
+# var overrides; fall back to the historical /opt/vllm-venv if present.
 if [ -z "${VENV_ACTIVATE:-}" ]; then
-    if [ -f "/opt/vllm-venv/bin/activate" ]; then
-        VENV_ACTIVATE="/opt/vllm-venv/bin/activate"
-    elif [ -f "$REPO_DIR/venv_vllm/bin/activate" ]; then
+    if [ -f "$REPO_DIR/venv_vllm/bin/activate" ]; then
         VENV_ACTIVATE="$REPO_DIR/venv_vllm/bin/activate"
+    elif [ -f "/opt/vllm-venv/bin/activate" ]; then
+        VENV_ACTIVATE="/opt/vllm-venv/bin/activate"
     else
-        echo "[ERROR] No venv found (tried /opt/vllm-venv and $REPO_DIR/venv_vllm)."
+        echo "[ERROR] No venv found (tried $REPO_DIR/venv_vllm and /opt/vllm-venv)."
         echo "[ERROR] Set VENV_ACTIVATE=/path/to/venv/bin/activate and retry."
         exit 1
     fi

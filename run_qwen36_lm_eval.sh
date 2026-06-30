@@ -38,8 +38,11 @@ set -uo pipefail
 # -----------------------------
 # Configuration
 # -----------------------------
-VENV_ACTIVATE="/opt/vllm-venv/bin/activate"
-REPO_DIR="$HOME/vllm"
+# Resolve the repo from this script's own location so the in-repo venv is used
+# regardless of where the script is invoked from.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Prefer the in-repo venv; allow VENV_ACTIVATE to override.
+VENV_ACTIVATE="${VENV_ACTIVATE:-$REPO_DIR/venv_vllm/bin/activate}"
 
 MODEL_NAME="Qwen/Qwen3.6-35B-A3B-FP8"
 PORT=8000
