@@ -32,7 +32,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
-from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
     interleave_for_tma_wgmma_up_v2,
 )
@@ -917,19 +916,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return True
         return super().is_monolithic
 
-    @property
-    def mk_owns_shared_expert(self) -> bool:
-        # The MoE monokernel only computes routed experts — it does NOT run
-        # the shared expert internally. When the monokernel path is active,
-        # return False so the runner handles shared experts externally (via
-        # NO_OVERLAP or MULTI_STREAM_OVERLAPPED). Without this override the
-        # base class returns True (because self.moe_kernel was built with
-        # shared_experts=layer.shared_experts), which makes the runner skip
-        # shared expert execution entirely — a silent correctness bug for
-        # models like Qwen3.5-35B that have shared experts.
-        if getattr(self, "_use_moe_monokernel", False):
-            return False
-        return super().mk_owns_shared_expert
+    # NOTE: the MoE runner runs shared experts unconditionally
+    # via `_maybe_apply_shared_experts` at the top of `_apply_quant_method`
+    # (before the monolithic/modular branch), so the monokernel routed-only
+    # path no longer risks skipping shared experts — and the base class no
+    # longer exposes `mk_owns_shared_expert` to override.
 
     def _apply_modular_fallback(
         self,
