@@ -548,6 +548,25 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
+        # Routing capture for offline kernel benchmarking. Records the real
+        # (imbalanced) decode-time router logits + token count so the kernel
+        # micro-benchmark can replay production routing instead of synthetic
+        # uniform-random routing. Sits in the common path so it fires for both
+        # the monolithic (monokernel) and modular (triton) branches below —
+        # routing depends only on weights+input, not the GEMM backend. No-op
+        # unless MONOKERNEL_ROUTE_CAPTURE is set. See route_capture.py.
+        from vllm.model_executor.layers.fused_moe import route_capture
+
+        if route_capture.is_enabled():
+            route_capture.capture_routing(
+                self,
+                hidden_states,
+                router_logits,
+                getattr(self.router, "top_k", 0),
+                getattr(self.router, "scoring_func", "softmax"),
+                getattr(self.router, "renormalize", True),
+            )
+
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(

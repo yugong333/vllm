@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_USE_MOE_MONOKERNEL: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1443,6 +1444,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Allow use of the fused MoE monokernel fast path (Qwen3.5-35B FP8
+    # block-wise: E=256, K=2048, N=1024, top_k>1) in Fp8MoEMethod. When
+    # disabled (0), the eligible layers fall back to the standard TRITON
+    # fused-MoE backend. Default on (1).
+    "VLLM_USE_MOE_MONOKERNEL": lambda: bool(
+        int(os.getenv("VLLM_USE_MOE_MONOKERNEL", "1"))
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

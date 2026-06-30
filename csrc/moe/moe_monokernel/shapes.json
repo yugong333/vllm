@@ -1,0 +1,98 @@
+{
+  "_comment": "Single source of truth for monokernel shapes. Each entry declares ONE compile-time specialization (the kernel is template-specialized on N/K/E, so a new shape needs a rebuild). The generator csrc/moe/moe_monokernel/tools/gen_shapes.py reads this and emits the C++ Dims structs / wrapper impls / op decls / torch bindings (as *.inc include files) plus the Python dispatch table. Shape-keyed op names are E{E}_N{N}_K{K}; legacy 35B/122B names are kept as aliases for back-compat. config[0] MUST be the shipped default (its knobs define the base Dims). UP_COL_HALVES is DERIVED from DCT: uch = max(1, 2*N*DCT/(128*K)); uch>=2 => raw two-TMA up-proj (no Python interleave). top_k is a RUNTIME arg (1..8); the value here is only the tuner/serving default.",
+  "atom": 128,
+  "constraints": {
+    "E_multiple_of": 32,
+    "max_token_expert_pairs": 64,
+    "N_multiple_of": 128,
+    "K_multiple_of": 128,
+    "top_k_max": 8
+  },
+  "shapes": [
+    {
+      "key": "qwen3.5_35b",
+      "aliases": ["35b", "qwen3.5", "qwen3_5_35b"],
+      "legacy_cpp_name": "Qwen3_5_35B",
+      "display_name": "Qwen3.5-35B block-wise FP8",
+      "E": 256,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "key": "qwen3.5_122b",
+      "aliases": ["122b", "qwen3_5_122b"],
+      "legacy_cpp_name": "Qwen3_5_122B",
+      "display_name": "Qwen3.5-122B block-wise FP8",
+      "E": 256,
+      "N": 1024,
+      "K": 3072,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (KUP=256, 188KB); fastest on H200 BS8 M=1..8, see tune_monokernel"},
+        {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "former default (KUP=128)"},
+        {"id": 2, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 4, "note": "SLOTS=4 (188KB)"}
+      ]
+    },
+    {
+      "_comment": "E-sweep shapes: 35B N/K (N_half=512, K=2048), varying expert count to exercise the generic E axis. Same config set as 35B (DCT 256 interleave cfg0-3, DCT 512 raw cfg4-5).",
+      "key": "e64_n512_k2048",
+      "aliases": ["e64"],
+      "display_name": "E-sweep E=64 (N512 K2048) block-wise FP8",
+      "E": 64,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "key": "e128_n512_k2048",
+      "aliases": ["e128"],
+      "display_name": "E-sweep E=128 (N512 K2048) block-wise FP8",
+      "E": 128,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "key": "e512_n512_k2048",
+      "aliases": ["e512"],
+      "display_name": "E-sweep E=512 (N512 K2048) block-wise FP8",
+      "E": 512,
+      "N": 512,
+      "K": 2048,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
+        {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
+        {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
+        {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    }
+  ]
+}

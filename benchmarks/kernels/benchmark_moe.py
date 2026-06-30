@@ -34,9 +34,15 @@ from vllm.model_executor.layers.fused_moe.fused_moe import *
 from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import is_torch_equal_or_newer, set_random_seed
 
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def disable_inplace() -> bool:
+    # torch >= 2.9 asserts when an inplace op is captured into a CUDA graph,
+    # which this benchmark does. Disable inplace in that case.
+    return is_torch_equal_or_newer("2.9.0")
 
 # Default interval for clearing Triton JIT cache during tuning
 # Set to 0 to disable automatic cache clearing
@@ -296,6 +302,7 @@ def benchmark_config(
                 w2,
                 topk_weights,
                 topk_ids,
+                # inplace=inplace,
                 quant_config=quant_config,
             )
 

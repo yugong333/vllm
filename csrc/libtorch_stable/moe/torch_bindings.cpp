@@ -35,6 +35,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor! num_tokens_post_pad,"
       "                     Tensor? maybe_expert_map) -> ()");
 
+#ifndef USE_ROCM
+  // Per-shape named + tunable monokernel op SCHEMAS (incl. legacy
+  // Qwen3_5_35B / _122B aliases) are emitted from
+  // csrc/moe/moe_monokernel/shapes.json by tools/gen_shapes.py.  Tunable ops
+  // take a trailing `config_id` selecting a KernelConfig variant; id 0 ==
+  // shipped default.  Up-projection weights for UCH==1 (interleave) shapes
+  // must be pre-interleaved via `interleave_for_tma_wgmma_up_v2` (Python);
+  // down-projection weights are passed RAW (TMA applies SWIZZLE_128B).
+  //
+  // Only the m.def schemas live here.  The matching m.impl registrations are
+  // TORCH_BOX'd in csrc/moe/moe_monokernel/moe_wrapper.cu (a STABLE_TORCH_-
+  // LIBRARY_IMPL block next to where the kernels are defined) — the same
+  // def-in-bindings / impl-in-source split dsv3_router_gemm uses.
+#include "moe/moe_monokernel/generated/defs_generated.inc"
+#endif
+
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
   m.def(

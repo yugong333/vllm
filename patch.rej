@@ -1,0 +1,98 @@
+Applying: Implement MoE Monokernel for Llama4 Scout and Maverick
+.git/rebase-apply/patch:448: trailing whitespace.
+ * This device function issues the asynchronous data copy requests for a tile of 
+.git/rebase-apply/patch:451: trailing whitespace.
+ * 
+.git/rebase-apply/patch:520: trailing whitespace.
+ * This device function issues the asynchronous data copy requests for a tile of 
+.git/rebase-apply/patch:523: trailing whitespace.
+ * 
+.git/rebase-apply/patch:592: trailing whitespace.
+ * This device function issues the asynchronous data copy requests for a tile of 
+Checking patch CMakeLists.txt...
+Hunk #1 succeeded at 1035 (offset 224 lines).
+Checking patch csrc/moe/moe_monokernel/moe_wrapper.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe_down_projection.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe_interface.h...
+Checking patch csrc/moe/moe_monokernel/src/moe_internal.h...
+Checking patch csrc/moe/moe_monokernel/src/moe_prepare.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe_routing.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe_scale_inputs.cu...
+Checking patch csrc/moe/moe_monokernel/src/moe_up_projection.cu...
+Checking patch csrc/moe/moe_monokernel/src/ptx_utils.h...
+Checking patch csrc/moe/moe_ops.h...
+error: while searching for:
+
+void shuffle_rows(const torch::Tensor& input_tensor,
+                  const torch::Tensor& dst2src_map,
+                  torch::Tensor& output_tensor);
+error: patch failed: csrc/moe/moe_ops.h:28
+Checking patch csrc/moe/torch_bindings.cpp...
+error: while searching for:
+      "                     Tensor! num_tokens_post_pad) -> ()");
+  m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+
+#ifndef USE_ROCM
+  m.def(
+      "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
+
+error: patch failed: csrc/moe/torch_bindings.cpp:22
+Checking patch vllm/_custom_ops.py...
+error: while searching for:
+        blocksparse_block_size, blocksparse_head_sliding_step)
+
+
+def paged_attention_rocm(
+    out: torch.Tensor,
+    exp_sum: torch.Tensor,
+
+error: patch failed: vllm/_custom_ops.py:97
+Checking patch vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py...
+error: while searching for:
+        # cutlass path
+        self.is_fp8_w8a8_sm100 = quant_config._is_fp8_w8a8_sm100(
+            self.weight_quant, self.input_quant)
+        self.use_cutlass = (quant_config._is_fp8_w8a8_sm90(
+            self.weight_quant, self.input_quant) or self.is_fp8_w8a8_sm100)
+        self.disable_expert_map = False
+
+    def create_weights(self, layer: torch.nn.Module, num_experts: int,
+                       hidden_size: int, intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+
+error: patch failed: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py:490
+error: while searching for:
+            raise NotImplementedError(
+                "EPLB not supported for "
+                "`CompressedTensorsW8A8Fp8MoEMethod` yet.")
+
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+
+error: patch failed: vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py:764
+Applied patch CMakeLists.txt cleanly.
+Applied patch csrc/moe/moe_monokernel/moe_wrapper.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_down_projection.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_interface.h cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_internal.h cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_prepare.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_routing.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_scale_inputs.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/moe_up_projection.cu cleanly.
+Applied patch csrc/moe/moe_monokernel/src/ptx_utils.h cleanly.
+Applying patch csrc/moe/moe_ops.h with 1 reject...
+Rejected hunk #1.
+Applying patch csrc/moe/torch_bindings.cpp with 1 reject...
+Rejected hunk #1.
+Applying patch vllm/_custom_ops.py with 1 reject...
+Rejected hunk #1.
+Applying patch vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py with 2 rejects...
+Rejected hunk #1.
+Rejected hunk #2.
+Patch failed at 0001 Implement MoE Monokernel for Llama4 Scout and Maverick
+hint: Use 'git am --show-current-patch=diff' to see the failed patch
+When you have resolved this problem, run "git am --continue".
+If you prefer to skip this patch, run "git am --skip" instead.
+To restore the original branch and stop patching, run "git am --abort".

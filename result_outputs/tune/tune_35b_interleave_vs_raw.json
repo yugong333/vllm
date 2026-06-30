@@ -1,0 +1,226 @@
+{
+  "model": "qwen3.5",
+  "shape": "35b",
+  "top_k": 8,
+  "acc_threshold": 0.999,
+  "perf_source": "synthetic",
+  "interleave_overhead_mb": 512.0,
+  "best_per_M": {
+    "1": {
+      "config_id": 0,
+      "speedup": 1.514966270664805,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "2": {
+      "config_id": 3,
+      "speedup": 1.4462472860361026,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 2
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "4": {
+      "config_id": 0,
+      "speedup": 1.2589319943806456,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "8": {
+      "config_id": 0,
+      "speedup": 1.1622359630421402,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    }
+  },
+  "best_interleave_per_M": {
+    "1": {
+      "config_id": 0,
+      "speedup": 1.514966270664805,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "2": {
+      "config_id": 3,
+      "speedup": 1.4462472860361026,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 2
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "4": {
+      "config_id": 0,
+      "speedup": 1.2589319943806456,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "8": {
+      "config_id": 0,
+      "speedup": 1.1622359630421402,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 256,
+        "k_step_up": 256,
+        "k_step_down": 256,
+        "up_w_slots": 4
+      },
+      "interleave": true,
+      "up_col_halves": 1
+    }
+  },
+  "best_no_interleave_per_M": {
+    "1": {
+      "config_id": 4,
+      "speedup": 1.187509166246846,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 512,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "2": {
+      "config_id": 4,
+      "speedup": 1.2446607257137299,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 512,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "4": {
+      "config_id": 4,
+      "speedup": 1.2577034482965828,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 512,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "8": {
+      "config_id": 4,
+      "speedup": 1.1032282189628684,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 512,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    }
+  },
+  "config_table": {
+    "0": {
+      "grid": 128,
+      "down_col_tile": 256,
+      "k_step_up": 256,
+      "k_step_down": 256,
+      "up_w_slots": 4,
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "1": {
+      "grid": 128,
+      "down_col_tile": 256,
+      "k_step_up": 128,
+      "k_step_down": 128,
+      "up_w_slots": 4,
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "2": {
+      "grid": 128,
+      "down_col_tile": 256,
+      "k_step_up": 128,
+      "k_step_down": 128,
+      "up_w_slots": 2,
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "3": {
+      "grid": 128,
+      "down_col_tile": 256,
+      "k_step_up": 256,
+      "k_step_down": 256,
+      "up_w_slots": 2,
+      "interleave": true,
+      "up_col_halves": 1
+    },
+    "4": {
+      "grid": 128,
+      "down_col_tile": 512,
+      "k_step_up": 256,
+      "k_step_down": 128,
+      "up_w_slots": 2,
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "5": {
+      "grid": 128,
+      "down_col_tile": 512,
+      "k_step_up": 128,
+      "k_step_down": 128,
+      "up_w_slots": 2,
+      "interleave": false,
+      "up_col_halves": 2
+    }
+  }
+}
