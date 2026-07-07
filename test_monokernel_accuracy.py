@@ -142,6 +142,29 @@ MODELS = {
         "op_bs8": "moe_monokernel_topk_BS8_E512_N512_K2048_BlockFP8_WGMMA_TMA",
         "op_bs8_cluster": None, "op_bs64": None,
     },
+    # ── Decoupled up/down carve (UP_GROUPS=64 != DOWN_GROUPS=8, R=8) ─────
+    # UP_COL_HALVES=2 pinned explicitly (raw two-TMA up-proj, NO interleave);
+    # site #2 uses the expert-slot producer→consumer barrier split.  Sigmoid
+    # scoring + top_k=8 is the serving config for this shape.
+    "glm52": {
+        "display_name": "E256 N_half256 K6144 decoupled block-wise FP8",
+        "E": 256, "N_HALF": 256, "K": 6144, "default_top_k": 8,
+        # Serving config for this shape scores with sigmoid (renormalized),
+        # not softmax; the reference and kernel calls follow this field.
+        "scoring_func": "sigmoid",
+        # GLM 5.2 serving routing: noaux_tc biased selection
+        # (e_score_correction_bias) + routed_scaling_factor=2.5.  A non-zero
+        # `use_expert_bias` flag makes accuracy_test synthesize a per-expert
+        # bias and exercise the kernel's biased-select / unbiased-weight path;
+        # `routed_scaling_factor` is folded into the kernel's routing weights.
+        "use_expert_bias": True,
+        "routed_scaling_factor": 2.5,
+        # Explicit UCH (decoupled shapes only): the host-side scratchpad
+        # layout math can't derive it from the DCT coupling identity.
+        "up_col_halves": 2,
+        "op_bs8": "moe_monokernel_topk_BS8_E256_N256_K6144_BlockFP8_WGMMA_TMA",
+        "op_bs8_cluster": None, "op_bs64": None,
+    },
     "coder": {
         "display_name": "Qwen3-Coder-30B-A3B",
         "E": 128,
@@ -207,6 +230,8 @@ def get_model_op(model_cfg, M, use_cluster=False):
         top_k=1,
         scoring_func="softmax",
         renormalize=True,
+        expert_bias=None,
+        routed_scaling_factor=1.0,
     ):
         return torch.ops.vllm.moe_monokernel_topk(
             activations_in,
@@ -219,6 +244,8 @@ def get_model_op(model_cfg, M, use_cluster=False):
             top_k,
             scoring_func,
             renormalize,
+            expert_bias,
+            routed_scaling_factor,
         )
 
     return _high_level_op
@@ -307,6 +334,49 @@ def routing_softmax_topk(logits_bf16, top_k):
     return wts, ids
 
 
+def routing_sigmoid_topk(
+    logits_bf16, top_k, renormalize=True, expert_bias=None,
+    routed_scaling_factor=1.0,
+):
+    """Sigmoid scoring → topk → optional renormalize (matches CUDA kernel).
+
+    Without ``expert_bias``: selection is done on RAW logits (sigmoid is
+    monotonic, so the top-k ids match post-activation ordering — same trick as
+    the kernel's fast path in moe_routing.cu). Weights are sigmoid(logit) of
+    the selected entries.
+
+    With ``expert_bias`` (GLM noaux_tc routing): winners are ranked by the
+    biased metric ``sigmoid(logit) + bias[e]``, but the routing WEIGHT stays
+    the UNBIASED ``sigmoid(logit)`` of the selected experts (matching
+    grouped_topk's original_scores split). This mirrors the CUDA kernel's
+    biased-select / unbiased-weight path.
+
+    Weights are divided by their sum when renormalize=True, then multiplied by
+    routed_scaling_factor. Tie-break: lowest expert index wins (scatter of
+    -inf + iterative max, as in routing_softmax_topk)."""
+    raw = logits_bf16.float()
+    M = raw.shape[0]
+    ids = torch.zeros(M, top_k, dtype=torch.int64, device=DEV)
+    # Rank on the biased sigmoid metric when a bias is supplied, else on the
+    # raw logit (monotone-equivalent to unbiased sigmoid).
+    if expert_bias is not None:
+        metric = torch.sigmoid(raw) + expert_bias.float().unsqueeze(0)
+    else:
+        metric = raw
+    s = metric.clone()
+    for k in range(top_k):
+        _, idx = s.max(dim=-1)
+        ids[:, k] = idx
+        s.scatter_(1, idx.unsqueeze(1), float("-inf"))
+    # Unbiased sigmoid weight of the selected experts.
+    wts = torch.sigmoid(raw.gather(1, ids))
+    if renormalize:
+        wts = wts / wts.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    if routed_scaling_factor != 1.0:
+        wts = wts * routed_scaling_factor
+    return wts, ids
+
+
 def quant_fp8_activation_block_wise(x_float, group_size=128):
     """Block-wise activation quantization matching the monokernel's
     per-token-dynamic-1x128 scheme.
@@ -367,7 +437,9 @@ def read_temp_bf16_from_scratchpad(scratchpad_bytes, M, top_k, is_bs8, N_HALF, K
     return temp[: M * top_k].clone()
 
 
-def read_wgmma_intermediates_from_scratchpad(scratchpad_bytes, N_HALF, K, E):
+def read_wgmma_intermediates_from_scratchpad(
+    scratchpad_bytes, N_HALF, K, E, up_col_halves=None
+):
     """Read the BS8 WGMMA-path intermediates from the monokernel scratchpad
     for step-by-step debugging of the 122B (and 35B) kernel.
 
@@ -391,10 +463,15 @@ def read_wgmma_intermediates_from_scratchpad(scratchpad_bytes, N_HALF, K, E):
     BS = 8  # BS8 path
     TEMP_ROWS = BS * 8 + 8  # SPEC_MAX_TOPK=8
     # Shape-derived activation-quant block size (matches MoEGemmSpec).
-    DOWN_GROUPS = 16
-    DOWN_GRID = 128 // DOWN_GROUPS  # 8
-    DOWN_COL_TILE = K // DOWN_GRID  # 256 (35B) / 384 (122B)
-    UP_COL_HALVES = (2 * N_HALF * DOWN_COL_TILE) // (128 * K)  # 1 / 2
+    # DECOUPLED shapes pin UP_COL_HALVES explicitly (the DCT coupling
+    # identity below doesn't hold for them); coupled shapes derive it.
+    if up_col_halves is not None:
+        UP_COL_HALVES = up_col_halves
+    else:
+        DOWN_GROUPS = 16
+        DOWN_GRID = 128 // DOWN_GROUPS  # 8
+        DOWN_COL_TILE = K // DOWN_GRID  # 256 (35B) / 384 (122B)
+        UP_COL_HALVES = (2 * N_HALF * DOWN_COL_TILE) // (128 * K)  # 1 / 2
     ACT_BLK = max(UP_COL_HALVES * 64, 64)
     TACS = N_HALF // ACT_BLK
 
@@ -654,6 +731,7 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     E = model_cfg["E"]
     N_HALF = model_cfg["N_HALF"]
     K = model_cfg["K"]
+    scoring_func = model_cfg.get("scoring_func", "softmax")
     kernel_op = get_model_op(model_cfg, M, use_cluster=use_cluster)
 
     is_bs8 = M <= 8
@@ -661,7 +739,8 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     sep = "=" * 72
 
     print(f"\n{'#' * 72}")
-    print(f"# ACCURACY [{model_cfg['display_name']}]: {path} M={M} top_k={top_k}")
+    print(f"# ACCURACY [{model_cfg['display_name']}]: {path} M={M} top_k={top_k}"
+          f" scoring={scoring_func}")
     print(f"{'#' * 72}")
 
     # Setup — block-wise quantization for all paths
@@ -671,7 +750,23 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     w2_fp8, s2 = quant_fp8_block_wise(w2_f)
     x = torch.randn(M, K, device=DEV, dtype=torch.bfloat16)
     logits = torch.randn(M, E, device=DEV, dtype=torch.bfloat16)
-    topk_w, topk_ids = routing_softmax_topk(logits, top_k)
+    # GLM-style routing knobs (default: no bias, no scaling => Qwen path).
+    routed_scaling_factor = model_cfg.get("routed_scaling_factor", 1.0)
+    expert_bias = None
+    if model_cfg.get("use_expert_bias"):
+        # Synthesize a per-expert bias with the same magnitude regime as GLM
+        # 5.2's e_score_correction_bias (~7.0, small spread), so selection is
+        # dominated by the bias just like production. float32 [E] on device.
+        expert_bias = (
+            7.0 + 0.05 * torch.randn(E, device=DEV, dtype=torch.float32)
+        )
+    if scoring_func == "sigmoid":
+        topk_w, topk_ids = routing_sigmoid_topk(
+            logits, top_k, expert_bias=expert_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+    else:
+        topk_w, topk_ids = routing_softmax_topk(logits, top_k)
 
     # Allocate scratchpad as raw bytes so we can read back temp_bf16
     BS = 8 if is_bs8 else 64
@@ -707,7 +802,13 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     # `down_partial_out` is a SINGLE [BS][K] buffer in the current kernel
     # (no per-DOWN_GROUPS dimension); Phase 5 reads each cell once.
     GRID_SIZE = 128
-    if is_bs8:
+    if is_bs8 and model_cfg.get("up_col_halves") is not None:
+        # DECOUPLED shape: UCH is pinned explicitly (the coupling identity
+        # below has no integer solution).  Only UP_COL_HALVES feeds the
+        # scratchpad layout (via DOWN_ACT_BLOCK_SIZE); the down-side carve
+        # doesn't change the MoEGemmSpec field sizes.
+        UP_COL_HALVES = model_cfg["up_col_halves"]
+    elif is_bs8:
         # BS8 TMA+WGMMA: DOWN_COL_TILE chosen so DOWN_GROUPS == UP_GROUPS.
         # UP_GROUPS = GRID_SIZE / (2*N_HALF / 128) for UP_COL_HALVES=1, but
         # the invariant the kernel enforces is DOWN_GRID = K / DOWN_COL_TILE
@@ -748,8 +849,10 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         s2.contiguous(),
         scratchpad,
         top_k=top_k,
-        scoring_func="softmax",
+        scoring_func=scoring_func,
         renormalize=True,
+        expert_bias=expert_bias,
+        routed_scaling_factor=routed_scaling_factor,
     )
     torch.accelerator.synchronize()
 
@@ -899,11 +1002,12 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         print("STEP-BY-STEP INTERMEDIATES (CUDA scratchpad vs Py reference)")
         print(sep)
         interm = read_wgmma_intermediates_from_scratchpad(
-            scratch_bytes, N_HALF, K, E
+            scratch_bytes, N_HALF, K, E,
+            up_col_halves=model_cfg.get("up_col_halves"),
         )
         act_blk = interm["act_blk"]
         print(f"  up-proj activation-quant block size = {act_blk} "
-              f"(expect 64 for 35B, 128 for 122B)")
+              f"(expect 64 for 35B, 128 for 122B/decoupled)")
 
         # Dequantize all written up rows: row r, feature f uses scale
         # column f // act_blk.
@@ -1103,6 +1207,7 @@ def perf_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     E = model_cfg["E"]
     N_HALF = model_cfg["N_HALF"]
     K = model_cfg["K"]
+    scoring_func = model_cfg.get("scoring_func", "softmax")
     kernel_op = get_model_op(model_cfg, M, use_cluster=use_cluster)
 
     w13_f = torch.randn(E, 2 * N_HALF, K, device=DEV) * 0.1
@@ -1129,7 +1234,7 @@ def perf_test(model_cfg, M, top_k, seed=42, use_cluster=False):
             s2c,
             scratchpad,
             top_k=top_k,
-            scoring_func="softmax",
+            scoring_func=scoring_func,
             renormalize=True,
         )
 

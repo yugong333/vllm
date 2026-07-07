@@ -73,7 +73,16 @@ def legacy_infix(shape):
 
 
 def uch_of(shape, dct):
-    """Derived UP_COL_HALVES = max(1, 2*N*DCT/(128*K)) — mirrors the C++."""
+    """UP_COL_HALVES for a shape/config.
+
+    DECOUPLED shapes pin an explicit `up_col_halves` (the up/down grids are
+    chosen independently, so UCH does not follow the DCT coupling identity);
+    return it verbatim.  COUPLED shapes derive UCH = max(1, 2*N*DCT/(128*K)),
+    mirroring the C++ `up_col_halves<Dims>` fallback.  `dct` is per-config so
+    a coupled shape with mixed DCT (e.g. 35B cfg4/5 at DCT=512) reports the
+    right UCH per config."""
+    if shape.get("up_col_halves") is not None:
+        return int(shape["up_col_halves"])
     v = (2 * shape["N"] * dct) // (ATOM * shape["K"])
     return v if v > 0 else 1
 
@@ -155,11 +164,26 @@ def emit_dims(shapes):
         if uch >= 2:
             out.append(f"    static constexpr std::uint32_t DOWN_COL_TILE = "
                        f"{c0['dct']};")
+        # UP_COL_HALVES: pinned ONLY for decoupled shapes (explicit
+        # `up_col_halves` in shapes.json).  Coupled shapes leave it absent so
+        # the kernel derives it from DOWN_COL_TILE (byte-identical to the
+        # pre-knob behavior).  When present it decouples the up-grid carve
+        # from DCT, which is what lets UP_GROUPS != DOWN_GROUPS.
+        if s.get("up_col_halves") is not None:
+            out.append(f"    static constexpr std::uint32_t UP_COL_HALVES = "
+                       f"{int(s['up_col_halves'])};")
         # SLOTS: omit when it equals the shape's natural default (4 for UCH==1,
         # 2 for UCH>=2) so we reproduce the hand code, which relied on the
         # up_w_slots<Dims> default.  Emit explicitly otherwise.
+        #
+        # DECOUPLED shapes (explicit up_col_halves) MUST always emit it: the
+        # `up_w_slots<Dims>` C++ fallback derives the "natural" depth from the
+        # DCT coupling identity (2*N*DCT/(128*K)), which floors to 0 for a
+        # decoupled shape and would wrongly return 4 — making the base named
+        # op differ from the config-0 tunable op.  Emitting it verbatim keeps
+        # the zero-regression base==config0 contract.
         natural_slots = 4 if uch == 1 else 2
-        if c0["slots"] != natural_slots:
+        if c0["slots"] != natural_slots or s.get("up_col_halves") is not None:
             out.append(f"    static constexpr std::uint32_t UP_W_SLOTS = "
                        f"{c0['slots']};")
         out.append("    static constexpr bool USE_PAIR_LAYOUT = true;")
@@ -212,6 +236,7 @@ def emit_wrapper(shapes):
         out.append("    const torch::Tensor& ewd, const torch::Tensor& esd, "
                    "torch::Tensor& ao,")
         out.append("    torch::Tensor& sp, int64_t top_k, int64_t sf, bool renorm,")
+        out.append("    const std::optional<torch::Tensor>& eb, double rsf,")
         out.append("    int64_t config_id) {")
         out.append("#define X(ID, GRID, DCT, KUP, KDN, SLOTS)                "
                    "                  \\")
@@ -220,7 +245,7 @@ def emit_wrapper(shapes):
         out.append("    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
                    "KDN, SLOTS>>(  \\")
         out.append("        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
-                   "            \\")
+                   "eb, rsf,       \\")
         out.append(f'        "{nm}_cfg" #ID);                                '
                    "             \\")
         out.append("    return;")
@@ -248,14 +273,18 @@ def emit_wrapper(shapes):
                    "activations_out,")
         out.append("    torch::Tensor& scratchpad, int64_t top_k, int64_t "
                    "scoring_func,")
-        out.append("    bool renormalize, int64_t config_id) {")
+        out.append("    bool renormalize,")
+        out.append("    const std::optional<torch::Tensor>& expert_bias,")
+        out.append("    double routed_scaling_factor, int64_t config_id) {")
         out.append(f"  moe_monokernel::dispatch_tunable_{nm}<")
         out.append(f"      moe_monokernel::Dims_BS8_{nm}_BlockFP8_WGMMA_TMA>(")
         out.append("      activations_in, router_logits, expert_weights_up, "
                    "expert_scales_up,")
         out.append("      expert_weights_down, expert_scales_down, activations_out, "
                    "scratchpad,")
-        out.append("      top_k, scoring_func, renormalize, config_id);")
+        out.append("      top_k, scoring_func, renormalize, expert_bias, "
+                   "routed_scaling_factor,")
+        out.append("      config_id);")
         out.append("}")
         out.append("")
     # Legacy-name forwarders: thin wrappers so old op symbols keep resolving.
@@ -271,20 +300,25 @@ def emit_wrapper(shapes):
         out.append("    const torch::Tensor& ewu, const torch::Tensor& esu,")
         out.append("    const torch::Tensor& ewd, const torch::Tensor& esd,")
         out.append("    torch::Tensor& ao, torch::Tensor& sp, int64_t top_k,")
-        out.append("    int64_t scoring_func, bool renormalize) {")
+        out.append("    int64_t scoring_func, bool renormalize,")
+        out.append("    const std::optional<torch::Tensor>& expert_bias,")
+        out.append("    double routed_scaling_factor) {")
         out.append(f"  moe_monokernel_topk_BS8_{nm}_BlockFP8_WGMMA_TMA_impl(")
         out.append("      ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, scoring_func,")
-        out.append("      renormalize);")
+        out.append("      renormalize, expert_bias, routed_scaling_factor);")
         out.append("}")
         out.append(f"void moe_monokernel_topk_BS8_{leg}_tunable_impl(")
         out.append("    const torch::Tensor& ai, const torch::Tensor& rl,")
         out.append("    const torch::Tensor& ewu, const torch::Tensor& esu,")
         out.append("    const torch::Tensor& ewd, const torch::Tensor& esd,")
         out.append("    torch::Tensor& ao, torch::Tensor& sp, int64_t top_k,")
-        out.append("    int64_t scoring_func, bool renormalize, int64_t config_id) {")
+        out.append("    int64_t scoring_func, bool renormalize,")
+        out.append("    const std::optional<torch::Tensor>& expert_bias,")
+        out.append("    double routed_scaling_factor, int64_t config_id) {")
         out.append(f"  moe_monokernel_topk_BS8_{nm}_tunable_impl(")
         out.append("      ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, scoring_func,")
-        out.append("      renormalize, config_id);")
+        out.append("      renormalize, expert_bias, routed_scaling_factor, "
+                   "config_id);")
         out.append("}")
         out.append("")
     return _stableize("\n".join(out))
@@ -317,7 +351,9 @@ def _op_decl(symbol, tunable):
         "    const torch::Tensor& expert_scales_down, torch::Tensor& "
         "activations_out,\n"
         "    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,\n"
-        f"    bool renormalize{extra});\n")
+        "    bool renormalize,\n"
+        "    const std::optional<torch::Tensor>& expert_bias,\n"
+        f"    double routed_scaling_factor{extra});\n")
 
 
 def emit_ops(shapes):
@@ -350,7 +386,9 @@ def _def(symbol, tunable):
         f'      "Tensor expert_weights_up, Tensor expert_scales_up,"\n'
         f'      "Tensor expert_weights_down, Tensor expert_scales_down,"\n'
         f'      "Tensor! activations_out, Tensor! scratchpad,"\n'
-        f'      "int top_k, int scoring_func, bool renormalize{cfg_sig}) -> ()");\n'
+        f'      "int top_k, int scoring_func, bool renormalize,"\n'
+        f'      "Tensor? expert_bias, float routed_scaling_factor'
+        f'{cfg_sig}) -> ()");\n'
     )
 
 

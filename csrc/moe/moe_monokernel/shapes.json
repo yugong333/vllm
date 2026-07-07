@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for monokernel shapes. Each entry declares ONE compile-time specialization (the kernel is template-specialized on N/K/E, so a new shape needs a rebuild). The generator csrc/moe/moe_monokernel/tools/gen_shapes.py reads this and emits the C++ Dims structs / wrapper impls / op decls / torch bindings (as *.inc include files) plus the Python dispatch table. Shape-keyed op names are E{E}_N{N}_K{K}; legacy 35B/122B names are kept as aliases for back-compat. config[0] MUST be the shipped default (its knobs define the base Dims). UP_COL_HALVES is DERIVED from DCT: uch = max(1, 2*N*DCT/(128*K)); uch>=2 => raw two-TMA up-proj (no Python interleave). top_k is a RUNTIME arg (1..8); the value here is only the tuner/serving default.",
+  "_comment": "Single source of truth for monokernel shapes. Each entry declares ONE compile-time specialization (the kernel is template-specialized on N/K/E, so a new shape needs a rebuild). The generator csrc/moe/moe_monokernel/tools/gen_shapes.py reads this and emits the C++ Dims structs / wrapper impls / op decls / torch bindings (as *.inc include files) plus the Python dispatch table. Shape-keyed op names are E{E}_N{N}_K{K}; legacy 35B/122B names are kept as aliases for back-compat. config[0] MUST be the shipped default (its knobs define the base Dims). UP_COL_HALVES is normally DERIVED from DCT: uch = max(1, 2*N*DCT/(128*K)); uch>=2 => raw two-TMA up-proj (no Python interleave). A shape MAY instead pin UP_COL_HALVES explicitly (optional per-shape 'up_col_halves' field) to DECOUPLE the up grid from the down grid when the coupling identity has no integer solution (UP_GROUPS != DOWN_GROUPS); such shapes use the expert-slot producer->consumer barrier at site #2 and are all-raw (never interleaved). top_k is a RUNTIME arg (1..8); the value here is only the tuner/serving default.",
   "atom": 128,
   "constraints": {
     "E_multiple_of": 32,
@@ -40,6 +40,25 @@
         {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (KUP=256, 188KB); fastest on H200 BS8 M=1..8, see tune_monokernel"},
         {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "former default (KUP=128)"},
         {"id": 2, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 4, "note": "SLOTS=4 (188KB)"}
+      ]
+    },
+    {
+      "_comment": "DECOUPLED up/down carve. K=6144, N_half=256 has no coupled solution (the identity 2N/(128*UCH)=K/DCT forces DOWN_COL_TILE=1536 => 12 halves / ~384KB SHM). Pin UP_COL_HALVES=2 explicitly (raw two-TMA up-proj, NO Python interleave) so the up grid (UP_GRID=2*N/(128*UCH)=2, UP_GROUPS=64) is chosen independently of the down grid (DOWN_GRID=K/DCT=16, DOWN_GROUPS=8). Barrier ratio R=UP_GROUPS/DOWN_GROUPS=8; site #2 uses the expert-slot producer->consumer split (expert_produce_arrive / expert_consume_wait) instead of the coupled per-up_group expert_barrier. down-proj reduction dim is N=256 (K_TILES_DOWN = 256/KDN). All configs are raw (UCH>=2) so Python never interleaves w13.",
+      "key": "e256_n256_k6144",
+      "aliases": ["glm52", "n256k6144"],
+      "display_name": "E256 N_half256 K6144 decoupled block-wise FP8",
+      "E": 256,
+      "N": 256,
+      "K": 6144,
+      "up_col_halves": 2,
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (tuned 2026-07-02, H200 synthetic sweep: best at every M 1/2/4/8, 1.19x/1.19x/1.14x/1.05x vs Triton); UCH=2 raw, UP_GRID=2/UP_GROUPS=64, DOWN_GRID=16/DOWN_GROUPS=8, R=8; KUP=256 => 24 up K-steps; SHM~219KB"},
+        {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "KUP=128 (48 up K-steps); lowest SHM ~187KB; former default"},
+        {"id": 2, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 4, "note": "SLOTS=4 deeper up-weight lookahead; SHM~219KB"},
+        {"id": 3, "grid": 112, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "grid=112 partial (DOWN 16x7, UP_GROUPS=56); loses at M=8 (0.84x)"},
+        {"id": 4, "grid": 120, "dct": 256, "kup": 256, "kdn": 128, "slots": 2, "note": "DCT=256: DOWN 24x5, UP_GROUPS=60; runner-up at M=1"},
+        {"id": 5, "grid": 96, "dct": 128, "kup": 256, "kdn": 128, "slots": 2, "note": "DCT=128: DOWN 48x2, UP_GROUPS=48; loses badly at M>=4"}
       ]
     },
     {

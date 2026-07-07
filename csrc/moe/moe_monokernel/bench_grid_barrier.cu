@@ -1,62 +1,24 @@
 // ============================================================================
 // Standalone microbenchmark for the software grid / expert / col-stripe
-// barriers defined in `src/moe_grid_barrier.h` (spec
-// `.kiro/specs/moe-monokernel-software-grid-sync/`, Task 16.1).
+// barriers defined in `src/moe_grid_barrier.h`.
 //
-// Goal
-// ----
-// Measure per-call latency of:
+// Measures per-call latency of:
+//   * grid_barrier<GRID_SIZE>          — 128 arrivals
+//   * expert_barrier                   — 8 arrivals, one id (matches the
+//                                        production site #2 for one expert
+//                                        group)
+//   * colstripe_barrier                — 16 arrivals × 8 concurrent ids
+//                                        (matches the production site #3)
 //
-//   * `moe_monokernel::grid_barrier<GRID_SIZE_STATIC>`   — 128 arrivals
-//     (Req 7.1, 7.2: overhead budget ≤ 10 µs at GRID_SIZE = 128).
+// Grid_Barrier kernels use `__launch_bounds__(BLOCK_SIZE, 1)` to match the
+// monokernel's one-block-per-SM occupancy — without it two measurement
+// blocks can pack onto one SM and report artificially low latency.
 //
-//   * `moe_monokernel::expert_barrier` — arrival_count = UP_GRID = 8,
-//     one barrier id (id = 0), only the first 8 blocks participate
-//     (matches the production BS8 TMA+WGMMA Expert_Barrier at site #2
-//     for a single expert group at UP_GRID = 8).
-//     (Req 10.1: latency ≤ 50 % of Grid_Barrier at the same grid.)
-//
-//   * `moe_monokernel::colstripe_barrier` — arrival_count = DOWN_GROUPS = 16,
-//     8 concurrent barriers (id = blockIdx.x % 8), so every block of the
-//     128-block grid calls the barrier with its col stripe id. Matches the
-//     production ColStripe_Barrier at site #3 with DOWN_GRID = 8 and
-//     DOWN_GROUPS = 16 after the Phase-2a layout alignment.
-//     (Req 10.1: latency ≤ 50 % of Grid_Barrier at the same grid.)
-//
-// The Grid_Barrier kernel uses `__launch_bounds__(BLOCK_SIZE, 1)` to match
-// the monokernel's one-block-per-SM occupancy invariant (Req 4.4) — the
-// microbenchmark would otherwise pack two measurement blocks onto a single
-// SM and report artificially low latency.
-//
-// Cooperative-groups baseline
-// ---------------------------
-// The spec's task item originally asked for a fourth kernel,
-// `cooperative_group_sync_microbench`, as a reference point. That kernel
-// requires `cudaLaunchCooperativeKernel` + `-rdc=true`, neither of which
-// the production monokernel build uses (by design — spec Requirement 1
-// removes cooperative launch entirely so CUDA Graph capture can work).
-// Including it here would force this benchmark to also adopt `-rdc=true`,
-// complicating what is otherwise a self-contained single-TU build. The
-// baseline comparison is therefore out-of-band: run a separate
-// cooperative-launch kernel in its own TU if a direct
-// `cooperative_groups::this_grid().sync()` reference number is needed.
-//
-// Timing methodology
-// ------------------
-// Per-kernel measurement uses `cudaEventRecord` / `cudaEventElapsedTime`
-// on the default stream. The host driver:
-//
-//   1. Sweeps `N_BARRIERS ∈ {1, 10, 100, 1000}` per primitive.
-//   2. Warms up by running the kernel ≥ 10 times at the largest
-//      N_BARRIERS to prime the instruction cache and L2.
-//   3. Reports `elapsed_ms * 1000 / N_BARRIERS` as per-call µs, matching
-//      the Req 7.2 definition of "per-call overhead".
-//
-// Launch overhead (≈ 5–10 µs on H200) shows up the same way for every
-// primitive at every N, so subtracting it is unnecessary for the relative
-// ranking the spec cares about (Grid vs. Expert vs. ColStripe). The
-// absolute per-call numbers at N = 1000 are however already dominated by
-// the barriers themselves, so the launch-overhead term is negligible.
+// Timing: cudaEvent elapsed time per kernel; sweeps N_BARRIERS in
+// {1, 10, 100, 1000} with warmup at the largest N, reporting
+// elapsed * 1000 / N as per-call µs.  Launch overhead shows up equally for
+// every primitive, so the relative ranking is unaffected; at N = 1000 the
+// absolute numbers are barrier-dominated anyway.
 //
 // Build
 // -----
@@ -68,18 +30,6 @@
 // Run (on H200)
 // -------------
 //   /tmp/bench_grid_barrier
-//
-// Expected output shape:
-//
-//   Grid_Barrier (128 arrivals):
-//     N=1     latency = <x> μs
-//     N=10    latency = <x> μs
-//     N=100   latency = <x> μs
-//     N=1000  latency = <x> μs
-//   Expert_Barrier (8 arrivals, 1 concurrent):
-//     ...
-//   ColStripe_Barrier (16 arrivals, 8 concurrent):
-//     ...
 // ============================================================================
 
 #include <cstdint>
@@ -99,10 +49,9 @@
 
 // ── Configuration ────────────────────────────────────────────────────────
 
-// Must match the production BS8 TMA+WGMMA variant so the microbench
-// result is directly comparable to the end-to-end overhead budget in
-// Req 7.1. 128 blocks × 384 threads = one-block-per-SM on H200 (132
-// SMs); see Design "Target compile-time configuration".
+// Must match the production BS8 TMA+WGMMA variant so the result is
+// comparable to the end-to-end overhead budget.  128 blocks × 384 threads
+// = one block per SM on H200 (132 SMs).
 constexpr uint32_t GRID_SIZE = 128u;
 constexpr uint32_t BLOCK_SIZE = 384u;
 
@@ -114,22 +63,15 @@ constexpr uint32_t DOWN_GROUPS = 16u;  // ColStripe_Barrier arrival count
 
 // Counter-region sizing: one Counter_Pair (2 × uint32_t) per barrier id.
 constexpr uint32_t GRID_COUNTERS = 2u;            // one pair
-constexpr uint32_t EXPERT_COUNTERS = 16u * 2u;    // 16 Counter_Pairs
-                                                  // — spec R13.1 says
-                                                  // "16 Counter_Pairs
-                                                  // for expert"; we
-                                                  // only hit id=0 but
-                                                  // provision the full
-                                                  // set to match the
-                                                  // real scratchpad.
+constexpr uint32_t EXPERT_COUNTERS = 16u * 2u;    // 16 pairs (only id=0
+                                                  // is hit; provisioned to
+                                                  // match the scratchpad)
 constexpr uint32_t COLSTRIPE_COUNTERS = 8u * 2u;  // 8 Counter_Pairs
                                                   // — one per col
                                                   // stripe.
 
-// H200 shader clock (2.11 GHz). Unused in the current event-based timing
-// path but kept as a documented constant for anyone who wants to cross-
-// check against `clock64()` reads inside the device code (spec Task 16.1
-// "Compute per-call µs using H200's 2.11 GHz shader clock").
+// H200 shader clock (2.11 GHz).  Unused by the event-based timing; kept
+// for cross-checking against clock64() reads inside device code.
 [[maybe_unused]] constexpr double H200_SHADER_GHZ = 2.11;
 
 constexpr int WARMUP_LAUNCHES = 10;
@@ -150,12 +92,7 @@ constexpr int WARMUP_LAUNCHES = 10;
 // ── Device-side microbench kernels ──────────────────────────────────────
 
 /**
- * @brief Grid_Barrier microbench — every block in the grid arrives at
- *        every iteration. Mirrors spec "Microbenchmark design" snippet.
- *
- * `GRID_SIZE_STATIC` is a template non-type parameter so `grid_barrier`'s
- * seed value and degenerate-case gate fold at compile time (same shape
- * as the production call sites).
+ * @brief Grid_Barrier microbench — every block arrives every iteration.
  */
 template <uint32_t GRID_SIZE_STATIC>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void grid_barrier_microbench(
@@ -301,10 +238,8 @@ int main(int /*argc*/, char** /*argv*/) {
   //   grid:       1  Counter_Pair  = 2 × uint32_t       (8 B)
   //   expert:     16 Counter_Pairs = 32 × uint32_t      (128 B)
   //   colstripe:  8  Counter_Pairs = 16 × uint32_t      (64 B)
-  // Spec Task 16.1 calls for "16 Counter_Pairs for expert, 8
-  // Counter_Pairs for colstripe" to mirror the scratchpad layout from
-  // `MoEGemmSpec<Dims>::partial_barrier`. Zero-init is required on
-  // first use (spec R13.2, `moe_grid_barrier.h` caller contract).
+  // Mirrors the MoEGemmSpec<Dims>::partial_barrier scratchpad layout.
+  // Zero-init is required on first use (moe_grid_barrier.h contract).
   uint32_t* d_grid_counters = nullptr;
   uint32_t* d_expert_counters = nullptr;
   uint32_t* d_colstripe_counters = nullptr;
@@ -355,22 +290,21 @@ int main(int /*argc*/, char** /*argv*/) {
       colstripe_results);
 
   // Summary — compare each sub-grid barrier to the Grid_Barrier at
-  // the same N (Req 10.1). Use N = 1000 as the reference point since
-  // per-launch overhead is amortized there.
+  // N = 1000, where per-launch overhead is amortized.
   const double grid_us = grid_results[3].per_call_us;
   const double expert_us = expert_results[3].per_call_us;
   const double colstripe_us = colstripe_results[3].per_call_us;
 
   std::printf("\nSummary (N=1000):\n");
   std::printf(
-      "  Grid_Barrier       : %.3f μs   (R7.1 budget: ≤ 10 μs   — %s)\n",
+      "  Grid_Barrier       : %.3f μs   (budget: ≤ 10 μs — %s)\n",
       grid_us, grid_us <= 10.0 ? "PASS" : "FAIL");
   std::printf(
-      "  Expert_Barrier     : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n",
+      "  Expert_Barrier     : %.3f μs   (%.1f%% of Grid, target ≤ 50%% — %s)\n",
       expert_us, grid_us > 0.0 ? (100.0 * expert_us / grid_us) : 0.0,
       (grid_us > 0.0 && expert_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
   std::printf(
-      "  ColStripe_Barrier  : %.3f μs   (%.1f%% of Grid, R10.1: ≤ 50%% — %s)\n",
+      "  ColStripe_Barrier  : %.3f μs   (%.1f%% of Grid, target ≤ 50%% — %s)\n",
       colstripe_us, grid_us > 0.0 ? (100.0 * colstripe_us / grid_us) : 0.0,
       (grid_us > 0.0 && colstripe_us <= 0.5 * grid_us) ? "PASS" : "FAIL");
 

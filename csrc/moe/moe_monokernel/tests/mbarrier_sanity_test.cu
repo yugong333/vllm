@@ -1,9 +1,8 @@
 // ============================================================================
 // Standalone device-side sanity test for the mbarrier PTX wrappers defined in
-// `vllm/csrc/moe/moe_monokernel/src/ptx_utils.h` (Task 1.3 of the
-// tma-wgmma-weight-load spec).
+// `vllm/csrc/moe/moe_monokernel/src/ptx_utils.h`.
 //
-// Goal (R3.1, R3.2, R3.5):
+// Goal:
 //   1. Allocate a single 64-bit mbarrier in SHM.
 //   2. One thread inits it with `arrival_count = 1`.
 //   3. Publish with `fence.mbarrier_init.release.cluster`.
@@ -55,12 +54,12 @@ __global__ void mbarrier_sanity_kernel(std::uint32_t* out_flag,
   __shared__ alignas(16) std::uint64_t bar;
 
   if (threadIdx.x == 0) {
-    // R3.1: init a single mbarrier with arrival_count = 1.
+    // init a single mbarrier with arrival_count = 1.
     moe_monokernel::mbarrier_init(&bar, /*arrival_count=*/1);
-    // R3.2: publish the init before any arrive / try_wait.
+    // publish the init before any arrive / try_wait.
     moe_monokernel::fence_mbarrier_init_release_cluster();
 
-    // R3.5: arm with tx = 0 and arrive. With no TMA traffic, the barrier
+    // arm with tx = 0 and arrive. With no TMA traffic, the barrier
     // must flip parity to 1 immediately, so try_wait.parity(0) should
     // succeed on (or very near) the first poll.
     moe_monokernel::mbarrier_arrive_expect_tx(&bar, /*tx_bytes=*/0);

@@ -815,12 +815,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         _monokernel_shape_ok = monokernel_shapes.is_supported(
             _monokernel_E, w13_n2, w13_k
         )
+        # The monokernel does plain (optionally bias-corrected) top-k over ALL
+        # experts. That equals vLLM's grouped_topk ONLY when the group carve is
+        # a no-op — i.e. a single expert group with all groups selected. GLM
+        # 5.2 has n_group=1/topk_group=1 (a no-op), so it qualifies; a real
+        # multi-group router (e.g. DeepSeek n_group=8) would route to different
+        # experts, so we must NOT engage the fast path there.
+        _monokernel_grouping_ok = (
+            getattr(layer, "num_expert_group", None) in (None, 1)
+            and getattr(layer, "topk_group", None) in (None, 1)
+        )
         self._use_moe_monokernel = (
             envs.VLLM_USE_MOE_MONOKERNEL
             and self.block_quant
             and self.fp8_backend == Fp8MoeBackend.TRITON
             and _monokernel_shape_ok
             and getattr(layer, "top_k", 1) > 1
+            and _monokernel_grouping_ok
         )
         if self._use_moe_monokernel:
             logger.info(
@@ -1012,6 +1023,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         _dump,
                     )
                     logger.info("MONOKERNEL_DUMP written to %s", _dump)
+                # GLM-style routing controls. `e_score_correction_bias`
+                # (noaux_tc selection bias) and `routed_scaling_factor` are
+                # folded into the kernel's routing so the monokernel matches
+                # grouped_topk exactly. Only valid when grouping is a no-op
+                # (num_expert_group <= 1); the eligibility gate in
+                # process_weights_after_loading enforces that, so a real
+                # multi-group model never reaches here with a bias. None /
+                # 1.0 (the Qwen case) leave routing byte-identical.
+                expert_bias = getattr(layer, "e_score_correction_bias", None)
+                routed_scaling_factor = getattr(
+                    layer, "routed_scaling_factor", 1.0
+                )
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
                     router_logits,
@@ -1023,6 +1046,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     top_k,
                     scoring_func,
                     renormalize,
+                    expert_bias,
+                    routed_scaling_factor,
                 )
             # Fall back to the modular kernel for large batches.
             return self._apply_modular_fallback(layer, x, router_logits)

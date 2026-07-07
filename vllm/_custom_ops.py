@@ -256,6 +256,8 @@ def moe_monokernel_topk(
     top_k: int = 1,
     scoring_func: str = "softmax",
     renormalize: bool = True,
+    expert_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
     config_id: int = -1,
 ) -> torch.Tensor:
     """MoE monokernel with configurable top-K routing, scoring function,
@@ -284,6 +286,14 @@ def moe_monokernel_topk(
         top_k: Number of experts per token (1-8)
         scoring_func: "softmax" or "sigmoid"
         renormalize: Whether to renormalize top-K weights to sum to 1
+        expert_bias: Optional per-expert selection bias [E] in float32
+            (GLM-style ``e_score_correction_bias``). When provided (sigmoid
+            scoring only), experts are ranked by ``sigmoid(logit) + bias`` while
+            the routing weight stays the unbiased ``sigmoid(logit)`` — matching
+            grouped_topk's biased-select / unbiased-weight split. ``None`` =>
+            rank on the raw logits (default; byte-identical to the Qwen path).
+        routed_scaling_factor: Scalar folded into every routing weight
+            (GLM's ``routed_scaling_factor``). Default 1.0 => no-op.
     """
     if not current_platform.is_cuda():
         raise NotImplementedError(
@@ -341,7 +351,13 @@ def moe_monokernel_topk(
     )
 
     assert activations_in.dtype is torch.bfloat16
-    assert router_logits.dtype is torch.bfloat16
+    # The kernel reads router logits as bfloat16 (const __nv_bfloat16*). Some
+    # gates (e.g. GLM 5.2's GateLinear) emit fp32 logits, so cast here rather
+    # than asserting — the bias (added in fp32 inside the kernel) preserves the
+    # selection metric's precision; only the logit itself is rounded to bf16,
+    # which matches what bf16-gate models already feed.
+    if router_logits.dtype is not torch.bfloat16:
+        router_logits = router_logits.to(torch.bfloat16)
     assert expert_weights_up.dtype is torch.float8_e4m3fn
     assert expert_scales_up.dtype is torch.float32
     assert expert_weights_down.dtype is torch.float8_e4m3fn
@@ -417,6 +433,18 @@ def moe_monokernel_topk(
     else:
         up_weights = expert_weights_up
 
+    # Optional GLM-style routing controls.  `expert_bias` (per-expert
+    # selection bias, float32 [E]) must live on the activation device; a
+    # None passes through as a null Tensor? to the raw-logit ranking path.
+    if expert_bias is not None:
+        assert expert_bias.dtype is torch.float32, (
+            f"expert_bias must be float32, got {expert_bias.dtype}"
+        )
+        assert expert_bias.numel() == E, (
+            f"expert_bias must have E={E} entries, got {expert_bias.numel()}"
+        )
+        expert_bias = expert_bias.contiguous()
+
     op_args = [
         activations_in,
         router_logits,
@@ -429,6 +457,8 @@ def moe_monokernel_topk(
         top_k,
         scoring_func_int,
         renormalize,
+        expert_bias,
+        float(routed_scaling_factor),
     ]
     # The tunable op takes a trailing config_id; the named default op does not.
     if config_id >= 0:
@@ -449,6 +479,8 @@ def moe_monokernel_topk_fake(
     top_k: int = 1,
     scoring_func: str = "softmax",
     renormalize: bool = True,
+    expert_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
     config_id: int = -1,
 ) -> torch.Tensor:
     return torch.empty_like(activations_in)

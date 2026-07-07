@@ -1168,12 +1168,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_down_projection.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_scale_inputs.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_routing.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_prepare.cu"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_internal.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_interface.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_debug.h"
         # Generated per-shape code (tools/gen_shapes.py from shapes.json).
         # moe_interface.h includes dims_generated.inc; moe_wrapper.cu includes
         # config_table + wrapper + impls (the m.impl registrations).  Listed so
@@ -1197,122 +1195,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
     )
 
-    # ── 122B variant (N=1024, K=3072) ──────────────────────────────────────
-    # UNIFIED (2026-06-11): both the 35B and 122B kernels are instantiated
-    # from the SAME csrc/moe/moe_monokernel tree — the wrapper TU above
-    # expands MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION for both Dims.
-    # The old csrc/moe/moe_monokernel_122B fork is retired (kept on disk
-    # for reference only; not built).
+    # Monokernel profiling flags (see csrc/moe/moe_monokernel/DESIGN.md
+    # "Profiling hooks").  Output is GARBAGE under any SKIP flag — timing
+    # only:
     #
-    # Step-by-step accuracy debugging of the monokernel: uncomment to
-    # enable the MONO_DBG_* / [MONO_DBG] printf dumps (routing → quant →
-    # up-WGMMA → up-out → down-out) for block 0, token 0.  Rebuild, run
-    # `test_monokernel_accuracy.py --model qwen3.5_122b --batch-sizes 1`,
-    # and compare each printed phase against the Python reference.  Leave
-    # OFF for production / perf runs (device printf serializes the launch).
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
-
-    # Uncomment the next line to enable debug printf in the monokernel:
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
-    # NOTE: use APPEND, not set_source_files_properties — see the
-    # `IMPORTANT` warning further down (line ~1133).  Enable
-    # transiently to debug the V2+DEFER post_silu_scratch staging
-    # (`up-proj-gate-up-pair-layout` Phase 6.5).  Disabled now that
-    # the up_rank_for_tok_prev snapshot fix is verified correct.
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "DEBUG_MOE_PRINT")
-
-    # Focused WGMMA input/output debug: prints the A (weight) and B
-    # (activation) SHM tiles for block 0, expert 0, first K-step, plus
-    # the accumulator values after the first 128-K-block commit.  Used
-    # to cross-check against a Python reference of the same WGMMA.
-    # Disabled after WGMMA bring-up was confirmed correct.
-    # set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   PROPERTIES COMPILE_DEFINITIONS "WGMMA_INPUT_DEBUG")
-
-    # Profiling flags — uncomment ONE (or a combination) to isolate the
-    # wall-clock cost of calc vs prefetch warps at barrier stalls. The
-    # kernel produces garbage outputs with any of these flags; they are
-    # only useful for timing the remaining work via NCU or wall-clock.
+    #   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warps compiled out
+    #   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches compiled out
+    #   MONO_PROFILE_SKIP_CALC_DOWN     : down-proj calc warps compiled out
+    #   MONO_PROFILE_SKIP_PREFETCH_DOWN : down-proj prefetches compiled out
     #
     # IMPORTANT — use `set_property(... APPEND PROPERTY COMPILE_DEFINITIONS
-    # ...)` (not `set_source_files_properties(... PROPERTIES ...)`).
-    # The latter REPLACES the property value, so a second call (e.g. the
-    # `MONO_PROFILE_PHASE_TIMING` line further below) silently wipes out
-    # everything set above it.  `APPEND` accumulates flags correctly.
-    #
-    # Per-phase fine-grained flags (preferred for analyzing a single
-    # phase in isolation while leaving the others functionally correct):
-    #
-    #   SKIP_CALC_UP        : up-proj calc warps compiled out
-    #   SKIP_PREFETCH_UP    : up-proj prefetches compiled out
-    #   SKIP_CALC_DOWN      : down-proj calc warps compiled out
-    #   SKIP_PREFETCH_DOWN  : down-proj prefetches compiled out
-    #
-    # Profile-only flag — kernel output WILL BE INCORRECT (do not use
-    # for accuracy testing):
-    #
-    #   SKIP_UP_EPILOGUE    : up-proj end-of-expert epilogue (wgmma_out
-    #                          SHM publish + sync + SiLU+fp8 quant
-    #                          writeback) elided.  Use to confirm
-    #                          via NCU PM-sampling whether the
-    #                          cross-expert "yellow + blue both idle"
-    #                          dip is attributable to the epilogue or
-    #                          to something else (cross-expert TMA
-    #                          wait, scale load, etc.).  WGMMA
-    #                          accumulators are kept alive via a
-    #                          volatile-sink so the K-loop does not
-    #                          collapse to a no-op.
-    #
-    # Example — measure pure down-proj prefetch / TMA-wait cost (calc
-    # path is "free", remaining time is data movement + barrier stalls):
+    # ...)`, NOT `set_source_files_properties(... PROPERTIES ...)`: the
+    # latter REPLACES the property, so a second call silently wipes out
+    # everything set before it.
     #
     # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC_DOWN")
-    #
-    # Example — measure pure down-proj compute cost (data already in
-    # SHM, no TMA traffic, no barrier waits):
-    #
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_PREFETCH_DOWN")
 
-    # Example — confirm the up-proj end-of-expert epilogue is the
-    # source of the cross-expert "yellow + blue both idle" dip in
-    # NCU PM-sampling profiles.  Output is INCORRECT under this flag
-    # (do not run accuracy tests); compare two NCU runs (with and
-    # without the flag) and inspect whether the inter-expert gap
-    # disappears.  If yes — the epilogue is the bottleneck.  If no —
-    # look elsewhere (cross-expert TMA wait, scale loader, etc.).
-    #
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_UP_EPILOGUE")
-
-    # The per-expert up-proj SiLU+fp8-quant writeback is now
-    # UNCONDITIONALLY deferred: it runs on prefetch warps at iters 0/1
-    # of the NEXT expert (4 prefetch warps × 1 token per iter, 8 tokens
-    # total).  Calc warps run iter-0/iter-1 WGMMAs in parallel.  The
-    # LAST expert has no next iter-0 to defer to and runs its writeback
-    # inline after the expert loop.  This is part of the single BS8
-    # design (V2 Pair_Layout + 4-deep weight TMA lookahead + deferred
-    # epilogue) and no longer behind a compile-time flag.
-
-    # The up-proj K-loop UNCONDITIONALLY uses a 4-deep weight TMA
-    # lookahead (bar_w[4] + w_wgmma[4] + parity_w[4]).  The launcher
-    # fires iter-(s+2) at iter `s`, and the cross-expert "stitch"
-    # splits into two arms at e0's last two K-iters (iter K_TILES-2
-    # fetches next expert's iter-0; iter K_TILES-1 fetches next
-    # expert's iter-1).  This gives DRAM more time to drain between the
-    # cross-expert TMAs and the next expert's iter-1 weight TMA.  SHM
-    # cost: 0 (`w_wgmma[4]` is unioned with `w_down_wgmma` at 128 KB,
-    # which already dominates the union).
-
-    # Phase-timing instrumentation — uncomment to enable per-phase
-    # clock64() timestamps written by block 0, thread 0.  Read back
-    # from Python via the scratchpad's `phase_timestamps` struct at the
-    # tail of MoEGemmSpec.  Kernel output is CORRECT (no skip flags);
-    # overhead is negligible (7 clock64 reads + 7 GM stores total).
+    # Phase-timing instrumentation — per-phase clock64() timestamps from
+    # block 0 into the scratchpad's `phase_timestamps` struct (read back
+    # from Python).  Output stays CORRECT; overhead negligible.
     #
     # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")

@@ -1,8 +1,7 @@
 # moe_monokernel standalone device tests
 
 Compilable, self-contained sanity checks for the low-level PTX wrappers that
-back the TMA + WGMMA up-projection path (spec:
-`.kiro/specs/tma-wgmma-weight-load/`).
+back the TMA + WGMMA up-projection path.
 
 These tests sit alongside the production kernel code but build **outside** the
 main CMake target so you can iterate on a single wrapper without linking the
@@ -15,9 +14,9 @@ whole `moe_monokernel` translation unit.
 
 ## Tests
 
-| Test                      | Covers                                          | Spec refs        |
-| ------------------------- | ----------------------------------------------- | ---------------- |
-| `mbarrier_sanity_test.cu` | `mbarrier_init`, `fence_mbarrier_init_release_cluster`, `mbarrier_arrive_expect_tx`, `mbarrier_try_wait_parity` with `tx=0` | R3.1, R3.2, R3.5 |
+| Test                      | Covers                                          |
+| ------------------------- | ----------------------------------------------- |
+| `mbarrier_sanity_test.cu` | `mbarrier_init`, `fence_mbarrier_init_release_cluster`, `mbarrier_arrive_expect_tx`, `mbarrier_try_wait_parity` with `tx=0` |
 
 ## Build + run
 

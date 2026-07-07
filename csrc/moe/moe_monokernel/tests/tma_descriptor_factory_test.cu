@@ -1,11 +1,9 @@
 // ============================================================================
 // Standalone host-side unit test for the `CUtensorMap` descriptor factories
 // declared in `vllm/csrc/moe/moe_monokernel/src/moe_tma.h` and defined in
-// `vllm/csrc/moe/moe_monokernel/src/moe_tma.cu` (Task 2.4 of the
-// tma-wgmma-weight-load spec and Task 6.4 of the
-// tma-wgmma-down-projection spec).
+// `vllm/csrc/moe/moe_monokernel/src/moe_tma.cu`.
 //
-// Goal (R5.6, R6.3 from up-proj spec; R6.6, R9.3 from down-proj spec):
+// Goal:
 //   1. Allocate dummy device pointers for the up-projection weight and
 //      activation tensors and for the down-projection weight and
 //      intermediate-activation tensors via `cudaMalloc`.  The descriptors
@@ -68,7 +66,7 @@ constexpr uint32_t kK = 3584u;
 constexpr uint32_t kBatchSizeCap = 8u;
 constexpr uint32_t kKHidden = 3584u;
 
-// Representative shapes for the down-projection factories (Task 6.4):
+// Representative shapes for the down-projection factories:
 //   E=256, K=3584 (hidden = down-proj output), N=512 (reduction = up-proj N)
 //   TEMP_ROWS = BS * MAX_TOPK = 8 * 8 = 64
 // Note: `kDownK` uses the same numerical hidden size as `kK` above but is
@@ -133,7 +131,7 @@ int main() {
     return 77;
   }
 
-  // --- Compile-time / ABI check (R5.6) -----------------------------------
+  // --- Compile-time / ABI check -----------------------------------
   //
   // The factory returns `CUtensorMap` by value, and the kernel receives it
   // as a `__grid_constant__ CUtensorMap const` parameter.  Both rely on the
@@ -142,7 +140,7 @@ int main() {
   static_assert(
       sizeof(CUtensorMap) == kExpectedCUtensorMapSize,
       "sizeof(CUtensorMap) must be 128 bytes for the __grid_constant__ "
-      "kernel-parameter contract to hold (spec R5.6).");
+      "kernel-parameter contract to hold.");
   if (sizeof(CUtensorMap) != kExpectedCUtensorMapSize) {
     std::fprintf(
         stderr,
@@ -188,7 +186,7 @@ int main() {
       moe_monokernel::create_up_weight_tma_desc(d_weights, kNumExperts, kN, kK);
   CUtensorMap act_desc = moe_monokernel::create_activations_tma_desc(
       d_acts, kBatchSizeCap, kKHidden);
-  // Down-projection factories (Task 6.4).  The two new descriptors share
+  // Down-projection factories.  The two new descriptors share
   // the same 128-B POD shape as the up-proj descriptors; the non-zero-byte
   // check below guards against a silent zero-init bypass just as it does
   // for the up-proj pair.
@@ -197,7 +195,7 @@ int main() {
   CUtensorMap down_act_desc = moe_monokernel::create_down_activation_tma_desc(
       d_down_acts, kTempRows, kDownN);
 
-  // --- Non-zero-byte check (R6.3 intent: guard against silent zero-init) --
+  // --- Non-zero-byte check --
   const size_t weight_nz = count_nonzero_bytes(weight_desc);
   const size_t act_nz = count_nonzero_bytes(act_desc);
   const size_t down_weight_nz = count_nonzero_bytes(down_weight_desc);

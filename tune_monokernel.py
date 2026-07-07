@@ -95,7 +95,14 @@ def config_uch(model_cfg, knobs):
     64-feature interleaved single-WGMMA up-proj (needs the Python gate/up
     repack ⇒ a duplicate weight tensor in GM); UCH>=2 is the raw two-TMA
     pure-half up-proj (no interleave, no duplicate tensor).
+
+    DECOUPLED shapes pin UCH explicitly (the DCT identity has no integer
+    solution for them and would floor to 1 here, mislabeling the config as
+    interleave); the registry carries the authoritative per-config value in
+    knobs["up_col_halves"], so prefer it when present.
     """
+    if knobs.get("up_col_halves"):
+        return int(knobs["up_col_halves"])
     n = model_cfg["N_HALF"]
     hidden = model_cfg["K"]
     dct = knobs["down_col_tile"]

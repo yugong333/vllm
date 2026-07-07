@@ -12,7 +12,7 @@ namespace moe_monokernel {
 
 // Weight quantization granularity
 enum class QuantGranularity : uint32_t {
-  PER_CHANNEL = 0,  // one scale per row (original)
+  PER_CHANNEL = 0,  // one scale per row
   BLOCK_WISE = 1,   // one scale per (block_row, block_col) tile
 };
 
@@ -25,7 +25,6 @@ struct MoEDimensions {
   static constexpr uint32_t M = m;
   static constexpr uint32_t NUM_EXPERTS = num_experts;
 
-  // Default: per-channel quantization (backward compatible)
   static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::PER_CHANNEL;
   static constexpr uint32_t BLOCK_SCALE_ROW = 0;
   static constexpr uint32_t BLOCK_SCALE_COL = 0;
@@ -36,67 +35,38 @@ struct MoEDimensions {
   };
 };
 
-// ── WGMMA variant of the BS8 block-wise kernel (v1 dual-WG K=128) ────────
-// Opts into the Hopper wgmma.mma_async fp8 path for Phase 3 (up-proj)
-// only.  All other phases (routing, input-quant-setup, down-proj,
-// writeback) use the existing mma.sync code.
-//
-// Layout implications when USE_WGMMA=true:
-//   - W_UP_TILE_WGMMA = 128 (each block owns 128 weight rows per K-step:
-//     64 for WG0 + 64 for WG1, with WG0 = gate[base..base+31] + up,
-//     WG1 = gate[base+32..base+63] + up).
-//   - UP_GRID = 2*N / 128 = 8 row-tiles per expert.
-//   - With GRID_SIZE = 128, UP_GROUPS = 128 / 8 = 16 experts in parallel
-//     (expert_stride = 16).
-//   - K_STEP_WGMMA = 128: each K-step consumes K=128 via 4 chained
-//     wgmma.mma_async.m64n8k32 instructions per WG.
-//   - K_TILES_WGMMA = 2048 / 128 = 16 K-steps per expert per block.
-//   - Streaming activation pipeline: bf16 input and fp8 activation tiles
-//     are K=128 and double-buffered; weight tile is K=128×128 and
-//     single-buffered.  Phase 2's upfront full-K quantization is removed.
-//   - SHM layout for `w_wgmma` and `a.fp8_act` uses canonical K-major
-//     (8×16-byte core matrices) so WGMMA descriptors reference them
-//     directly.
-//
-// The rest of the kernel (BS8 down-proj) is unchanged.
-// ── BS8 WGMMA kernel — Pair_Layout V2 (gate/up paired in M dim) ─────────
-// The single BS8 TMA + WGMMA + SWIZZLE_128B variant.
-//
-// Callers MUST NOT pre-interleave the weights for canonical Major::K
-// byte order — the TMA hardware applies the 8-row × 128-byte core-matrix
-// XOR swizzle at write time.  Up-projection weights MUST be repacked via
-// `interleave_for_tma_wgmma_up_v2` (gate/up PAIR interleave) so a single
-// 128×128 TMA fetches one full WGMMA A-tile in the pair layout.  Down-
-// projection weights are passed RAW row-major `[E, K, N]`.  Activation B
-// operands always use SWIZZLE_NONE.
-//
-// `KernelConfig::USE_PAIR_LAYOUT = true` opts the up-projection kernel
-// into the Pair_Layout register-resident per-expert epilogue (see
-// design.md "Up-Projection Gate/Up Pair Layout").  Selection is via the
-// `use_pair_layout<Dims>` SFINAE helper in moe_internal.h.
-// ── GENERATED Dims structs ───────────────────────────────────────────────
-// The per-shape Dims_* structs (and their legacy `using` aliases) are emitted
-// from csrc/moe/moe_monokernel/shapes.json by tools/gen_shapes.py.  Each
-// shape's base KernelConfig knobs come from its config[0] (the shipped
+// ── Per-shape Dims structs (GENERATED) ───────────────────────────────────
+// Emitted from csrc/moe/moe_monokernel/shapes.json by tools/gen_shapes.py.
+// Each shape's KernelConfig knobs come from its config[0] (the shipped
 // default), so the base Dims is byte-identical to the config-0 tunable
 // instantiation.  To add/edit a shape: edit shapes.json, run gen_shapes.py,
 // rebuild.  DO NOT hand-edit the generated file.
 #include "../generated/dims_generated.inc"
 
+// Extracts a shape's explicit `KernelConfig::UP_COL_HALVES` if it pins one
+// (decoupled shapes), else 0 to signal "derive from DOWN_COL_TILE" (coupled
+// shapes).  Self-contained here (no dependency on the detectors in
+// moe_internal.h, which is included after this file).
+template <typename Base>
+struct base_explicit_uch_or_zero {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::KernelConfig::UP_COL_HALVES) {
+    return (std::uint32_t)D::KernelConfig::UP_COL_HALVES;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return 0u;
+  }
+  static constexpr std::uint32_t value = test<Base>(0);
+};
+
 // ── Tunable-config Dims wrapper ──────────────────────────────────────────
-// `DimsTunable<Base, GRID, DCT, KUP, KDN, SLOTS>` clones the SHAPE of `Base`
-// (HIDDEN_STATES, K, N, BS, NUM_EXPERTS, quant granularity + all the derived
-// scale-row/col counts) but OVERRIDES the tunable KernelConfig knobs.  One
+// Clones the SHAPE of `Base` (dims, quant granularity, scale-tensor extents)
+// but overrides the tunable KernelConfig knobs.  One
 // `moe_kernel_topk<DimsTunable<...>>` is instantiated per entry in the
-// per-shape config table below; the runtime dispatcher (moe_wrapper.cu)
-// picks one by `config_id`.  config_id 0 is always the shipped default and
-// is byte-identical to the bare `Base` Dims (same knob values), so the
-// existing named ops and the config-0 tunable op produce the same kernel.
-//
-// Only the SIX coupled-mode tunables are exposed here (GRID_SIZE,
-// DOWN_COL_TILE, K_STEP_UP, K_STEP_DOWN, UP_W_SLOTS; UP_COL_HALVES is
-// derived from DCT).  Phase-B decoupled configs (independent up/down groups)
-// need the barrier-set rework in task 10 and are NOT expressible here yet.
+// per-shape config table; the runtime dispatcher (moe_wrapper.cu) picks one
+// by config_id.  config_id 0 always equals the bare `Base` Dims.
 template <typename Base, std::uint32_t GRID, std::uint32_t DCT,
           std::uint32_t KUP, std::uint32_t KDN, std::uint32_t SLOTS>
 struct DimsTunable {
@@ -122,6 +92,15 @@ struct DimsTunable {
     static constexpr std::uint32_t K_STEP_UP = KUP;
     static constexpr std::uint32_t DOWN_COL_TILE = DCT;
     static constexpr std::uint32_t UP_W_SLOTS = SLOTS;
+    // Decoupled shapes pin UP_COL_HALVES on the Base — use it verbatim.
+    // Coupled shapes derive it from THIS config's DCT (not Base's config-0
+    // DCT), since one shape can mix DCT values across configs.
+    static constexpr std::uint32_t UP_COL_HALVES =
+        base_explicit_uch_or_zero<Base>::value != 0u
+            ? base_explicit_uch_or_zero<Base>::value
+            : (((2u * N * DCT) / (128u * HIDDEN_STATES) > 0u)
+                   ? (2u * N * DCT) / (128u * HIDDEN_STATES)
+                   : 1u);
     static constexpr bool USE_PAIR_LAYOUT = Base::KernelConfig::USE_PAIR_LAYOUT;
   };
 };
@@ -154,8 +133,9 @@ constexpr size_t get_moe_max_scratchpad_size();
  * @brief W8A8 MoE kernel with configurable top-K routing, scoring function,
  *        and renormalization.
  *
- * Designed for Qwen3.5-30B-A3B FP8 (softmax scoring, top_k=8, 256 experts).
- * Also supports block-wise (128×128) FP8 quantization for Qwen3.5-35B.
+ * Supports block-wise (128×128) FP8 quantization for the shapes declared in
+ * shapes.json (e.g. Qwen3.5-35B/122B: softmax scoring, top_k=8, 256
+ * experts).  See DESIGN.md for the architecture.
  *
  * @param [in] activations_in Input activations. Shape: [M, K]
  * @param [in] token_count Number of active tokens
@@ -175,6 +155,8 @@ constexpr size_t get_moe_max_scratchpad_size();
  * @param [in] top_k Number of experts to select per token
  * @param [in] scoring_func Scoring function (SIGMOID or SOFTMAX)
  * @param [in] renormalize Whether to renormalize top-K weights to sum to 1
+ * @param [in] expert_bias Optional per-expert selection bias [E]
+ * @param [in] routed_scaling_factor Scalar folded into every routing weight
  */
 template <typename Dims>
 __global__ extern void moe_kernel_topk(
@@ -187,6 +169,7 @@ __global__ extern void moe_kernel_topk(
     R_element* __restrict activations_out, void* __restrict__ scratchpad,
     size_t scratchpad_size, size_t shmem_size, std::uint32_t top_k,
     ScoringFunc scoring_func, bool renormalize,
+    const float* __restrict__ expert_bias, float routed_scaling_factor,
     __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
