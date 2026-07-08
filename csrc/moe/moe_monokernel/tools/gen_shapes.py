@@ -462,7 +462,7 @@ def emit_python(data):
                           up_col_halves=uch_by_cfg[c["id"]])
             for c in s["configs"]
         }
-        rows.append(dict(
+        row = dict(
             key=s["key"], aliases=s.get("aliases", []),
             E=s["E"], N_half=s["N"], K=s["K"], N_fused=2 * s["N"],
             default_top_k=s["default_top_k"], display_name=s["display_name"],
@@ -472,7 +472,14 @@ def emit_python(data):
             config_macro=f"MONO_CONFIGS_{nm}",
             configs=configs,
             raw_upproj_config_ids=raw_ids, all_raw=all_raw,
-        ))
+        )
+        # Optional routing metadata (runtime args to the kernel, recorded per
+        # shape so the accuracy/tuning harness exercises the serving routing).
+        for opt in ("scoring_func", "use_expert_bias", "routed_scaling_factor",
+                    "up_col_halves"):
+            if s.get(opt) is not None:
+                row[opt] = s[opt]
+        rows.append(row)
     # repr() (not json.dumps) so booleans render as Python True/False.
     import pprint
     out.append("SHAPES = " + pprint.pformat(rows, indent=4, width=88, sort_dicts=False))

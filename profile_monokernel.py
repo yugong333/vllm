@@ -68,7 +68,10 @@ for _cand in (_here, os.path.join(_here, "vllm")):
 
 import torch
 
-import vllm._moe_C  # noqa: F401  registers the _moe_C symbols
+# The MoE CUDA ops moved from the full-libtorch `_moe_C` extension to the
+# stable-ABI `_moe_C_stable_libtorch` extension; import that so the
+# `torch.ops._moe_C.*` monokernel ops are registered.
+import vllm._moe_C_stable_libtorch  # noqa: F401  registers the _moe_C symbols
 import vllm._custom_ops  # noqa: F401  registers torch.ops.vllm.moe_monokernel_topk
 
 

@@ -178,6 +178,45 @@ MODELS = {
     },
 }
 
+
+def _register_models_from_registry():
+    """Auto-register every shape from the generated monokernel registry
+    (shapes.json via gen_shapes.py) that isn't already hand-declared above.
+
+    Newly onboarded shapes become testable/tunable with no edit here: the
+    registry row carries dims, op names, and the optional routing metadata
+    (scoring_func / use_expert_bias / routed_scaling_factor /
+    up_col_halves).  Hand entries win on key collisions so local overrides
+    (e.g. the 35B cluster op) are preserved.
+    """
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes as REG
+
+    known_dims = {(m["E"], m["N_HALF"], m["K"]) for m in MODELS.values()}
+    for row in REG.SHAPES:
+        dims = (row["E"], row["N_half"], row["K"])
+        names = [row["key"]] + list(row.get("aliases", []))
+        if dims in known_dims or any(n in MODELS for n in names):
+            continue
+        entry = {
+            "display_name": row["display_name"],
+            "E": row["E"],
+            "N_HALF": row["N_half"],
+            "K": row["K"],
+            "default_top_k": row["default_top_k"],
+            "op_bs8": row["named_op"],
+            "op_bs8_cluster": None,
+            "op_bs64": None,
+        }
+        for opt in ("scoring_func", "use_expert_bias",
+                    "routed_scaling_factor", "up_col_halves"):
+            if row.get(opt) is not None:
+                entry[opt] = row[opt]
+        for n in names:
+            MODELS.setdefault(n, entry)
+
+
+_register_models_from_registry()
+
 DEV = "cuda"
 
 

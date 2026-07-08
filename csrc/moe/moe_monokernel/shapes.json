@@ -52,6 +52,9 @@
       "K": 6144,
       "up_col_halves": 2,
       "default_top_k": 8,
+      "scoring_func": "sigmoid",
+      "use_expert_bias": true,
+      "routed_scaling_factor": 2.5,
       "configs": [
         {"id": 0, "grid": 128, "dct": 384, "kup": 256, "kdn": 128, "slots": 2, "note": "default (tuned 2026-07-02, H200 synthetic sweep: best at every M 1/2/4/8, 1.19x/1.19x/1.14x/1.05x vs Triton); UCH=2 raw, UP_GRID=2/UP_GROUPS=64, DOWN_GRID=16/DOWN_GROUPS=8, R=8; KUP=256 => 24 up K-steps; SHM~219KB"},
         {"id": 1, "grid": 128, "dct": 384, "kup": 128, "kdn": 128, "slots": 2, "note": "KUP=128 (48 up K-steps); lowest SHM ~187KB; former default"},

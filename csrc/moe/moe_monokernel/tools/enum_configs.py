@@ -224,8 +224,9 @@ def enum_coupled(N, K, E, bs, sm_count, shm_budget):
         # Hard kernel limit (until task 4 lifts it): UP_COL_HALVES <= 2.
         if uch > 2:
             continue
-        # DOWN_COL_HALVES supported range (until task 5): <= 3.
-        if dct // ATOM > 3:
+        # DOWN_COL_HALVES kernel limit: <= 4 (DCT <= 512), matching the
+        # static_assert in moe_down_projection.cu.
+        if dct // ATOM > 4:
             continue
         down_grid = K // dct
         for slots in UP_W_SLOTS_CHOICES:
@@ -235,9 +236,17 @@ def enum_coupled(N, K, E, bs, sm_count, shm_budget):
                 k_tiles_up = K // kup
                 if k_tiles_up % slots != 0 or k_tiles_up < slots:
                     continue
+                # Deferred up-proj epilogue: ceil(BS/4) waves must fit in
+                # K_TILES_UP - 1 iterations (WAVES <= DEFER_ITERS assert).
+                if k_tiles_up - 1 < (bs + 3) // 4:
+                    continue
                 for kdn in K_STEP_CHOICES:
                     # Down-proj reduction dim is N (NOT K).
                     if N % kdn != 0:
+                        continue
+                    # Inter-expert lookahead slot parity: K_TILES_DOWN even
+                    # (kernel static_assert in moe_down_projection.cu).
+                    if (N // kdn) % 2 != 0:
                         continue
                     # groups range: grid = groups*bpe <= SMs; grid must also
                     # be a multiple of both UP_GRID(=up_rows/up_tile=bpe) and
@@ -248,6 +257,10 @@ def enum_coupled(N, K, E, bs, sm_count, shm_budget):
                     for groups in range(1, max_groups + 1):
                         grid = groups * bpe
                         if grid % down_grid != 0:
+                            continue
+                        # Each expert group must own >= 1 expert
+                        # (UP_GROUPS / DOWN_GROUPS <= NUM_EXPERTS asserts).
+                        if groups > E or grid // down_grid > E:
                             continue
                         shm = shm_estimate(N, K, bs, dct, uch, kup, kdn, slots)
                         if shm > shm_budget:
@@ -275,7 +288,7 @@ def enum_decoupled(N, K, E, bs, sm_count, shm_budget):
             continue
         for down_bpe in down_bpes:
             dct = K // down_bpe
-            if dct % ATOM != 0 or dct // ATOM > 3:   # kernel limit until task5
+            if dct % ATOM != 0 or dct // ATOM > 4:   # kernel: DCT <= 512
                 continue
             # grid equality + integer barrier ratio.
             #   grid = up_groups*up_bpe = down_groups*down_bpe <= SMs
@@ -290,6 +303,9 @@ def enum_decoupled(N, K, E, bs, sm_count, shm_budget):
                 R = up_groups // down_groups
                 if R < 1:
                     continue
+                # Each expert group must own >= 1 expert.
+                if up_groups > E or down_groups > E:
+                    continue
                 for slots in UP_W_SLOTS_CHOICES:
                     for kup in K_STEP_CHOICES:
                         if K % kup != 0:
@@ -297,8 +313,15 @@ def enum_decoupled(N, K, E, bs, sm_count, shm_budget):
                         k_tiles_up = K // kup
                         if k_tiles_up % slots != 0 or k_tiles_up < slots:
                             continue
+                        # Deferred epilogue: ceil(BS/4) waves must fit in
+                        # K_TILES_UP - 1 iterations.
+                        if k_tiles_up - 1 < (bs + 3) // 4:
+                            continue
                         for kdn in K_STEP_CHOICES:
                             if N % kdn != 0:
+                                continue
+                            # Inter-expert lookahead: K_TILES_DOWN even.
+                            if (N // kdn) % 2 != 0:
                                 continue
                             shm = shm_estimate(N, K, bs, dct, uch, kup, kdn,
                                                slots)
