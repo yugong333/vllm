@@ -198,6 +198,18 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   #endif
   }
 
+  // Per-slot mbarrier parity, hoisted OUT of the expert loop so it stays
+  // continuously synced with the bar_w[slot] hardware phase across expert
+  // transitions (same reasoning as the down-proj's hoisted parity_w/parity_a).
+  // A per-expert reset to 0 is only correct when each slot completes an
+  // EVEN number of phases per expert (K_TILES / SLOTS even); for an odd
+  // quotient (e.g. K_TILES=12, SLOTS=4 → 3) the barrier ends the expert at
+  // phase 1 and a blind reset makes the next expert's first wait pass on
+  // the stale phase, corrupting the arm/wait pairing.
+  uint32_t parity_w[SLOTS];
+  #pragma unroll
+  for (uint32_t i = 0; i < SLOTS; ++i) parity_w[i] = 0u;
+
   // ── Expert loop ───────────────────────────────────────────────────────
   MONO_PHASE_TIMESTAMP(t_up_after_preloop);
   for (uint32_t e = expert_start; e < expert_count; e += expert_stride) {
@@ -205,13 +217,6 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     const bool has_next_e = (e + expert_stride < expert_count);
     const uint32_t next_id =
         has_next_e ? shmem->experts[e + expert_stride].id : 0u;
-
-    // Every slot starts at parity 0: slots [0, A) are pre-armed (pre-loop
-    // or previous expert's stitch), the rest are first armed inside this
-    // expert's K-loop.
-    uint32_t parity_w[SLOTS];
-  #pragma unroll
-    for (uint32_t i = 0; i < SLOTS; ++i) parity_w[i] = 0u;
 
     final_d0 = final_d1 = final_d2 = final_d3 = 0.f;
 
@@ -768,16 +773,19 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   #endif
   }
 
+  // Per-slot mbarrier parity, hoisted OUT of the expert loop — see the
+  // single-atom variant above for why a per-expert reset is wrong when
+  // K_TILES / SLOTS is odd.
+  uint32_t parity_w[SLOTS];
+  #pragma unroll
+  for (uint32_t i = 0; i < SLOTS; ++i) parity_w[i] = 0u;
+
   // ── Expert loop ───────────────────────────────────────────────────────
   for (uint32_t e = expert_start; e < expert_count; e += expert_stride) {
     const uint32_t id = shmem->experts[e].id;
     const bool has_next_e = (e + expert_stride < expert_count);
     const uint32_t next_id =
         has_next_e ? shmem->experts[e + expert_stride].id : 0u;
-
-    uint32_t parity_w[SLOTS];
-  #pragma unroll
-    for (uint32_t i = 0; i < SLOTS; ++i) parity_w[i] = 0u;
 
   #pragma unroll
     for (uint32_t h = 0; h < HALVES; ++h) {

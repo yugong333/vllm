@@ -321,7 +321,12 @@ iters of an expert *stitch* the next expert's iters [0, A) into slots [0, A),
 so the mbarrier parity chain carries across the expert boundary with no
 barrier reinit (this requires `K_TILES_UP % S == 0`).  A slot is never
 re-armed before its previous consumer wait completed
-(wraparound safety: `S >= A + 2` by construction).
+(wraparound safety: `S >= A + 2` by construction).  The per-slot parity
+registers are hoisted OUT of the expert loop (like the down-proj's): a slot
+completes `K_TILES_UP / S` phases per expert, and when that quotient is odd
+(e.g. K_TILES=12, S=4) the mbarrier ends the expert at phase 1 — a
+per-expert parity reset would then let the next expert's first wait pass on
+the stale phase and corrupt the arm/wait pairing.
 
 Per 128-K substep, each WG chains 4 `wgmma.mma_async.m64n8k32.e4m3` reading:
 - A = weight tile from `w_wgmma` (SWZ128 canonical Major::K, LBO=16,

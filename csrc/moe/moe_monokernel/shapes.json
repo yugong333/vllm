@@ -115,6 +115,28 @@
         {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
         {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
       ]
+    },
+    {
+      "_comment": "Onboarded via onboard_model.py for minimax_m2_5. Candidate configs from enum_configs; config 0 is the heuristic default \u2014 retune with tune_monokernel.py.",
+      "key": "e256_n768_k3072",
+      "aliases": [
+            "minimax_m2_5"
+      ],
+      "display_name": "minimax_m2_5 E256 N_half768 K3072 block-wise FP8",
+      "E": 256,
+      "N": 768,
+      "K": 3072,
+      "default_top_k": 8,
+      "scoring_func": "sigmoid",
+      "use_expert_bias": true,
+      "configs": [
+        {"id": 0, "grid": 132, "dct": 256, "kup": 256, "kdn": 128, "slots": 2, "note": "heuristic default (untuned)"},
+        {"id": 1, "grid": 132, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~168KB"},
+        {"id": 2, "grid": 132, "dct": 256, "kup": 256, "kdn": 128, "slots": 4, "note": "coupled candidate, SHM~168KB"},
+        {"id": 3, "grid": 132, "dct": 256, "kup": 128, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~104KB"},
+        {"id": 4, "grid": 132, "dct": 256, "kup": 384, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~136KB"},
+        {"id": 5, "grid": 132, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "coupled candidate, SHM~168KB"}
+      ]
     }
   ]
 }

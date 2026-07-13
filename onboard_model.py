@@ -127,11 +127,20 @@ def inspect_model(model):
                 "hidden_size" in cfg[sub]:
             cfg = {**cfg, **cfg[sub]}
 
+    E = _first(cfg, "n_routed_experts", "num_experts", "num_local_experts")
+    # Expert FFN size: most MoE configs use `moe_intermediate_size`; some
+    # (MiniMax, Mixtral-style) reuse plain `intermediate_size` as the
+    # per-expert size.  Only fall back when the model is clearly MoE —
+    # for dense+MoE hybrids (Qwen) `intermediate_size` is the DENSE FFN.
+    n_half = cfg.get("moe_intermediate_size")
+    if n_half is None and E:
+        n_half = cfg.get("intermediate_size")
+
     info = dict(
         model=model,
         model_type=cfg.get("model_type"),
-        E=_first(cfg, "n_routed_experts", "num_experts", "num_local_experts"),
-        N_half_full=_first(cfg, "moe_intermediate_size"),
+        E=E,
+        N_half_full=n_half,
         K=_first(cfg, "hidden_size"),
         top_k=_first(cfg, "num_experts_per_tok", "moe_top_k", "moe_topk",
                      default=8),
@@ -143,6 +152,7 @@ def inspect_model(model):
         norm_topk_prob=cfg.get("norm_topk_prob"),
         scoring_func=cfg.get("scoring_func"),           # deepseek/glm style
         topk_method=cfg.get("topk_method"),
+        use_routing_bias=cfg.get("use_routing_bias"),   # minimax style
         routed_scaling_factor=cfg.get("routed_scaling_factor"),
         use_grouped_topk=bool(cfg.get("n_group") and cfg.get("n_group") > 1),
     )
@@ -285,7 +295,7 @@ def derive_shape(info, tp):
     routing = {}
     if info.get("scoring_func") == "sigmoid" or info.get("topk_method"):
         routing["scoring_func"] = "sigmoid"
-    if info.get("topk_method") == "noaux_tc":
+    if info.get("topk_method") == "noaux_tc" or info.get("use_routing_bias"):
         routing["use_expert_bias"] = True
     rsf = info.get("routed_scaling_factor")
     if rsf and float(rsf) != 1.0:
@@ -465,13 +475,47 @@ def regen_and_build():
 
 
 def run_tune(shape_key, batch_sizes, out_json, route_capture=None):
-    cmd = [PYTHON, os.path.join(REPO, "tune_monokernel.py"),
-           "--model", shape_key,
-           "--batch-sizes"] + [str(b) for b in batch_sizes] + [
-           "--json", out_json]
-    if route_capture:
-        cmd += ["--route-capture", route_capture]
-    sh(cmd)
+    """Tune each candidate config in its own subprocess.
+
+    A config whose kernel crashes (CUDA launch failure) poisons the CUDA
+    context, so an in-process sweep would take down every config after it.
+    Per-config isolation turns a crash into a per-config CRASHED verdict
+    and the sweep continues.  Results are merged into one best-per-M JSON.
+    """
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes as REG
+    row = REG.BY_NAME[shape_key]
+    config_ids = sorted(int(c) for c in row["configs"])
+
+    merged, crashed = {}, []
+    for cid in config_ids:
+        cj = f"/tmp/onboard_tune_{shape_key}_cfg{cid}.json"
+        cmd = [PYTHON, os.path.join(REPO, "tune_monokernel.py"),
+               "--model", shape_key, "--configs", str(cid),
+               "--batch-sizes"] + [str(b) for b in batch_sizes] + [
+               "--json", cj]
+        if route_capture:
+            cmd += ["--route-capture", route_capture]
+        print(f"[onboard] $ {' '.join(cmd)}")
+        r = subprocess.run(cmd)
+        if r.returncode != 0 or not os.path.exists(cj):
+            print(f"[onboard] config {cid} CRASHED / failed — excluded "
+                  f"from the ranking.")
+            crashed.append(cid)
+            continue
+        with open(cj) as f:
+            res = json.load(f)
+        for m, v in (res.get("best_per_M") or {}).items():
+            if m not in merged or v["speedup"] > merged[m]["speedup"]:
+                merged[m] = v
+        os.remove(cj)
+
+    out = dict(model=shape_key, shape=shape_key,
+               perf_source=("route_capture" if route_capture else "synthetic"),
+               crashed_config_ids=crashed, best_per_M=merged)
+    with open(out_json, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"[onboard] merged tuning results -> {out_json}"
+          + (f" (crashed: {crashed})" if crashed else ""))
 
 
 def pin_from_tuning(out_json, shape_key):
@@ -620,15 +664,55 @@ def main():
     if "configs" in steps and row is None:
         cands = enumerate_candidates(E, N, K, verify=args.verify_shm)
         if not cands:
+            # The chosen TP has no feasible kernel carve.  Sweep the other
+            # TP options so the user sees which (if any) would work and at
+            # what memory cost.
+            print(f"[onboard] no feasible KernelConfig at TP={tp} "
+                  f"(N_half={N}, K={K}).  Sweeping other TPs:")
+            wb = info.get("weight_bytes")
+            budget = GPUS[args.gpu]["mem_gib"] * (1 << 30) * \
+                WEIGHT_MEM_FRACTION
+            kv = info["num_kv_heads"] or args.max_tp
+            nf = info["N_half_full"]
+            # (tp, weight-overage-vs-budget) for every TP with a feasible
+            # kernel carve; a small overage over the 75% heuristic can be
+            # acceptable, but weights must at least fit the physical card.
+            phys = GPUS[args.gpu]["mem_gib"] * (1 << 30) * 0.92
+            feasible = []
+            for t in (1, 2, 4, 8, 16):
+                if t > args.max_tp or t == tp:
+                    continue
+                if kv % t or nf % t or (nf // t) % 128:
+                    print(f"    TP={t}: invalid (divisibility)")
+                    continue
+                n_t = nf // t
+                cn = len(enumerate_candidates(E, n_t, K))
+                per_gpu = wb / t if wb else None
+                if per_gpu is None:
+                    mem = "mem unknown"
+                elif per_gpu <= budget:
+                    mem = f"{per_gpu / 2**30:.0f} GiB/GPU (fits budget)"
+                elif per_gpu <= phys:
+                    mem = (f"{per_gpu / 2**30:.0f} GiB/GPU — over the 75% "
+                           f"weight budget but fits the card (less KV room)")
+                else:
+                    mem = (f"{per_gpu / 2**30:.0f} GiB/GPU — does NOT fit "
+                           f"the card")
+                print(f"    TP={t}: N_half={n_t}, {cn} feasible configs, "
+                      f"{mem}")
+                if cn and (per_gpu is None or per_gpu <= phys):
+                    feasible.append((per_gpu is not None and
+                                     per_gpu > budget, t))
+            feasible.sort()  # budget-fitting TPs first, then smallest TP
+            hint = (f"  Rerun with --tp {feasible[0][1]}."
+                    if feasible else
+                    "  No TP works — the kernel needs an extension for this "
+                    "shape (UCH>2 or odd-K_TILES_DOWN support).")
             raise SystemExit(
-                "[onboard] enum_configs found no feasible KernelConfig for "
-                f"this shape (N_half={N}, K={K}).\n"
-                "  The kernel needs an up-grid carve with UP_COL_HALVES <= 2 "
-                "(2N/128 must have a divisor yielding a 128- or 256-row "
-                "up-tile)\n  and a down carve with DOWN_COL_TILE <= 512 "
-                "(K/DCT integer), with grid <= SM count.\n"
-                "  Options: pick a different TP (--tp) so the sharded N_half "
-                "changes, or extend the kernel (UCH>2 / DCT>384 support).")
+                f"[onboard] shape infeasible at TP={tp}.\n"
+                "  Constraints: UP_COL_HALVES <= 2, DOWN_COL_TILE <= 512, "
+                "K_TILES_DOWN (= sharded N_half / KDN) must be even, "
+                "grid <= SM count.\n" + hint)
         sms = GPUS[args.gpu]["sms"]
         picked = pick_candidates(cands, sms, args.max_configs)
         print(f"[onboard] {len(cands)} feasible configs; instantiating "
