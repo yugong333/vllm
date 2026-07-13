@@ -946,14 +946,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         during prefill).
         """
         assert self.moe_kernel is not None
+        # select_experts' plain top-k branch is softmax-only; sigmoid scoring
+        # and/or a selection bias (e.g. MiniMax M2, GLM noaux_tc) must go
+        # through its grouped_topk branch, which handles both.  With a single
+        # group and topk_group=1 the group carve is a no-op, so this is
+        # exactly plain biased/sigmoid top-k (the same no-op carve GLM
+        # declares explicitly via use_grouped_topk=True, n_group=1).
+        needs_grouped = (
+            layer.use_grouped_topk
+            or layer.scoring_func != "softmax"
+            or layer.e_score_correction_bias is not None
+        )
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             top_k=layer.top_k,
-            use_grouped_topk=layer.use_grouped_topk,
+            use_grouped_topk=needs_grouped,
             renormalize=layer.renormalize,
-            topk_group=layer.topk_group,
-            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group or 1,
+            num_expert_group=layer.num_expert_group or 1,
             custom_routing_function=layer.custom_routing_function,
             scoring_func=layer.scoring_func,
             e_score_correction_bias=layer.e_score_correction_bias,
