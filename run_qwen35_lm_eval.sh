@@ -25,15 +25,16 @@
 #     35b         Qwen/Qwen3.5-35B-A3B-FP8   (E=256, N=512,  K=2048)
 #     122b        Qwen/Qwen3.5-122B-A10B-FP8 (E=256, N=1024, K=3072)
 #
-#   TASK (optional, default: gsm8k)
-#     Any lm_eval task name (e.g. gsm8k, mmlu, hellaswag, arc_challenge)
-#     Multiple tasks can be comma-separated: gsm8k,hellaswag
+#   TASK (optional, default: gsm8k,humaneval)
+#     Any lm_eval task name (e.g. gsm8k, humaneval, mmlu, hellaswag,
+#     arc_challenge). Multiple tasks can be comma-separated: gsm8k,humaneval
 #
 #   BACKEND/MODEL/TASK can also be set via env vars; positional args take
 #   precedence.  Examples:
-#     ./run_qwen35_lm_eval.sh                      # monokernel, 35b, gsm8k
-#     ./run_qwen35_lm_eval.sh both 122b            # both backends, 122b, gsm8k
-#     ./run_qwen35_lm_eval.sh monokernel 122b mmlu # monokernel, 122b, mmlu
+#     ./run_qwen35_lm_eval.sh                              # monokernel, 35b, gsm8k+humaneval
+#     ./run_qwen35_lm_eval.sh both 122b                    # both backends, 122b, gsm8k+humaneval
+#     ./run_qwen35_lm_eval.sh monokernel 122b mmlu         # monokernel, 122b, mmlu only
+#     ./run_qwen35_lm_eval.sh monokernel 35b humaneval     # monokernel, 35b, HumanEval only
 #
 # Prerequisites:
 #   pip install lm_eval   (lm-evaluation-harness)
@@ -63,8 +64,8 @@ BACKEND="${1:-${BACKEND:-monokernel}}"
 # Positional arg ($2) takes precedence over the MODEL env var.
 MODEL="${2:-${MODEL:-35b}}"
 
-# lm_eval task(s) — comma-separated for multiple (default gsm8k).
-TASK="${3:-${LM_EVAL_TASK:-gsm8k}}"
+# lm_eval task(s) — comma-separated for multiple (default gsm8k + HumanEval).
+TASK="${3:-${LM_EVAL_TASK:-gsm8k,humaneval}}"
 case "$MODEL" in
     35b)
         MODEL_NAME="Qwen/Qwen3.5-35B-A3B-FP8"
