@@ -240,8 +240,7 @@ struct up_col_halves {
   }
   template <typename D>
   static constexpr std::uint32_t test(...) {
-    return ((2u * D::N * down_col_tile<D>::value) /
-                (128u * D::HIDDEN_STATES) >
+    return ((2u * D::N * down_col_tile<D>::value) / (128u * D::HIDDEN_STATES) >
             0u)
                ? (2u * D::N * down_col_tile<D>::value) /
                      (128u * D::HIDDEN_STATES)
@@ -467,9 +466,9 @@ __device__ __forceinline__ void moe_publish_act_scale(
   if (lane == 0) {
     __threadfence();
     constexpr uint32_t SCALE_COLS = MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-    atomicExch(&moe_act_scale_buf<Dims>(spec, parity)[row * SCALE_COLS +
-                                                      up_block],
-               fmaxf(scale, __FLT_MIN__));
+    atomicExch(
+        &moe_act_scale_buf<Dims>(spec, parity)[row * SCALE_COLS + up_block],
+        fmaxf(scale, __FLT_MIN__));
   }
 }
 
@@ -731,12 +730,10 @@ struct MoE_SHM {
         // is the box's own inner dim (256 B), not the destination's
         // logical row stride; each K-substep therefore needs its own
         // self-contained 2 KB slab.
-        alignas(1024) A_element
-            bf16_in_full[BF16_IN_FULL_K_BLOCKS][BF16_IN_FULL_BS]
-                        [BF16_IN_FULL_K];
+        alignas(1024) A_element bf16_in_full[BF16_IN_FULL_K_BLOCKS]
+                                            [BF16_IN_FULL_BS][BF16_IN_FULL_K];
         // Up-proj weight slots (Phase 3), UP_W_SLOTS deep.
-        alignas(1024)
-            W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
+        alignas(1024) W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
         // Down-proj weight double-buffer (Phase 4).
         alignas(1024) W_element
             w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL][CoreDims::K_STEP_WGMMA];

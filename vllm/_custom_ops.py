@@ -368,7 +368,14 @@ def moe_monokernel_topk(
         "Only the BS8 (M<=8) TMA+WGMMA path is supported."
     )
 
-    # Allocate output tensor (separate from input for top-K accumulation)
+    # M-row tensors are safe for any M <= 8: the kernel's memory footprint
+    # matches the logical batch size on both sides.  The activation TMA
+    # descriptor is built over the REAL row count (the TMA engine
+    # hardware-zeros out-of-bounds box rows), and Phase 5 writes exactly
+    # rows [0, M) of the output.  (A former 8-row padding workaround here
+    # covered an OOB read/write when the descriptor was still built over
+    # a fixed 8 rows; removed with the kernel-side fix, 2026-07-14.)
+    # Allocate output tensor (separate from input for top-K accumulation).
     activations_out = torch.zeros_like(activations_in)
 
     # Resolve the config selection: an explicit non-negative `config_id`

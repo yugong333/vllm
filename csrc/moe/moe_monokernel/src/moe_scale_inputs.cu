@@ -145,8 +145,7 @@ __device__ inline void routing_phase_quantize(
       Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
   static_assert(KBlocks == K_BLOCKS_TOTAL,
                 "bf16_in_full outer extent must be K_BLOCKS_TOTAL");
-  static_assert(Bs == Dims::BS,
-                "bf16_in_full middle extent must be Dims::BS");
+  static_assert(Bs == Dims::BS, "bf16_in_full middle extent must be Dims::BS");
   static_assert(KStep == CoreDims::K_STEP_WGMMA,
                 "bf16_in_full inner extent must be K_STEP_WGMMA (128)");
   static_assert(Fp8NumChunks == 8, "fp8_act_full middle dim must be 8");

@@ -155,12 +155,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   auto tma_slot = [&](uint32_t slot, uint32_t eid, uint32_t k_iter) {
   #pragma unroll
     for (uint32_t kk = 0; kk < K_SUBSTEPS; ++kk) {
-      tma_load_up_wgmma_tile(
-          up_weights_desc, /*expert_id=*/eid, /*N=*/Dims::N,
-          /*base_row_up=*/base_row_up,
-          /*k_start=*/k_iter * K_STEP + kk * K_STEP_WGMMA,
-          /*dest_slot=*/&shm->w_wgmma[slot][kk * W_UP_M][0],
-          /*bar=*/&shm->bar_w[slot]);
+      tma_load_up_wgmma_tile(up_weights_desc, /*expert_id=*/eid, /*N=*/Dims::N,
+                             /*base_row_up=*/base_row_up,
+                             /*k_start=*/k_iter * K_STEP + kk * K_STEP_WGMMA,
+                             /*dest_slot=*/&shm->w_wgmma[slot][kk * W_UP_M][0],
+                             /*bar=*/&shm->bar_w[slot]);
     }
   };
 
@@ -171,7 +170,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     const uint32_t first_id = shmem->experts[expert_start].id;
-  #pragma unroll
+    #pragma unroll
     for (uint32_t a = 0; a < ARM_DISTANCE; ++a) {
       mbarrier_arrive_expect_tx(&shm->bar_w[a], UP_W_TX_BYTES_TOTAL);
       tma_slot(a, first_id, a);
@@ -430,7 +429,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   #ifndef MONO_PROFILE_SKIP_CALC_UP
         const unsigned pf_warp = warp - CoreDims::CALC_WARP_COUNT;  // 0..3
         const uint32_t col_in_half = lane;                          // 0..31
-  #pragma unroll
+    #pragma unroll
         for (uint32_t w = 0; w < WAVES; ++w) {
           // s, w, pf_warp are lane-uniform, so the warp stays in lockstep
           // for the reduce; distinct s per wave ⇒ each token once.
@@ -749,7 +748,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     static_assert(K_TILES >= SLOTS && K_TILES % SLOTS == 0,
                   "up-proj SLOTS-deep pipeline requires K_TILES to be a "
                   "multiple of UP_W_SLOTS and >= UP_W_SLOTS.");
-  #pragma unroll
+    #pragma unroll
     for (uint32_t a = 0; a < ARM_DISTANCE; ++a) {
       mbarrier_arrive_expect_tx(&shm->bar_w[a], UP_W_TX_BYTES_TOTAL);
       tma_slot(a, first_id, a);
@@ -877,8 +876,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                   (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
               const void* b_ptr =
                   (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
-              uint64_t desc_a =
-                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
               uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
               wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
                                            chunk_d2, chunk_d3);
@@ -937,7 +935,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   #ifndef MONO_PROFILE_SKIP_CALC_UP
         const unsigned pf_warp = warp - CoreDims::CALC_WARP_COUNT;  // 0..3
         const uint32_t col = lane;                                  // 0..31
-  #pragma unroll
+    #pragma unroll
         for (uint32_t w = 0; w < WAVES; ++w) {
           if (s != w * DEFER_ITERS / WAVES) continue;
           const uint32_t tok = w * PF + pf_warp;
@@ -965,7 +963,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
               base_row_up + 96 + col};
           bool wr[4];
           float v[4];
-  #pragma unroll
+    #pragma unroll
           for (int i = 0; i < 4; ++i) {
             wr[i] = store_local && (oc[i] < Dims::N);
             v[i] = wr[i] ? pv[i] : 0.f;
@@ -982,8 +980,8 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
           const float inv_scale = FP8_MAX / block_max;
 
           if (store_local && tok < batch_size) {
-            // (warp-uniform branch: tok / store_local are per-warp values)
-  #pragma unroll
+              // (warp-uniform branch: tok / store_local are per-warp values)
+    #pragma unroll
             for (int i = 0; i < 4; ++i) {
               if (wr[i]) {
                 spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =
@@ -1027,16 +1025,22 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
         // f_lo and f_lo+8 (× 2 tokens).
         const float* gd = final_d[0];
         const float* ud = final_d[1];
-        float v_lo_even = __fdividef(rw_even * ud[0] * gd[0],
-                                     1.0f + __expf(-gd[0]));
-        float v_lo_odd = __fdividef(rw_odd * ud[1] * gd[1],
-                                    1.0f + __expf(-gd[1]));
-        float v_hi_even = __fdividef(rw_even * ud[2] * gd[2],
-                                     1.0f + __expf(-gd[2]));
-        float v_hi_odd = __fdividef(rw_odd * ud[3] * gd[3],
-                                    1.0f + __expf(-gd[3]));
-        if (!store_even) { v_lo_even = 0.f; v_hi_even = 0.f; }
-        if (!store_odd) { v_lo_odd = 0.f; v_hi_odd = 0.f; }
+        float v_lo_even =
+            __fdividef(rw_even * ud[0] * gd[0], 1.0f + __expf(-gd[0]));
+        float v_lo_odd =
+            __fdividef(rw_odd * ud[1] * gd[1], 1.0f + __expf(-gd[1]));
+        float v_hi_even =
+            __fdividef(rw_even * ud[2] * gd[2], 1.0f + __expf(-gd[2]));
+        float v_hi_odd =
+            __fdividef(rw_odd * ud[3] * gd[3], 1.0f + __expf(-gd[3]));
+        if (!store_even) {
+          v_lo_even = 0.f;
+          v_hi_even = 0.f;
+        }
+        if (!store_odd) {
+          v_lo_odd = 0.f;
+          v_hi_odd = 0.f;
+        }
         const uint32_t f_lo = (is_wg1 ? 64u : 0u) + warp_in_wg * 16u + lane / 4;
         const uint32_t f_hi = f_lo + 8u;
         shm->partial_result.post_silu_scratch[f_lo][tok_even] = v_lo_even;
@@ -1073,23 +1077,23 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
       }
     }
 
-    const float pv[4] = {
-        shm->partial_result.post_silu_scratch[col][tok],
-        shm->partial_result.post_silu_scratch[col + 32][tok],
-        shm->partial_result.post_silu_scratch[col + 64][tok],
-        shm->partial_result.post_silu_scratch[col + 96][tok]};
+    const float pv[4] = {shm->partial_result.post_silu_scratch[col][tok],
+                         shm->partial_result.post_silu_scratch[col + 32][tok],
+                         shm->partial_result.post_silu_scratch[col + 64][tok],
+                         shm->partial_result.post_silu_scratch[col + 96][tok]};
     const std::uint32_t oc[4] = {base_row_up + col, base_row_up + 32 + col,
-                                 base_row_up + 64 + col, base_row_up + 96 + col};
+                                 base_row_up + 64 + col,
+                                 base_row_up + 96 + col};
     bool wr[4];
     float v[4];
-  #pragma unroll
+    #pragma unroll
     for (int i = 0; i < 4; ++i) {
       wr[i] = store_local && (oc[i] < Dims::N);
       v[i] = wr[i] ? pv[i] : 0.f;
     }
 
-    float local_max = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
-                            fmaxf(fabsf(v[2]), fabsf(v[3])));
+    float local_max =
+        fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
     float block_max = warp_reduce_max_float(local_max);
     if (block_max < __FLT_MIN__) block_max = 1.0f;
     constexpr float FP8_MAX = 448.0f;
@@ -1098,8 +1102,8 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     const float inv_scale = FP8_MAX / block_max;
 
     if (store_local && tok < batch_size) {
-      // (warp-uniform branch: tok == warp id here)
-  #pragma unroll
+        // (warp-uniform branch: tok == warp id here)
+    #pragma unroll
       for (int i = 0; i < 4; ++i) {
         if (wr[i]) {
           spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =

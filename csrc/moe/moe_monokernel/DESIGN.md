@@ -26,13 +26,13 @@ GM out: activations_out [BS,K] bf16
   barriers (below) deadlock-free: every block is scheduled from launch.
 - Warp roles (fixed for the whole kernel; the same physical warps take
   phase-specific duties, detailed per stage below):
-  - warps 0–7 (threads 0–255): **calc warps**, forming two WGMMA
+    - warps 0–7 (threads 0–255): **calc warps**, forming two WGMMA
     warpgroups — WG0 = warps 0–3, WG1 = warps 4–7.  A WGMMA is issued by
     all 128 threads of a warpgroup together.
-  - warp 8 lane 0 (thread 256): the single **TMA launcher thread** —
+    - warp 8 lane 0 (thread 256): the single **TMA launcher thread** —
     issues every `cp.async.bulk.tensor.2d` and arms every mbarrier in the
     block, in all phases.
-  - warps 8–11 (threads 256–383): **prefetch warps** (PF0–PF3) — scale
+    - warps 8–11 (threads 256–383): **prefetch warps** (PF0–PF3) — scale
     loads, the deferred up-proj epilogue, the deferred down-proj
     accumulate, and (warps 1–11) the Phase-2 quantization.
 
@@ -163,11 +163,11 @@ Block assignment: `up_group = blockIdx.x / UP_GRID`,
 - **Blocks per expert**: `UP_GRID = 2N/(128·UCH)` blocks jointly produce
   one expert's full `2N` intermediate rows; block `up_block_idx` owns rows
   `[up_block_idx · 128·UCH, +128·UCH)`.
-  - 35B cfg 0: 8 blocks × 128 rows (64 gate + 64 up features each,
+    - 35B cfg 0: 8 blocks × 128 rows (64 gate + 64 up features each,
     interleaved).
-  - 122B cfg 0: 8 blocks × 256 rows = 128 gate + 128 up features each (two
+    - 122B cfg 0: 8 blocks × 256 rows = 128 gate + 128 up features each (two
     raw atoms).
-  - GLM 5.2 cfg 0: 2 blocks × 256 rows.
+    - GLM 5.2 cfg 0: 2 blocks × 256 rows.
 - **Experts in parallel**: `UP_GROUPS = GRID_SIZE/UP_GRID` expert groups
   (16 / 16 / 64) run concurrently, one active expert per group at a time.
 - **Expert loop**: group g iterates the *active* expert list (built by
@@ -178,7 +178,7 @@ Block assignment: `up_group = blockIdx.x / UP_GRID`,
   UP_GROUPS=64.  A group whose index exceeds `expert_count` skips Phase 3
   entirely and waits at the site-#2 barrier.
 - **Per expert, warp duties**:
-  - warps 0–7 (WG0 + WG1): the K-loop — `K_TILES_UP = K/KUP` iterations
+    - warps 0–7 (WG0 + WG1): the K-loop — `K_TILES_UP = K/KUP` iterations
     (8 / 12 / 24), each
     waiting `bar_w[s % SLOTS]` then chaining 4 WGMMAs per 128-K substep
     per M-atom, with scale-apply at every 128-K boundary.  WG0 computes
@@ -187,14 +187,14 @@ Block assignment: `up_group = blockIdx.x / UP_GRID`,
     `post_silu_scratch` and snapshot the rank cache.  8 calc threads
     (one per token) also populate the per-expert routing cache at the
     K-loop top.
-  - warp 8 lane 0 (launcher): inside each K-iteration, arms + TMAs the
+    - warp 8 lane 0 (launcher): inside each K-iteration, arms + TMAs the
     weight slot `UP_ARM_DISTANCE = max(1, SLOTS−2)` iterations ahead; on
     the last `UP_ARM_DISTANCE` iterations it stitches the *next* expert's
     first tiles instead, so the pipeline never drains across experts.
-  - warp 8 (lanes 0–31, as PF warp 0): cp.async-prefetches the *next*
+    - warp 8 (lanes 0–31, as PF warp 0): cp.async-prefetches the *next*
     expert's block-scale tile into the `up_scale` ping-pong during the
     current K-loop.
-  - warps 8–11 (PF0–PF3): the **deferred epilogue of the previous
+    - warps 8–11 (PF0–PF3): the **deferred epilogue of the previous
     expert** — one warp per token, `ceil(BS/4)` waves spaced across the
     first `K_TILES_UP - 1` iterations: read `post_silu_scratch`,
     warp-reduce max over the block's 64 (35B) or 128 (122B) features,
@@ -231,21 +231,21 @@ The same 128 blocks re-map: `down_group = blockIdx.x / DOWN_GRID`,
   in a different interleaving; correctness needs only that Phase 3
   finished the expert before Phase 4 reads it, which site #2 guarantees.
 - **Per expert, warp duties**:
-  - warps 0–7: K-loop of `K_TILES_DOWN = N/KDN` iterations (2 / 8 / 2),
+    - warps 0–7: K-loop of `K_TILES_DOWN = N/KDN` iterations (2 / 8 / 2),
     each
     waiting `bar_w[s&1]` + `bar_a[s&1]` (weight + activation double
     buffers) then running the lo/hi WGMMA chains per substep per
     col-half with scale-apply; at the loop tail they write the
     accumulators to `down_out` in SHM.
-  - warp 8 lane 0 (launcher): prefetches K-step s+1 during step s; on
+    - warp 8 lane 0 (launcher): prefetches K-step s+1 during step s; on
     the last step prefetches the *next expert's* step-0 weight +
     activation tiles instead (inter-expert lookahead).  The activation
     tile is one bulk TMA per 128-K substep covering all ≤ 8 routed rows
     of the expert (fetched from the contiguous `temp_fp8` slab).
-  - warp 8 (PF0): loads the expert's per-token activation scales;
+    - warp 8 (PF0): loads the expert's per-token activation scales;
     warp 9 (PF1): loads the expert's weight scales — both once per
     expert, in parallel, before the K-loop.
-  - warps 8–11 (128 PF threads): the **deferred accumulate of the
+    - warps 8–11 (128 PF threads): the **deferred accumulate of the
     previous expert** — `out_accum[tok][col] += down_out[col][rank]`,
     the (tok, col) plane sliced across the first `K_TILES_DOWN − 1`
     iterations (7 slices at K_TILES_DOWN=8; a single slice at s=0 for
@@ -297,6 +297,7 @@ asymmetric producer→consumer barrier (`expert_produce_arrive` /
 `expert_consume_wait`, keyed by up_group).
 
 **Interleaved vs raw up-proj weights.**
+
 - UCH == 1 (35B): one 128-row A-tile packs 64 gate + 64 up rows in the
   gate/up *pair layout*.  The tensor must be pre-interleaved in Python
   (`interleave_for_tma_wgmma_up_v2`) so a single 128×128 TMA fetches one
@@ -329,6 +330,7 @@ per-expert parity reset would then let the next expert's first wait pass on
 the stale phase and corrupt the arm/wait pairing.
 
 Per 128-K substep, each WG chains 4 `wgmma.mma_async.m64n8k32.e4m3` reading:
+
 - A = weight tile from `w_wgmma` (SWZ128 canonical Major::K, LBO=16,
   SBO=1024, swizzle=1),
 - B = activations from `fp8_act_full` (SWIZZLE_NONE; LBO=144 — see SHM),
@@ -337,6 +339,7 @@ then applies `weight_scale × act_scale` at the 128-K boundary into fp32
 accumulators.
 
 Cross-expert latency hiding:
+
 - the next expert's block-scale tile is prefetched via `cp.async` into a
   ping-pong `up_scale[2]` buffer during the current K-loop;
 - a per-expert routing cache (`up_rank_for_tok` / `up_rw_for_tok`) is
@@ -372,7 +375,7 @@ expert:
   activation scales for the *whole* expert (warp 8) — hoisted out of the
   K-loop.  The activation-scale SHM layout is `[block][tok]`
   (bank-conflict-free broadcast in the scale-apply).
-- K-loop over `K_TILES_DOWN = N / K_STEP_DOWN` with a 2-slot weight + 
+- K-loop over `K_TILES_DOWN = N / K_STEP_DOWN` with a 2-slot weight +
   activation TMA double-buffer (`bar_w[0..1]`, `bar_a[0..1]`, reinitialized in
   the down-proj prologue).  The launcher prefetches step s+1 during step s;
   at the last step it instead prefetches the *next expert's* step-0 tiles
@@ -398,6 +401,7 @@ expert:
 
 `topK_BS8` (one warp per token, experts distributed lane-cyclically,
 `NUM_EXPERTS % 32 == 0` keeps score arrays in registers):
+
 - Fast path (softmax+renormalize, or sigmoid): select top-k on raw logits
   (activations are monotone), then exponentiate only the k winners; for
   softmax+renorm the global denominator cancels.  Softmax+no-renorm needs the
@@ -409,6 +413,7 @@ expert:
   `routed_scaling_factor` is folded into the shared normalizer.
 
 `prepare_moe_topk_BS8` (warp 0 only, 3 phases):
+
 - A: vectorized zero of `expert_routed_count`, 0xFF-seed of `down_rank`,
   tally via `__match_any_sync` with routed pair eids cached in registers.
 - B: fused dual warp scan (routed-count prefix + active-expert prefix) →
@@ -429,6 +434,7 @@ The dominant space is a union whose members have strictly disjoint lifetimes
 | `w_down_wgmma[2][DCT·K_SUBSTEPS][128]` | 4 | dominates |
 
 Other notable fields:
+
 - `fp8_act_full[K/128][8][T_TILE+1][16]` — single-buffer fp8 activations for
   the whole K range (Phase 3 reads with no slot alternation).  The 9th
   token row per 16-B chunk is padding: it moves the chunk stride from 128 B
@@ -567,7 +573,6 @@ CMakeLists.txt — see the commented examples there):
 - `MONO_PROFILE_PHASE_TIMING` — block-0 clock64 timestamps at phase
   boundaries into `spec->phase_timestamps`; output stays correct, overhead
   negligible.  Read back from the scratchpad tail in Python.
-
 
 ## Shipped configurations (from shapes.json)
 

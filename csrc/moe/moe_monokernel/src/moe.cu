@@ -83,7 +83,7 @@ __device__ void moe_kernel_topk_BS8(
   // gated on the same flag, so nothing blocks on an uninitialized parity).
   auto* u_tma = &shmem->u.tiny_wgmma_tma;
   if (is_tma_launcher_thread<Dims>()) {
-  #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < MoECoreDims<Dims>::UP_W_SLOTS; ++i) {
       mbarrier_init(&u_tma->bar_w[i], 1u);
     }
@@ -267,8 +267,8 @@ __device__ void moe_kernel_topk_BS8(
   // ── Phase 5: fp32 → bf16 cast + writeback ─────────────────────────────
   // Each cell of down_partial_out already holds the full sum (Phase-4
   // atomicAdds); the first DOWN_GRID blocks stream-cast their own col
-  // stripe.  Every output element is `=`-written (real tokens get the sum,
-  // padding tokens get zero), so no output pre-zero pass exists anywhere.
+  // stripe.  Every element of the M-row output is `=`-written, so no
+  // output pre-zero pass exists anywhere.
   constexpr std::uint32_t DOWN_GRID_LOCAL = CoreDims::DOWN_GRID;
   constexpr std::uint32_t DOWN_COL_TILE_LOCAL = CoreDims::DOWN_COL_TILE;
   const std::uint32_t down_group_r = blockIdx.x / DOWN_GRID_LOCAL;
@@ -297,15 +297,9 @@ __device__ void moe_kernel_topk_BS8(
       activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)v;
     }
 
-    // Zero the padding tokens [batch_size, Dims::BS) in this col stripe.
-    for (std::uint32_t flat = threadIdx.x;
-         flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
-         flat += blockDim.x) {
-      const std::uint32_t tok = batch_size + flat / DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col = base_col_r + col_in_block;
-      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
-    }
+    // No padding-row writes: activations_out is an M-row tensor and rows
+    // [batch_size, Dims::BS) do not exist (writing them was an
+    // out-of-bounds store for M < 8; no consumer ever read them).
   }
 
   MONO_PHASE_TIMESTAMP(t_after_phase5);

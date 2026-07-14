@@ -218,9 +218,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   (void)expert_weights_down;
   (void)top_k;
 
-  constexpr std::uint32_t K_TILE_W = CoreDims::K_TILE_WGMMA;             // 32
+  constexpr std::uint32_t K_TILE_W = CoreDims::K_TILE_WGMMA;  // 32
   constexpr std::uint32_t K_STEP_DOWN = CoreDims::K_STEP_DOWN;
-  constexpr std::uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;         // 128
+  constexpr std::uint32_t K_STEP_WGMMA = CoreDims::K_STEP_WGMMA;  // 128
   constexpr std::uint32_t K_SUBSTEPS_DOWN = CoreDims::K_SUBSTEPS_DOWN;
   constexpr std::uint32_t WGMMAS_PER_SUBSTEP = K_STEP_WGMMA / K_TILE_W;  // 4
   constexpr std::uint32_t K_TILES_DOWN = Dims::N / K_STEP_DOWN;
@@ -458,7 +458,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 (const void*)((const char*)a_slot_base + atom_off_bytes +
                               wg_offset_bytes);
 
-            // 2 chained WGMMAs into the lo chunk (K[0..63])...
+              // 2 chained WGMMAs into the lo chunk (K[0..63])...
     #pragma unroll
             for (std::uint32_t j = 0; j < 2; ++j) {
               const void* a_ptr =
@@ -474,7 +474,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                                            chunk_d_lo[h][3]);
             }
 
-            // ...and 2 into the hi chunk (K[64..127]).
+              // ...and 2 into the hi chunk (K[64..127]).
     #pragma unroll
             for (std::uint32_t j = 2; j < WGMMAS_PER_SUBSTEP; ++j) {
               const void* a_ptr =
