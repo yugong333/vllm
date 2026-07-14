@@ -227,8 +227,9 @@ struct up_w_slots {
 //   UP_COL_HALVES = (2*N * DOWN_COL_TILE) / (128 * HIDDEN_STATES), min 1.
 //
 // When PRESENT, taken verbatim and the up/down grids are DECOUPLED
-// (UP_GROUPS need not equal DOWN_GROUPS); such shapes must use the
-// producer→consumer barrier split at site #2 (see moe_grid_barrier.h).
+// (UP_GROUPS need not equal DOWN_GROUPS); the sentinel Phase-3→4 handoff
+// covers this case natively (consumers poll the published scales they
+// read, so producer set != consumer set needs no special protocol).
 template <typename Dims>
 struct up_col_halves {
  private:
@@ -308,17 +309,12 @@ struct MoEGemmSpec {
   // precision.
   float down_partial_out[Dims::BS * Dims::HIDDEN_STATES];
 
-  // ── Software barrier counters (tail — see the layout invariant above) ──
-  // Zeroed once per process by the host on first launch; self-maintaining
-  // afterwards via the seed-exchange ping-pong discipline in
-  // moe_grid_barrier.h.
-  //
-  //   grid_barrier.slot[2]                  — full-grid ping-pong pair.
-  //   partial_barrier.expert_slot[E][2]     — site #2, one pair per expert
-  //                                           group (arrival count = UP_GRID).
-  //   partial_barrier.colstripe_slot[DG][2] — site #3, one pair per output
-  //                                           col stripe (arrival count =
-  //                                           DOWN_GROUPS).
+  // ── RESERVED (unused since the flag-based Phase 3→4 / 4→5 handoffs) ──
+  // Former software-barrier counter regions (moe_grid_barrier.h, since
+  // removed).  Both handoff sites now use data-path / flag readiness
+  // instead (see the sentinel tail fields below); no kernel code touches
+  // these words.  Kept as dead bytes so the phase_timestamps offsets
+  // (read by external profiling tooling) stay stable.
   struct {
     uint32_t slot[2];
   } grid_barrier;
@@ -380,7 +376,102 @@ struct MoEGemmSpec {
     int64_t t_up_e1_after_scale_block;
     int64_t t_after_phase5;
   } phase_timestamps;
+
+  // ── Sentinel-based Phase 3 → 4 handoff state (tail fields) ────────────
+  //
+  // The site-#2 barrier is replaced by data-path readiness (see the
+  // site-#2 note in moe.cu and the up/down projection publish/poll
+  // sites): a `temp_act_scale` cell doubles as the readiness
+  // flag for its fp8 payload segment, with bit pattern 0x00000000 (+0.0f)
+  // as the "not yet published" sentinel.  Published scales are clamped to
+  // >= FLT_MIN (positive normal) at the publish site, so 0.0 is never a
+  // valid value — even under flush-to-zero.  Using 0.0 (not NaN) means
+  // the host-side `torch.zeros` scratchpad allocation establishes the
+  // sentinel invariant for EVERY scratchpad (one per layer) with no
+  // per-scratchpad host init.
+  //
+  // Reset discipline (double buffer + async reset): consumers must never
+  // observe a LEFTOVER scale from the previous launch, so the scale
+  // buffer ping-pongs per launch.  Launch parity comes from
+  // `launch_flip[blockIdx.x]` — a per-block PRIVATE persistent counter
+  // each block increments exactly once per launch (no cross-block
+  // synchronization needed; all blocks agree because all count the same
+  // launches).  Each launch writes/polls the parity-selected buffer and
+  // zero-refills the OTHER buffer for the next launch, off the critical
+  // path.
+  //
+  // `temp_act_scale_alt` lives at the TAIL (not next to `temp_act_scale`)
+  // to preserve the head-field layout invariant documented above.
+  float temp_act_scale_alt[TEMP_ROWS * TEMP_ACT_SCALE_COLS];
+  uint32_t launch_flip[Dims::KernelConfig::GRID_SIZE];
+
+  // ── Phase 4 → 5 readiness flags (replaces the site-#3 barrier) ────────
+  //
+  // `down_partial_out` is atomicAdd-accumulated, so its readiness cannot
+  // be encoded in the data (a partial sum looks like a complete one).
+  // Instead each contributing block bumps its col-stripe's arrival
+  // counter (fence + atomicAdd) after its Phase-4 adds; the stripe's
+  // single Phase-5 writer polls until the count reaches DOWN_GROUPS.
+  // Only the 8 Phase-5 writers ever wait — the other blocks publish and
+  // exit (the old colstripe_barrier made all 128 blocks spin).
+  //
+  // Same double-buffer parity reset as the scale sentinel: launch parity
+  // selects the active row; the prologue zero-refills the OTHER row for
+  // the next launch.  torch.zeros allocation covers the first launch.
+  uint32_t down_ready[2][DOWN_GRID];
+
+  static constexpr size_t TEMP_ACT_SCALE_OFFSET =
+      offsetof(MoEGemmSpec<Dims>, temp_act_scale);
+  static constexpr size_t TEMP_ACT_SCALE_ALT_OFFSET =
+      offsetof(MoEGemmSpec<Dims>, temp_act_scale_alt);
+  static constexpr size_t TEMP_ACT_SCALE_BYTES =
+      sizeof(float) * TEMP_ROWS * TEMP_ACT_SCALE_COLS;
 };
+
+// ── Sentinel handoff helpers (Phase 3 → 4) ────────────────────────────────
+
+// "Not yet published" test.  The sentinel is exactly +0.0f (bit pattern
+// 0x00000000); published scales are clamped to >= FLT_MIN so no valid
+// publication can produce it.  (-0.0f cannot occur either: the buffer is
+// only ever zero-filled or published-to.)
+__device__ __forceinline__ bool moe_scale_is_sentinel(uint32_t bits) {
+  return bits == 0u;
+}
+
+// Parity-selected scale buffer for the CURRENT launch.
+template <typename Dims>
+__device__ __forceinline__ float* moe_act_scale_buf(
+    MoEGemmSpec<Dims>* __restrict__ spec, uint32_t parity) {
+  return parity ? spec->temp_act_scale_alt : spec->temp_act_scale;
+}
+
+/**
+ * @brief Publish one (row, up-block) activation scale as payload + flag.
+ *
+ * Caller contract: every lane of the calling warp has already issued its
+ * fp8 payload stores for this (row, up-block) segment, and the call is
+ * warp-uniform.  `__syncwarp()` joins the lanes, the fence releases the
+ * payload at device scope, and the `atomicExch` makes the flag store
+ * morally strong so a consumer's device-scope poll that observes a
+ * non-sentinel value is guaranteed to also observe the payload.
+ *
+ * The published value is clamped to >= FLT_MIN so a subnormal scale can
+ * never flush to 0.0 (the sentinel) and hang a consumer; a scale that
+ * tiny dequantizes to ~0 either way, so the clamp is numerically inert.
+ */
+template <typename Dims>
+__device__ __forceinline__ void moe_publish_act_scale(
+    MoEGemmSpec<Dims>* __restrict__ spec, uint32_t parity, uint32_t row,
+    uint32_t up_block, float scale, unsigned lane) {
+  __syncwarp();
+  if (lane == 0) {
+    __threadfence();
+    constexpr uint32_t SCALE_COLS = MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
+    atomicExch(&moe_act_scale_buf<Dims>(spec, parity)[row * SCALE_COLS +
+                                                      up_block],
+               fmaxf(scale, __FLT_MIN__));
+  }
+}
 
 // Maximum supported dimensions.  Sizes only the max-SHM / max-scratchpad
 // bookkeeping (`get_moe_max_*`); never launched.
@@ -771,6 +862,12 @@ struct MoE_SHM {
   static constexpr uint32_t ACT_SCALE_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
   S_element act_scale[ACT_SCALE_BLOCKS][Dims::BS];
+
+  // Launch parity for the sentinel Phase-3→4 handoff (selects which
+  // temp_act_scale buffer this launch publishes/polls).  Written by
+  // thread 0 in the kernel prologue from spec->launch_flip[blockIdx.x];
+  // published to all warps by the prologue __syncthreads.
+  uint32_t scale_parity;
 
   // Unique experts active in this batch, ascending id; filled by
   // prepare_moe_topk_BS8.

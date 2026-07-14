@@ -228,11 +228,12 @@ void launch_moe_monokernel(
                 dims::KernelConfig::BLOCK_SIZE, shmem_size, fa.numRegs,
                 fa.sharedSizeBytes, max_blocks_per_sm, sm_count,
                 max_blocks_per_sm * sm_count, smem_opt_in);
-        /* Runtime half of the software-barrier co-residency invariant
-           (see src/moe_grid_barrier.h): every participating block must be
-           scheduled for the kernel's full lifetime, which needs
-           GRID_SIZE <= SM count.  One-shot: GRID_SIZE is constexpr and
-           the SM count is device-static. */
+        /* Runtime half of the co-residency invariant required by the
+           flag/sentinel handoffs (sites #2 and #3 in src/moe.cu): a
+           consumer spin-waits on values a producer block publishes, so
+           every block must be scheduled for the kernel's full lifetime,
+           which needs GRID_SIZE <= SM count.  One-shot: GRID_SIZE is
+           constexpr and the SM count is device-static. */
         STD_TORCH_CHECK(
             dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count),
             "moe_monokernel requires GRID_SIZE (=",
@@ -249,14 +250,21 @@ void launch_moe_monokernel(
     {
       static bool _zeroed = false;
       if (!_zeroed) {
+        /* The zero fill also establishes the sentinel-handoff invariant:
+           an all-zero temp_act_scale buffer reads as "nothing published"
+           (0.0f sentinel; see moe_scale_is_sentinel in moe_internal.h).
+           Callers that allocate the scratchpad with torch.zeros (the
+           serving path — one scratchpad per layer, where this one-shot
+           static wouldn't fire per instance) satisfy it the same way. */
         CUDA_CHECK(
             cudaMemsetAsync(scratchpad_ptr, 0, scratchpad_size, stream));
         _zeroed = true;
       }
     }
     /* Standard (non-cooperative) launch: cross-block ordering comes from
-       the software barriers in src/moe_grid_barrier.h, which is what lets
-       the kernel be captured into a CUDA Graph. */
+       the flag/sentinel handoffs inside the kernel (sites #2 and #3 in
+       src/moe.cu), which is what lets the kernel be captured into a CUDA
+       Graph. */
     CUDA_CHECK(cudaLaunchKernel((const void*)moe_kernel_topk<dims>,
                                 dim3(dims::KernelConfig::GRID_SIZE, 1, 1),
                                 dim3(dims::KernelConfig::BLOCK_SIZE, 1, 1),

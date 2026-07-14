@@ -14,7 +14,6 @@
 
   #include "moe_interface.h"
   #include "moe_internal.h"
-  #include "moe_grid_barrier.h"
   #include "ptx_utils.h"
 
 namespace moe_monokernel {

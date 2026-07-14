@@ -475,18 +475,18 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
 
           if (store_local && tok < batch_size) {
+            // (warp-uniform branch: tok / store_local are per-warp values)
             if (write1_l) {
               spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
             }
             if (write2_l) {
               spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
             }
-            if (lane == 0) {
-              constexpr std::uint32_t SCALE_COLS =
-                  MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-              spec->temp_act_scale[dest_row_local * SCALE_COLS +
-                                   effective_bid] = block_scale_l;
-            }
+            // Sentinel handoff: payload first, then the scale as a
+            // release-published readiness flag (syncwarp + fence inside).
+            moe_publish_act_scale<Dims>(spec, shmem->scale_parity,
+                                        dest_row_local, effective_bid,
+                                        block_scale_l, lane);
           }
         }
   #endif
@@ -621,18 +621,16 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
 
       if (store_local && tok < batch_size) {
+        // (warp-uniform branch: tok == warp id here)
         if (write1_l) {
           spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
         }
         if (write2_l) {
           spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
         }
-        if (lane == 0) {
-          constexpr std::uint32_t SCALE_COLS =
-              MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-          spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
-              block_scale_l;
-        }
+        // Sentinel handoff publish (see moe_publish_act_scale).
+        moe_publish_act_scale<Dims>(spec, shmem->scale_parity, dest_row_local,
+                                    effective_bid, block_scale_l, lane);
       }
     }
   #endif
@@ -984,6 +982,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
           const float inv_scale = FP8_MAX / block_max;
 
           if (store_local && tok < batch_size) {
+            // (warp-uniform branch: tok / store_local are per-warp values)
   #pragma unroll
             for (int i = 0; i < 4; ++i) {
               if (wr[i]) {
@@ -991,12 +990,10 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                     (AQ_element)(v[i] * inv_scale);
               }
             }
-            if (lane == 0) {
-              constexpr std::uint32_t SCALE_COLS =
-                  MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-              spec->temp_act_scale[dest_row_local * SCALE_COLS +
-                                   effective_bid] = block_scale;
-            }
+            // Sentinel handoff publish (see moe_publish_act_scale).
+            moe_publish_act_scale<Dims>(spec, shmem->scale_parity,
+                                        dest_row_local, effective_bid,
+                                        block_scale, lane);
           }
         }
   #endif
@@ -1101,6 +1098,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     const float inv_scale = FP8_MAX / block_max;
 
     if (store_local && tok < batch_size) {
+      // (warp-uniform branch: tok == warp id here)
   #pragma unroll
       for (int i = 0; i < 4; ++i) {
         if (wr[i]) {
@@ -1108,12 +1106,9 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
               (AQ_element)(v[i] * inv_scale);
         }
       }
-      if (lane == 0) {
-        constexpr std::uint32_t SCALE_COLS =
-            MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-        spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
-            block_scale;
-      }
+      // Sentinel handoff publish (see moe_publish_act_scale).
+      moe_publish_act_scale<Dims>(spec, shmem->scale_parity, dest_row_local,
+                                  effective_bid, block_scale, lane);
     }
   #endif
   }

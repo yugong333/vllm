@@ -458,35 +458,54 @@ Persistent GM workspace, one per process (allocated by the caller, ≥
   **Layout invariant:** the host computes the device address of `temp_fp8`
   as `scratchpad + TEMP_FP8_OFFSET` when building the down-activation TMA
   descriptor, so no field may ever be inserted before `temp_fp8`; new fields
-  (barrier counters, timing) go at the tail.  A `static_assert` in
+  (handoff flags, timing) go at the tail.  A `static_assert` in
   `moe_wrapper.cu` enforces this.
 - `down_partial_out[BS][K]` fp32 — Phase 4 atomicAdd target.
-- barrier counters (`grid_barrier.slot[2]`,
-  `partial_barrier.expert_slot[E][2]`, `colstripe_slot[DOWN_GRID][2]`).
+- reserved dead bytes (former software-barrier counter regions; kept so the
+  `phase_timestamps` offsets stay stable).
 - `phase_timestamps` — clock64 instrumentation, only written under
   `MONO_PROFILE_PHASE_TIMING`.
+- sentinel-handoff tail state: `temp_act_scale_alt` (the second scale
+  buffer), `launch_flip[GRID_SIZE]` (per-block private launch counters →
+  buffer parity), `down_ready[2][DOWN_GRID]` (Phase-4→5 arrival counters).
 
-## Software barriers (`moe_grid_barrier.h`)
+## Cross-block synchronization (flag/sentinel handoffs)
 
-Replace `cooperative_groups::this_grid().sync()` so the kernel launches via
-plain `cudaLaunchKernel` and can be captured into a CUDA Graph.
+There are no grid barriers.  The kernel launches via plain
+`cudaLaunchKernel` (CUDA-Graph capturable) and orders its two cross-block
+handoffs through the data path, so consumers wait only on the values they
+actually need.  Both handoffs rely on the one-block-per-SM co-residency
+invariant (a spinning consumer needs its producers scheduled), enforced at
+compile time by `__launch_bounds__(BLOCK_SIZE, 1)` and at runtime by the
+`GRID_SIZE <= SM count` check in the wrapper.
 
-Protocol per (region, id) counter pair:
-1. `__syncthreads()`; thread 0 `__threadfence()` (release).
-2. The seed block `atomicExch`es `SEED = 0x80000000 - (arrival_count-1)` and
-   folds back any early arrivals (`prior & 0x7FFFFFFF` — the high bit is the
-   previous call's exit marker, not a count).  Other blocks `atomicAdd(+1)`.
-3. All threads spin on `atomicAdd(c, 0)` until bit 31 sets, then
-   `__threadfence()` + `__syncthreads()` (acquire).
-4. Ping-pong slot (`phase & 1`) so a call racing one ahead can't observe the
-   previous call's exit state.  Counters are zeroed once by the host; the
-   seed exchange makes them self-maintaining afterwards.
+**Site #2 (Phase 3 → 4), sentinel-in-data:** each `temp_act_scale` cell
+doubles as the readiness flag for the fp8 payload segment it covers.  The
+producing warp stores the payload, then `__syncwarp()` +
+`__threadfence()` + `atomicExch` of the scale (`moe_publish_act_scale`),
+clamped to >= FLT_MIN so the sentinel `+0.0f` is never a valid value.  The
+down-projection polls exactly the cells of the expert it is about to
+consume (device-scope atomic reads) before reading scales or issuing the
+activation TMA; the inter-expert lookahead TMA has its own sweep-poll
+(`moe_wait_expert_scales_published`).  This gives per-expert granularity —
+down work for an expert starts as soon as that expert's rows are
+published — and covers coupled and decoupled carves uniformly.
 
-Variants: `grid_barrier` (whole grid), `partial_barrier` with the
-`expert_barrier` / `colstripe_barrier` aliases, and the asymmetric
-`expert_produce_arrive` / `expert_consume_wait` pair for decoupled shapes
-(producers arrive without spinning; consumers spin without arriving; slot
-parity is pinned to 0 because each slot completes exactly once per launch).
+**Site #3 (Phase 4 → 5), arrival flags:** `down_partial_out` is
+atomicAdd-accumulated, so readiness cannot live in the data (a partial sum
+looks complete).  Each block instead bumps its col stripe's arrival
+counter (`__syncthreads()`, `__threadfence()`, `atomicAdd(+1)`) and runs
+to exit; only the stripe's single Phase-5 writer polls the counter up to
+`DOWN_GROUPS`.
+
+**Reset discipline (both sites):** flag state must never leak across
+launches, so it is double-buffered by launch parity: every block bumps its
+private `launch_flip` word once per launch (all blocks agree on parity
+with no cross-block sync), the current parity's state is consumed, and the
+OTHER parity's state is zero-refilled in the prologue, off the critical
+path.  A `torch.zeros` scratchpad allocation establishes the invariant for
+the first launch — no host-side re-init is ever needed, and the scheme is
+CUDA-Graph-replay safe (parity keeps alternating across replays).
 
 ## TMA descriptors
 

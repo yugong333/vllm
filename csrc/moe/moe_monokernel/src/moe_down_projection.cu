@@ -64,6 +64,18 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
   const uint32_t expert_start =
       static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
 
+  // Sentinel handoff (replaces the site-#2 barrier): the up-proj epilogue
+  // release-publishes each scale AFTER its fp8 payload segment, so
+  // polling a cell until it turns non-zero is the readiness wait for
+  // exactly the payload this expert consumes.  Device-scope atomic reads
+  // (ld.acquire.gpu on SM90) bypass the non-coherent L1.
+  //
+  // Under MONO_PROFILE_SKIP_CALC_UP the scales are never published;
+  // polling would deadlock, so fall back to plain (garbage) loads —
+  // profiling output is documented as garbage anyway.
+  uint32_t* scale_bits = reinterpret_cast<uint32_t*>(moe_act_scale_buf<Dims>(
+      const_cast<MoEGemmSpec<Dims>*>(spec), shmem->scale_parity));
+
   constexpr unsigned TOTAL = (unsigned)(ScaleTok * ScaleHalves);
   for (unsigned i = thread; i < TOTAL; i += 32u) {
     const unsigned slot_row = i / SCALE_COLS;
@@ -71,14 +83,74 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
 
     if (slot_row < routed_count) {
       const uint32_t source_row = expert_start + slot_row;
-      dest_scale[half][slot_row] =
-          spec->temp_act_scale[source_row * SCALE_COLS + half];
+      uint32_t* cell = scale_bits + source_row * SCALE_COLS + half;
+  #ifndef MONO_PROFILE_SKIP_CALC_UP
+      uint32_t bits = atomicAdd(cell, 0u);
+      while (moe_scale_is_sentinel(bits)) {
+        bits = atomicAdd(cell, 0u);
+      }
+      dest_scale[half][slot_row] = __uint_as_float(bits);
+  #else
+      dest_scale[half][slot_row] = __uint_as_float(*cell);
+  #endif
     } else {
       // Unused rank — never consumed (the rank-filtered accumulate skips
       // it); zeroed for cleanliness.
       dest_scale[half][slot_row] = 0.f;
     }
   }
+
+  // Acquire for the payload behind the observed flags, then join the
+  // warp: this loader runs on the TMA launcher's warp, so after the
+  // syncwarp the launcher's activation-TMA issue (later in program
+  // order) is gated on EVERY lane's polls, not just its own.
+  __threadfence();
+  __syncwarp();
+}
+
+/**
+ * @brief Single-thread readiness wait for one expert's published scales.
+ *
+ * Sentinel-handoff companion for the inter-expert LOOKAHEAD activation
+ * TMA: the launcher issues the NEXT expert's K=0 activation tile while
+ * the current expert is still computing, i.e. BEFORE the next expert's
+ * loader poll runs — so the launcher must confirm the next expert's
+ * payload is published first.  Sweep-polls all (row, half) cells of the
+ * expert (independent reads pipeline within a sweep; re-sweeps until no
+ * sentinel remains), then acquires.
+ *
+ * Runs on ONE thread (the TMA launcher).  Weight TMAs need no such gate
+ * (weights are static); issue them before this wait to keep DRAM busy.
+ */
+template <typename Dims>
+__device__ inline void moe_wait_expert_scales_published(
+    const MoEGemmSpec<Dims>* __restrict__ spec,
+    const MoE_SHM<Dims>* __restrict__ shmem, std::uint32_t expert_start,
+    std::uint32_t routed_count) {
+  #ifndef MONO_PROFILE_SKIP_CALC_UP
+  constexpr uint32_t SCALE_COLS =
+      Dims::N / MoECoreDims<Dims>::DOWN_ACT_BLOCK_SIZE;
+  uint32_t* base = reinterpret_cast<uint32_t*>(moe_act_scale_buf<Dims>(
+      const_cast<MoEGemmSpec<Dims>*>(spec), shmem->scale_parity));
+  bool pending = true;
+  while (pending) {
+    pending = false;
+    for (uint32_t r = 0; r < routed_count; ++r) {
+      for (uint32_t h = 0; h < SCALE_COLS; ++h) {
+        uint32_t* cell = base + (expert_start + r) * SCALE_COLS + h;
+        if (moe_scale_is_sentinel(atomicAdd(cell, 0u))) {
+          pending = true;
+        }
+      }
+    }
+  }
+  __threadfence();
+  #else
+  (void)spec;
+  (void)shmem;
+  (void)expert_start;
+  (void)routed_count;
+  #endif
 }
 
 /**
@@ -545,6 +617,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           }
 
           if (next_routed_count > 0u) {
+            // Sentinel handoff: the next expert's fp8 payload may still
+            // be in flight from its up-group — confirm publication
+            // before the activation TMA reads it.  (Weight TMAs above
+            // are static data and issue without the gate.)
+            moe_wait_expert_scales_published<Dims>(
+                spec, shmem, next_expert_start, next_routed_count);
             mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
                                       /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
     #pragma unroll

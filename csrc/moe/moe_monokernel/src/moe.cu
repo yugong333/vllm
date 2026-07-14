@@ -11,7 +11,6 @@
 
 #define INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
 #include "moe_down_projection.cu"
-#include "moe_grid_barrier.h"
 #include "moe_internal.h"
 #include "moe_scale_inputs.cu"
 #include "moe_tma.h"
@@ -30,11 +29,15 @@ namespace moe_monokernel {
  *   Phase 2: warp 0 runs prepare_moe_topk_BS8; warps 1..11 wait on
  *            bar_rwin and quantize the tile into fp8_act_full + act_scale
  *   Phase 3: up-proj — streaming WGMMA reading FP8 from fp8_act_full →
- *            SiLU → fp8 writeback to spec->temp_fp8
- *   site #2: expert barrier
+ *            SiLU → fp8 writeback to spec->temp_fp8, each scale
+ *            release-published as the readiness flag for its payload
+ *   site #2: NO barrier — the down-proj polls the published scales it
+ *            consumes (sentinel handoff, per-expert granularity)
  *   Phase 4: down-proj — streaming WGMMA; each block atomicAdds its fp32
  *            partial sum into spec->down_partial_out
- *   site #3: col-stripe barrier
+ *   site #3: NO barrier — each block bumps its col stripe's parity-
+ *            selected arrival counter; only the stripe's Phase-5 writer
+ *            polls it
  *   Phase 5: fp32 → bf16 cast, write activations_out
  */
 template <typename Dims>
@@ -51,9 +54,7 @@ __device__ void moe_kernel_topk_BS8(
     MoEGemmSpec<Dims>* __restrict__ spec, MoE_SHM<Dims>* __restrict__ shmem,
     CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
     CUtensorMap const& down_weights_desc,
-    CUtensorMap const& down_activations_desc,
-    uint32_t* __restrict__ expert_counters, uint32_t& expert_phase,
-    uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase) {
+    CUtensorMap const& down_activations_desc) {
   static_assert(Dims::BS <= 8);
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
@@ -62,9 +63,12 @@ __device__ void moe_kernel_topk_BS8(
 
   MONO_PHASE_TIMESTAMP(t_start);
 
-  // Zero the Phase-4 accumulator (all blocks cooperate); the site-#2
-  // expert barrier publishes the zero across blocks before any Phase-4
-  // atomicAdd fires.
+  // Zero the Phase-4 accumulator (all blocks cooperate).  No cross-block
+  // sync guards this against Phase-4 atomicAdds from fast blocks; the
+  // margin is structural — every block runs the full routing + quantize +
+  // up-projection pipeline (tens of µs) before its first Phase-4
+  // atomicAdd, while this zero-fill retires within the first ~µs of the
+  // launch.
   {
     const uint32_t partial_n = Dims::BS * Dims::HIDDEN_STATES;
     for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < partial_n;
@@ -73,7 +77,7 @@ __device__ void moe_kernel_topk_BS8(
     }
   }
 
-  // ── mbarrier init ───────────────────────────────────────────────────
+  // ── mbarrier init + sentinel-handoff launch parity ───────────────────
   // Inits run unconditionally (cheap SHM writes, keeps state well-defined
   // even when SKIP_PREFETCH elides the arms below; the matching waits are
   // gated on the same flag, so nothing blocks on an uninitialized parity).
@@ -86,13 +90,41 @@ __device__ void moe_kernel_topk_BS8(
     mbarrier_init(&u_tma->bar_rwin, 1u);
     fence_mbarrier_init_release_cluster();
   }
+  if (threadIdx.x == 0) {
+    // Per-block private launch counter → scale-buffer parity for the
+    // sentinel Phase-3→4 handoff.  No cross-block sync needed: each block
+    // increments only its own word, once per launch, so all blocks agree.
+    const uint32_t flip = spec->launch_flip[blockIdx.x];
+    shmem->scale_parity = flip & 1u;
+    spec->launch_flip[blockIdx.x] = flip + 1u;
+  }
   // Publish the launcher-thread inits to every warp before any
   // try_wait.parity.  fence_mbarrier_init alone is not sufficient: it pairs
   // with a matching acquire, but try_wait.parity is not an acquire of the
   // init — without this sync a prefetch warp can hit the Phase-2 bar_rwin
   // wait while the barrier is still uninitialized (mbarrier state
-  // corruption under compute-sanitizer).
+  // corruption under compute-sanitizer).  Also publishes scale_parity.
   __syncthreads();
+
+  // Zero-refill the OTHER parity's handoff state for the NEXT launch
+  // (sentinel reset, off the critical path — nobody reads those words
+  // this launch; kernel completion publishes them before the next launch
+  // starts).  The host-side torch.zeros allocation establishes the same
+  // invariant before the first launch.
+  {
+    constexpr uint32_t SCALE_N =
+        MoEGemmSpec<Dims>::TEMP_ROWS * MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
+    const uint32_t next_parity = shmem->scale_parity ^ 1u;
+    float* next_buf = moe_act_scale_buf<Dims>(spec, next_parity);
+    for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < SCALE_N;
+         i += blockDim.x * gridDim.x) {
+      reinterpret_cast<uint32_t*>(next_buf)[i] = 0u;  // +0.0f sentinel
+    }
+    // Phase-4→5 readiness counters for the next launch (site #3 flags).
+    if (threadIdx.x < MoEGemmSpec<Dims>::DOWN_GRID && blockIdx.x == 0) {
+      spec->down_ready[next_parity][threadIdx.x] = 0u;
+    }
+  }
 
   // ── Phase 1: routing ∥ routing-window BF16 prefetch ───────────────────
   const unsigned warp_id = get_any_warp<Dims>();
@@ -181,44 +213,22 @@ __device__ void moe_kernel_topk_BS8(
 
   MONO_PHASE_TIMESTAMP(t_after_up);
 
-  // ── Site #2: Phase 3 → Phase 4 barrier ────────────────────────────────
+  // ── Site #2: Phase 3 → Phase 4 handoff — SENTINEL, NO BARRIER ─────────
   //
-  // COUPLED carve (UP_GROUPS == DOWN_GROUPS, all shipped coupled shapes):
-  // the UP_GRID blocks that produced an expert group's temp_fp8 rows are
-  // exactly the blocks that consume them in Phase 4, so a symmetric
-  // per-up_group expert barrier suffices (arrival contention UP_GRID
-  // instead of GRID_SIZE; UP_GROUPS barriers run concurrently).
+  // Replaced by data-path readiness: each `temp_act_scale` cell is
+  // release-published by its producing warp AFTER the covering fp8
+  // payload segment (moe_publish_act_scale), and the down-projection
+  // polls exactly the cells it consumes until they turn non-NaN before
+  // reading/TMA-loading the payload (see the act-scale loader and the
+  // inter-expert lookahead poll in moe_down_projection.cu).
   //
-  // DECOUPLED carve (UP_GROUPS != DOWN_GROUPS): producer set != consumer
-  // set, so the rendezvous splits into a producer-arrive on this block's
-  // up_group plus consumer-waits on every up_group whose temp_fp8 rows
-  // this block reads in Phase 4.  The wait loop mirrors the Phase-4 expert
-  // loop exactly (same bound/stride), so the wait set is precisely the
-  // produced set.  expert_count is block-uniform, so the __syncthreads
-  // inside expert_consume_wait stays collective.
-  if constexpr (UP_GROUPS == MoECoreDims<Dims>::DOWN_GROUPS) {
-    if (in_up) {
-      moe_monokernel::expert_barrier(expert_counters,
-                                     /*expert_id=*/up_group,
-                                     /*arrival_count=*/UP_GRID,
-                                     /*seed_blockidx=*/up_group * UP_GRID,
-                                     expert_phase);
-    }
-  } else {
-    if (in_up) {
-      moe_monokernel::expert_produce_arrive(
-          expert_counters, /*up_group=*/up_group,
-          /*arrival_count=*/UP_GRID, /*seed_blockidx=*/up_group * UP_GRID);
-    }
-    const std::uint32_t down_group_c =
-        blockIdx.x / MoECoreDims<Dims>::DOWN_GRID;
-    for (std::uint32_t e = down_group_c; e < shmem->expert_count;
-         e += MoECoreDims<Dims>::DOWN_GROUPS) {
-      moe_monokernel::expert_consume_wait(expert_counters,
-                                          /*up_group=*/e % UP_GROUPS,
-                                          /*arrival_count=*/UP_GRID);
-    }
-  }
+  // This gives per-expert granularity — a down-block starts an expert as
+  // soon as THAT expert's rows are published, instead of waiting for its
+  // whole up-group — and covers the coupled and decoupled carves
+  // uniformly (consumers wait on data, so producer set != consumer set
+  // needs no special protocol).  Barrier-counter state is no longer
+  // involved in this handoff, which also removes the decoupled
+  // consume-wait stale-marker hazard.
 
   MONO_PHASE_TIMESTAMP(t_after_barrier2);
 
@@ -229,18 +239,27 @@ __device__ void moe_kernel_topk_BS8(
 
   MONO_PHASE_TIMESTAMP(t_after_down);
 
-  // ── Site #3: Phase 4 → Phase 5 barrier ────────────────────────────────
+  // ── Site #3: Phase 4 → Phase 5 handoff — FLAGS, NO BARRIER ────────────
   // Phase 5 on block b reads down_partial_out cells at col stripe b, whose
   // producers are the DOWN_GROUPS blocks with blockIdx.x % DOWN_GRID == b.
-  // Every block calls the barrier to publish its Phase-4 atomicAdds; the
-  // seed block (blockIdx.x == stripe id) is also the Phase-5 reader.
+  //
+  // down_partial_out is atomicAdd-accumulated, so readiness cannot live
+  // in the data itself; instead every block publishes its Phase-4 adds
+  // by bumping its stripe's parity-selected arrival counter (release
+  // fence + add), and ONLY the stripe's Phase-5 writer polls it up to
+  // DOWN_GROUPS.  The other blocks publish and run to kernel exit — no
+  // grid-wide mutual spin.  Counter reset is the launch-parity
+  // double-buffer refilled in the prologue (same discipline as the
+  // site-#2 scale sentinel).
   {
     const uint32_t col_stripe_id = blockIdx.x % MoECoreDims<Dims>::DOWN_GRID;
-    moe_monokernel::colstripe_barrier(
-        colstripe_counters,
-        /*col_stripe=*/col_stripe_id,
-        /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
-        /*seed_blockidx=*/col_stripe_id, colstripe_phase);
+    // All threads' Phase-4 atomicAdds are issued before this sync; the
+    // fence releases them at device scope before the arrival is visible.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence();
+      atomicAdd(&spec->down_ready[shmem->scale_parity][col_stripe_id], 1u);
+    }
   }
 
   MONO_PHASE_TIMESTAMP(t_after_barrier3);
@@ -257,6 +276,18 @@ __device__ void moe_kernel_topk_BS8(
   const std::uint32_t base_col_r = down_block_idx_r * DOWN_COL_TILE_LOCAL;
 
   if (down_group_r == 0) {
+    // Readiness wait: this block is the single Phase-5 writer for col
+    // stripe `down_block_idx_r` (== blockIdx.x here).  One thread polls
+    // the stripe's arrival counter, acquires, and the __syncthreads
+    // broadcasts the observation to the whole block.
+    if (threadIdx.x == 0) {
+      uint32_t* ctr = &spec->down_ready[shmem->scale_parity][down_block_idx_r];
+      while (atomicAdd(ctr, 0u) < MoECoreDims<Dims>::DOWN_GROUPS) {
+      }
+      __threadfence();
+    }
+    __syncthreads();
+
     for (std::uint32_t flat = threadIdx.x;
          flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
       const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
@@ -332,20 +363,15 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   extern __shared__ char shmem_buffer[];
   MoE_SHM<Dims>* shmem = reinterpret_cast<MoE_SHM<Dims>*>(shmem_buffer);
 
-  // Software barrier counter regions (in the scratchpad) + block-local
-  // register-resident phase counters.
-  uint32_t* expert_counters = &spec->partial_barrier.expert_slot[0][0];
-  uint32_t* colstripe_counters = &spec->partial_barrier.colstripe_slot[0][0];
-  uint32_t expert_phase = 0;
-  uint32_t colstripe_phase = 0;
+  // Cross-block ordering is entirely flag/sentinel-based (sites #2 and
+  // #3 inside moe_kernel_topk_BS8); no software barrier counters remain.
 
   moe_kernel_topk_BS8<Dims>(
       activations_in, token_count, router_logits, expert_weights_up,
       expert_scales_up, expert_weights_down, expert_scales_down,
       activations_out, top_k, scoring_func, renormalize, expert_bias,
       routed_scaling_factor, spec, shmem, up_weights_desc, activations_desc,
-      down_weights_desc, down_activations_desc, expert_counters, expert_phase,
-      colstripe_counters, colstripe_phase);
+      down_weights_desc, down_activations_desc);
 }
 
 }  // namespace moe_monokernel
