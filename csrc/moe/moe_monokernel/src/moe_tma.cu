@@ -49,17 +49,21 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   STD_TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for up-projection weights: "
-              "CUresult=",
-              static_cast<int>(res), " (num_experts=", num_experts, ", N=", N,
-              ", K=", K, ")");
+                  "cuTensorMapEncodeTiled failed for up-projection weights: "
+                  "CUresult=",
+                  static_cast<int>(res), " (num_experts=", num_experts,
+                  ", N=", N, ", K=", K, ")");
 
   return desc;
 }
 
 CUtensorMap create_activations_tma_desc(const void* activations_ptr,
                                         uint32_t batch_size_cap,
-                                        uint32_t K_hidden) {
+                                        uint32_t K_hidden, uint32_t box_rows) {
+  STD_TORCH_CHECK(box_rows == 8u || box_rows == 16u,
+                  "create_activations_tma_desc: box_rows must be 8 (BS8) or "
+                  "16 (BS16), got ",
+                  box_rows);
   CUtensorMap desc{};
 
   // Innermost-first ordering per cuTensorMapEncodeTiled: globalDim[0] = K,
@@ -75,7 +79,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
   };
   uint32_t box_dim[kRank] = {
       /*K-inner*/ 128u,
-      /*tokens */ 8u,
+      /*tokens */ box_rows,
   };
   uint32_t element_strides[kRank] = {1u, 1u};
 
@@ -87,9 +91,9 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   STD_TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for activations: CUresult=",
-              static_cast<int>(res), " (batch_size_cap=", batch_size_cap,
-              ", K_hidden=", K_hidden, ")");
+                  "cuTensorMapEncodeTiled failed for activations: CUresult=",
+                  static_cast<int>(res), " (batch_size_cap=", batch_size_cap,
+                  ", K_hidden=", K_hidden, ")");
 
   return desc;
 }
@@ -97,11 +101,11 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr,
 CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
                                         uint32_t num_experts, uint32_t K,
                                         uint32_t N, uint32_t row_box) {
-  STD_TORCH_CHECK(row_box == 128u || row_box == 256u,
-              "create_down_weight_tma_desc: row_box must be 128 or 256, got ",
-              row_box);
+  STD_TORCH_CHECK(
+      row_box == 128u || row_box == 256u,
+      "create_down_weight_tma_desc: row_box must be 128 or 256, got ", row_box);
   STD_TORCH_CHECK(K % row_box == 0, "create_down_weight_tma_desc: K=", K,
-              " must be a multiple of row_box=", row_box);
+                  " must be a multiple of row_box=", row_box);
 
   // Innermost = N (the down-proj reduction dim), outer = flattened
   // expert_id * K + output_row; see moe_tma.h.
@@ -138,10 +142,16 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
 }
 
 CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
-                                            uint32_t temp_rows, uint32_t N) {
+                                            uint32_t temp_rows, uint32_t N,
+                                            uint32_t t_tile) {
   // SWZ128 preconditions: boxDim[0] * sizeof(fp8) = 128 B; the row stride
   // N must be a multiple of 128; the scratchpad base is 256-B aligned by
-  // the PyTorch allocator.
+  // the PyTorch allocator.  t_tile is the per-issue row-box: 8 (one SWZ128
+  // atom) on the BS8 path, 16 (two stacked atoms) on the BS16 path.
+  STD_TORCH_CHECK(t_tile == 8u || t_tile == 16u,
+                  "create_down_activation_tma_desc: t_tile must be 8 (BS8) "
+                  "or 16 (BS16), got ",
+                  t_tile);
   CUtensorMap desc{};
 
   constexpr uint32_t kRank = 2;
@@ -154,7 +164,7 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
   };
   uint32_t box_dim[kRank] = {
       /*K-inner*/ 128u,
-      /*rows   */ 8u,
+      /*rows   */ t_tile,
   };
   uint32_t element_strides[kRank] = {1u, 1u};
 
@@ -166,9 +176,10 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   STD_TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for down-projection "
-              "activations: CUresult=",
-              static_cast<int>(res), " (temp_rows=", temp_rows, ", N=", N, ")");
+                  "cuTensorMapEncodeTiled failed for down-projection "
+                  "activations: CUresult=",
+                  static_cast<int>(res), " (temp_rows=", temp_rows, ", N=", N,
+                  ")");
 
   return desc;
 }

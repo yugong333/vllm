@@ -82,7 +82,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     CUtensorMap const& activations_desc,
     std::uint32_t up_block_idx = 0xffffffffu, std::uint32_t expert_start = 0,
     std::uint32_t expert_stride = 1) {
-  static_assert(Dims::BS <= 8);
+  static_assert(Dims::BS <= 16,
+                "allexperts up-proj supports BS<=16 (BS16 widens the WGMMA "
+                "N dim to m64n16k32; BS8 codegen is unchanged).");
   using CoreDims = MoECoreDims<Dims>;
 
   // All GM reads go through the TMA descriptors; the raw pointers stay on
@@ -116,7 +118,22 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
       static_cast<uint64_t>(
           MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);
-  constexpr uint64_t B_SBO = B_LBO;  // unused (single N-block for N=8)
+  // B_SBO = stride between adjacent WGMMA N core matrices (8 tokens each).
+  //   * BS<=8: the m64n8k32 issue has a single N core matrix, so the
+  //     hardware never consumes SBO; keep it equal to B_LBO so the emitted
+  //     descriptor immediate stays byte-identical to the historical BS8
+  //     stream (the value is inert).
+  //   * BS=16: the m64n16k32 issue spans TWO N core matrices — tokens
+  //     [0..7] and [8..15].  In the `[kc][tok][ki]` fp8_act_full layout
+  //     consecutive tokens are FP8_ACT_K_CHUNK (16 B) apart, so the
+  //     token-8 core matrix sits 8 * 16 = 128 B from token 0.  Using
+  //     B_LBO here would point the second core matrix at the wrong
+  //     activation columns and corrupt tokens 8..15.
+  constexpr uint64_t B_SBO =
+      (Dims::BS == 16u)
+          ? (8ull * static_cast<uint64_t>(
+                        MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK))
+          : B_LBO;
 
   const unsigned thread_in_block = threadIdx.x;
   const unsigned warp = thread_in_block / 32;  // 0..11
@@ -134,9 +151,15 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   const unsigned base_row_up = effective_bid * (W_UP_M / 2);
   const std::uint32_t expert_count = shmem->expert_count;
 
-  // Per-thread fp32 accumulators for WGMMA m64n8k32.
+  // Per-thread fp32 accumulators for WGMMA m64n8k32 (BS<=8) or m64n16k32
+  // (BS==16).  d4..d7 cover N=[8,16) of the m64n16k32 fragment (see
+  // ptx_utils.h); they are declared unconditionally but every use is
+  // gated under `if constexpr (Dims::BS == 16)`, so on the BS<=8 path
+  // nvcc dead-code-eliminates them and BS8 SASS is unchanged.
   float chunk_d0 = 0.f, chunk_d1 = 0.f, chunk_d2 = 0.f, chunk_d3 = 0.f;
   float final_d0 = 0.f, final_d1 = 0.f, final_d2 = 0.f, final_d3 = 0.f;
+  float chunk_d4 = 0.f, chunk_d5 = 0.f, chunk_d6 = 0.f, chunk_d7 = 0.f;
+  float final_d4 = 0.f, final_d5 = 0.f, final_d6 = 0.f, final_d7 = 0.f;
 
   // A non-multiple K_TILES would phase-shift the slot index across the
   // expert boundary and break the mbarrier parity chain (authoritative
@@ -218,6 +241,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
         has_next_e ? shmem->experts[e + expert_stride].id : 0u;
 
     final_d0 = final_d1 = final_d2 = final_d3 = 0.f;
+    if constexpr (Dims::BS == 16) {
+      // BS=16 uses 8 accumulators per thread (m64n16k32).
+      final_d4 = final_d5 = final_d6 = final_d7 = 0.f;
+    }
 
     // Drain this expert's prefetched scale (issued a full K-loop ago);
     // prefetch the next expert's into the other ping-pong slot.
@@ -345,8 +372,18 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
                 (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
             uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
             uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
-            wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
-                                         chunk_d2, chunk_d3);
+            if constexpr (Dims::BS == 16) {
+              // BS=16: one m64n16k32 covers all 16 token columns per
+              // chained issue; the 8-fp32 fragment d0..d7 is shared
+              // across the 4 chained issues per substep (scale-D == 1),
+              // identical to the BS8 4-chain pattern but widened in N.
+              wgmma_m64n16k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
+                                            chunk_d2, chunk_d3, chunk_d4,
+                                            chunk_d5, chunk_d6, chunk_d7);
+            } else {
+              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
+                                           chunk_d2, chunk_d3);
+            }
           }
 
           wgmma_commit_group();
@@ -367,8 +404,25 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
             final_d1 += chunk_d1 * ws_gate * as_13;
             final_d2 += chunk_d2 * ws_up * as_02;
             final_d3 += chunk_d3 * ws_up * as_13;
+            if constexpr (Dims::BS == 16) {
+              // d4..d7 cover the second 8-column quadrant N=[8,16); the
+              // token mapping is the (lane%4)*2 / +1 pair shifted up by
+              // 8 tokens.  Same ws_gate / ws_up — weight scales are not
+              // BS-dependent.
+              const uint32_t tok_46 = tok_02 + 8u;
+              const uint32_t tok_57 = tok_13 + 8u;
+              const float as_46 = shmem->act_scale[kblk][tok_46];
+              const float as_57 = shmem->act_scale[kblk][tok_57];
+              final_d4 += chunk_d4 * ws_gate * as_46;
+              final_d5 += chunk_d5 * ws_gate * as_57;
+              final_d6 += chunk_d6 * ws_up * as_46;
+              final_d7 += chunk_d7 * ws_up * as_57;
+            }
           }
           chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
+          if constexpr (Dims::BS == 16) {
+            chunk_d4 = chunk_d5 = chunk_d6 = chunk_d7 = 0.f;
+          }
         }
   #endif
       }
@@ -554,6 +608,38 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
             (is_wg1 ? 64u : 0u) + warp_in_wg * 8 + lane / 4;
         shm->partial_result.post_silu_scratch[row_in_tile][tok_even] = val0;
         shm->partial_result.post_silu_scratch[row_in_tile][tok_odd] = val1;
+
+        // ── BS=16: extend silu+combine to tokens 8..15 ──
+        // Mirror of the BS<=8 block above for the second 8-token quadrant
+        // of the m64n16k32 fragment: d4/d5 are gate rows and d6/d7 up rows
+        // for tokens tok_even+8 / tok_odd+8.  At BS=16 T_TILE = 16, so
+        // post_silu_scratch's inner extent (T_TILE+1 = 17) keeps the +8
+        // columns in-bounds.
+        if constexpr (Dims::BS == 16) {
+          const std::uint32_t tok_46 = tok_even + 8u;  // 8, 10, 12, 14
+          const std::uint32_t tok_57 = tok_odd + 8u;   // 9, 11, 13, 15
+
+          float rw_46 = 0.f, rw_57 = 0.f;
+          bool store_46 = false, store_57 = false;
+          if (tok_46 < batch_size) {
+            rw_46 = shm->up_rw_for_tok[tok_46];
+            store_46 = (rw_46 != 0.f);
+          }
+          if (tok_57 < batch_size) {
+            rw_57 = shm->up_rw_for_tok[tok_57];
+            store_57 = (rw_57 != 0.f);
+          }
+
+          float val2 =
+              __fdividef(rw_46 * final_d6 * final_d4, 1.0f + __expf(-final_d4));
+          float val3 =
+              __fdividef(rw_57 * final_d7 * final_d5, 1.0f + __expf(-final_d5));
+          if (!store_46) val2 = 0.f;
+          if (!store_57) val3 = 0.f;
+
+          shm->partial_result.post_silu_scratch[row_in_tile][tok_46] = val2;
+          shm->partial_result.post_silu_scratch[row_in_tile][tok_57] = val3;
+        }
         MONO_PHASE_TIMESTAMP_IF(t_up_e0_defer_after_store, e == expert_start);
 
         // Snapshot this expert's ranks for the next expert's PF body (the
@@ -588,9 +674,15 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // warp) now that the K-loop is done.
   if (has_pending_writeback && is_calc) {
   #ifndef MONO_PROFILE_SKIP_CALC_UP
-    const uint32_t tok = warp;          // 0..7
+    // BS<=8: one pass, tok = warp (0..7).  BS=16: two passes per calc
+    // warp — tok = warp (pass 0, tokens 0..7) and tok = warp + 8 (pass 1,
+    // tokens 8..15).  DRAIN_PASSES folds to 1 for BS<=8 so the BS8 loop
+    // structure (and SASS) is unchanged.
+    constexpr uint32_t DRAIN_PASSES = (Dims::BS + 7u) / 8u;
     const uint32_t col_in_half = lane;  // 0..31
-    {
+    #pragma unroll
+    for (uint32_t t_off = 0; t_off < DRAIN_PASSES; ++t_off) {
+      const uint32_t tok = warp + t_off * CoreDims::CALC_WARP_COUNT;
       bool store_local = false;
       std::uint32_t dest_row_local = 0;
       if (tok < batch_size) {
@@ -626,7 +718,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
 
       if (store_local && tok < batch_size) {
-        // (warp-uniform branch: tok == warp id here)
+        // (warp-uniform branch: tok is per-warp here)
         if (write1_l) {
           spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
         }
@@ -670,7 +762,9 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     CUtensorMap const& activations_desc,
     std::uint32_t up_block_idx = 0xffffffffu, std::uint32_t expert_start = 0,
     std::uint32_t expert_stride = 1) {
-  static_assert(Dims::BS <= 8);
+  static_assert(Dims::BS <= 16,
+                "raw two-TMA up-proj supports BS<=16 (BS16 widens the "
+                "WGMMA N dim to m64n16k32; BS8 codegen is unchanged).");
   using CoreDims = MoECoreDims<Dims>;
   static_assert(CoreDims::UP_COL_HALVES == 2u,
                 "moe_up_projection_BS8_122B_wgmma_tma is specialized for "
@@ -699,7 +793,11 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
           MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
       static_cast<uint64_t>(
           MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);
-  constexpr uint64_t B_SBO = B_LBO;
+  constexpr uint64_t B_SBO =
+      (Dims::BS == 16u)
+          ? (8ull * static_cast<uint64_t>(
+                        MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK))
+          : B_LBO;
 
   const unsigned thread_in_block = threadIdx.x;
   const unsigned warp = thread_in_block / 32;
@@ -716,12 +814,18 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   const unsigned base_row_up = effective_bid * (HALVES * W_UP_M / 2);
   const std::uint32_t expert_count = shmem->expert_count;
 
-  // Per-atom accumulators: final_d[h][0..3] for atoms h in {0, 1}.
+  // Per-atom accumulators: final_d[h][0..3] cover token columns 0..7;
+  // final_d_hi[h][0..3] cover token columns 8..15 on the BS16 m64n16k32
+  // path.  The *_hi registers are dead-code-eliminated for BS<=8.
   float chunk_d0 = 0.f, chunk_d1 = 0.f, chunk_d2 = 0.f, chunk_d3 = 0.f;
+  float chunk_d4 = 0.f, chunk_d5 = 0.f, chunk_d6 = 0.f, chunk_d7 = 0.f;
   float final_d[HALVES][4];
+  float final_d_hi[HALVES][4];
   #pragma unroll
   for (uint32_t h = 0; h < HALVES; ++h) {
     final_d[h][0] = final_d[h][1] = final_d[h][2] = final_d[h][3] = 0.f;
+    final_d_hi[h][0] = final_d_hi[h][1] = final_d_hi[h][2] = final_d_hi[h][3] =
+        0.f;
   }
 
   constexpr uint32_t UP_W_TX_BYTES_PER_ATOM = 16384u;
@@ -793,6 +897,10 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   #pragma unroll
     for (uint32_t h = 0; h < HALVES; ++h) {
       final_d[h][0] = final_d[h][1] = final_d[h][2] = final_d[h][3] = 0.f;
+      if constexpr (Dims::BS == 16) {
+        final_d_hi[h][0] = final_d_hi[h][1] = final_d_hi[h][2] =
+            final_d_hi[h][3] = 0.f;
+      }
     }
 
     // Drain this expert's prefetched scale; prefetch the next expert's.
@@ -876,6 +984,9 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                 (const void*)((const char*)a_slot_base + atom * ATOM_W_BYTES +
                               wg_offset_bytes);
             chunk_d0 = chunk_d1 = chunk_d2 = chunk_d3 = 0.f;
+            if constexpr (Dims::BS == 16) {
+              chunk_d4 = chunk_d5 = chunk_d6 = chunk_d7 = 0.f;
+            }
     #pragma unroll
             for (uint32_t j = 0; j < WGMMAS_PER_SUBSTEP; ++j) {
               const void* a_ptr =
@@ -884,8 +995,14 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                   (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
               uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
               uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
-              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
-                                           chunk_d2, chunk_d3);
+              if constexpr (Dims::BS == 16) {
+                wgmma_m64n16k32_e4m3_e4m3_f32(
+                    desc_a, desc_b, chunk_d0, chunk_d1, chunk_d2, chunk_d3,
+                    chunk_d4, chunk_d5, chunk_d6, chunk_d7);
+              } else {
+                wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
+                                             chunk_d2, chunk_d3);
+              }
             }
             wgmma_commit_group();
             wgmma_wait_group<0>();
@@ -904,6 +1021,16 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
             final_d[h][1] += chunk_d1 * ws * as_13;
             final_d[h][2] += chunk_d2 * ws * as_02;
             final_d[h][3] += chunk_d3 * ws * as_13;
+            if constexpr (Dims::BS == 16) {
+              const uint32_t tok_46 = tok_02 + 8u;
+              const uint32_t tok_57 = tok_13 + 8u;
+              const float as_46 = shmem->act_scale[kblk][tok_46];
+              const float as_57 = shmem->act_scale[kblk][tok_57];
+              final_d_hi[h][0] += chunk_d4 * ws * as_46;
+              final_d_hi[h][1] += chunk_d5 * ws * as_57;
+              final_d_hi[h][2] += chunk_d6 * ws * as_46;
+              final_d_hi[h][3] += chunk_d7 * ws * as_57;
+            }
           }
         }
   #endif
@@ -1056,9 +1183,54 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
         shm->partial_result.post_silu_scratch[f_hi][tok_even] = v_hi_even;
         shm->partial_result.post_silu_scratch[f_hi][tok_odd] = v_hi_odd;
 
-        // Snapshot the rank cache for the next expert's PF body.
-        if (warp == 0 && lane < Dims::BS) {
-          shm->up_rank_for_tok_prev[lane] = shm->up_rank_for_tok[lane];
+        if constexpr (Dims::BS == 16) {
+          const std::uint32_t tok_even_hi = tok_even + 8u;
+          const std::uint32_t tok_odd_hi = tok_odd + 8u;
+
+          float rw_even_hi = 0.f, rw_odd_hi = 0.f;
+          bool store_even_hi = false, store_odd_hi = false;
+          if (tok_even_hi < batch_size) {
+            rw_even_hi = shm->up_rw_for_tok[tok_even_hi];
+            store_even_hi = (rw_even_hi != 0.f);
+          }
+          if (tok_odd_hi < batch_size) {
+            rw_odd_hi = shm->up_rw_for_tok[tok_odd_hi];
+            store_odd_hi = (rw_odd_hi != 0.f);
+          }
+
+          const float* gd_hi = final_d_hi[0];
+          const float* ud_hi = final_d_hi[1];
+          float v_lo_even_hi = __fdividef(rw_even_hi * ud_hi[0] * gd_hi[0],
+                                          1.0f + __expf(-gd_hi[0]));
+          float v_lo_odd_hi = __fdividef(rw_odd_hi * ud_hi[1] * gd_hi[1],
+                                         1.0f + __expf(-gd_hi[1]));
+          float v_hi_even_hi = __fdividef(rw_even_hi * ud_hi[2] * gd_hi[2],
+                                          1.0f + __expf(-gd_hi[2]));
+          float v_hi_odd_hi = __fdividef(rw_odd_hi * ud_hi[3] * gd_hi[3],
+                                         1.0f + __expf(-gd_hi[3]));
+          if (!store_even_hi) {
+            v_lo_even_hi = 0.f;
+            v_hi_even_hi = 0.f;
+          }
+          if (!store_odd_hi) {
+            v_lo_odd_hi = 0.f;
+            v_hi_odd_hi = 0.f;
+          }
+
+          shm->partial_result.post_silu_scratch[f_lo][tok_even_hi] =
+              v_lo_even_hi;
+          shm->partial_result.post_silu_scratch[f_lo][tok_odd_hi] = v_lo_odd_hi;
+          shm->partial_result.post_silu_scratch[f_hi][tok_even_hi] =
+              v_hi_even_hi;
+          shm->partial_result.post_silu_scratch[f_hi][tok_odd_hi] = v_hi_odd_hi;
+        }
+
+        // Snapshot the rank cache for the next expert's PF body.  Calc-warp
+        // thread lanes cover only 0..31 here; copy all BS tokens so BS16's
+        // second deferred wave (tokens 8..15) has valid ranks.
+        if (thread_in_block < Dims::BS) {
+          shm->up_rank_for_tok_prev[thread_in_block] =
+              shm->up_rank_for_tok[thread_in_block];
         }
   #endif
       }
@@ -1072,57 +1244,63 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   // ── Post-loop drain for the LAST expert (calc warps, 128-feat reduce) ──
   if (has_pending_writeback && is_calc) {
   #ifndef MONO_PROFILE_SKIP_CALC_UP
-    const uint32_t tok = warp;  // 0..7
+    constexpr uint32_t DRAIN_PASSES = (Dims::BS + 7u) / 8u;
     const uint32_t col = lane;  // 0..31
 
-    bool store_local = false;
-    std::uint32_t dest_row_local = 0;
-    if (tok < batch_size) {
-      const uint8_t k = shm->up_rank_for_tok_prev[tok];
-      if (k != 0xFFu) {
-        store_local = true;
-        dest_row_local = shm->sorted_slot[tok * top_k + k];
-      }
-    }
-
-    const float pv[4] = {shm->partial_result.post_silu_scratch[col][tok],
-                         shm->partial_result.post_silu_scratch[col + 32][tok],
-                         shm->partial_result.post_silu_scratch[col + 64][tok],
-                         shm->partial_result.post_silu_scratch[col + 96][tok]};
-    const std::uint32_t oc[4] = {base_row_up + col, base_row_up + 32 + col,
-                                 base_row_up + 64 + col,
-                                 base_row_up + 96 + col};
-    bool wr[4];
-    float v[4];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      wr[i] = store_local && (oc[i] < Dims::N);
-      v[i] = wr[i] ? pv[i] : 0.f;
-    }
+    for (uint32_t t_off = 0; t_off < DRAIN_PASSES; ++t_off) {
+      const uint32_t tok = warp + t_off * CoreDims::CALC_WARP_COUNT;
 
-    float local_max =
-        fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    float block_max = warp_reduce_max_float(local_max);
-    // Eps-clamp tiny maxima (overflow-safe inv_scale); see the
-    // pair-layout epilogue above for the full rationale.
-    block_max = fmaxf(block_max, 1e-10f);
-    constexpr float FP8_MAX = 448.0f;
-    constexpr float FP8_MAX_INV = 1.0f / 448.0f;
-    const float block_scale = block_max * FP8_MAX_INV;
-    const float inv_scale = FP8_MAX / block_max;
-
-    if (store_local && tok < batch_size) {
-        // (warp-uniform branch: tok == warp id here)
-    #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        if (wr[i]) {
-          spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =
-              (AQ_element)(v[i] * inv_scale);
+      bool store_local = false;
+      std::uint32_t dest_row_local = 0;
+      if (tok < batch_size) {
+        const uint8_t k = shm->up_rank_for_tok_prev[tok];
+        if (k != 0xFFu) {
+          store_local = true;
+          dest_row_local = shm->sorted_slot[tok * top_k + k];
         }
       }
-      // Sentinel handoff publish (see moe_publish_act_scale).
-      moe_publish_act_scale<Dims>(spec, shmem->scale_parity, dest_row_local,
-                                  effective_bid, block_scale, lane);
+
+      const float pv[4] = {
+          shm->partial_result.post_silu_scratch[col][tok],
+          shm->partial_result.post_silu_scratch[col + 32][tok],
+          shm->partial_result.post_silu_scratch[col + 64][tok],
+          shm->partial_result.post_silu_scratch[col + 96][tok]};
+      const std::uint32_t oc[4] = {base_row_up + col, base_row_up + 32 + col,
+                                   base_row_up + 64 + col,
+                                   base_row_up + 96 + col};
+      bool wr[4];
+      float v[4];
+    #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        wr[i] = store_local && (oc[i] < Dims::N);
+        v[i] = wr[i] ? pv[i] : 0.f;
+      }
+
+      float local_max = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
+                              fmaxf(fabsf(v[2]), fabsf(v[3])));
+      float block_max = warp_reduce_max_float(local_max);
+      // Eps-clamp tiny maxima (overflow-safe inv_scale); see the
+      // pair-layout epilogue above for the full rationale.
+      block_max = fmaxf(block_max, 1e-10f);
+      constexpr float FP8_MAX = 448.0f;
+      constexpr float FP8_MAX_INV = 1.0f / 448.0f;
+      const float block_scale = block_max * FP8_MAX_INV;
+      const float inv_scale = FP8_MAX / block_max;
+
+      if (store_local && tok < batch_size) {
+    // (warp-uniform branch: tok is per-warp here)
+    #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          if (wr[i]) {
+            spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =
+                (AQ_element)(v[i] * inv_scale);
+          }
+        }
+        // Sentinel handoff publish (see moe_publish_act_scale).
+        moe_publish_act_scale<Dims>(spec, shmem->scale_parity, dest_row_local,
+                                    effective_bid, block_scale, lane);
+      }
     }
   #endif
   }

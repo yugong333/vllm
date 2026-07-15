@@ -208,8 +208,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
     MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& down_weights_desc,
     CUtensorMap const& down_activations_desc) {
-  static_assert(Dims::BS <= 8,
-                "moe_down_projection_BS8_allexperts_wgmma_tma is BS<=8 only");
+  static_assert(Dims::BS <= 16,
+                "moe_down_projection_BS8_allexperts_wgmma_tma supports "
+                "BS<=16 (BS16 widens the WGMMA N dim to m64n16k32).");
   using CoreDims = MoECoreDims<Dims>;
 
   // All weight GM reads go through the TMA descriptor; top_k's rank scan
@@ -245,7 +246,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint32_t DOWN_W_TX_BYTES_PER_HALF = 16384u;
   constexpr std::uint32_t DOWN_W_TX_BYTES_TOTAL =
       DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES * K_SUBSTEPS_DOWN;
-  constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL = 1024u * K_SUBSTEPS_DOWN;
+  // Activation atom bytes scale with T_TILE (8 tok × 128 K = 1024 B on
+  // the BS8 path; 16 tok × 128 K = 2048 B on the BS16 path).
+  constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL =
+      CoreDims::T_TILE *
+      MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_NUM_CHUNKS *
+      MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK * K_SUBSTEPS_DOWN;
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
@@ -260,9 +266,18 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint64_t A_LBO = 16ULL;
   constexpr std::uint64_t A_SBO = 1024ULL;
   constexpr std::uint32_t A_SWIZZLE = 1u;
-  // B operand (activations): 8-token × 128-K SWZ128 atom.
+  // B operand (activations): 8-token × 128-K SWZ128 atom(s).
+  //
+  // B_SBO = stride between consecutive 8-token N core matrices.  The BS16
+  // m64n16k32 issue reads N=16 token-ranks as TWO 8-token core matrices;
+  // the second atom (ranks 8..15) is one full SWZ128 tile away = 8 rows ×
+  // 128 B/row = 1024 B.  A 128 B value would make the hardware fetch the
+  // second N-group starting at rank 1, corrupting every rank >= 8 — only
+  // observable when an expert has routed_count > 8 (a hot expert).  BS8
+  // (m64n8k32) has a single atom so SBO is unused; the historical 128 B
+  // value is preserved there to keep BS8 SASS byte-identical.
   constexpr std::uint64_t B_LBO = 16ULL;
-  constexpr std::uint64_t B_SBO = 128ULL;
+  constexpr std::uint64_t B_SBO = (Dims::BS == 16) ? 1024ULL : 128ULL;
   constexpr std::uint32_t B_SWIZZLE = 1u;
 
   const unsigned thread_in_block = threadIdx.x;
@@ -286,6 +301,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   float chunk_d_lo[DOWN_COL_HALVES][4] = {{0.f}};
   float chunk_d_hi[DOWN_COL_HALVES][4] = {{0.f}};
   float final_d[DOWN_COL_HALVES][4] = {{0.f}};
+  // BS=16 only: companion fragments for the m64n16k32 N=[8,16) quadrant
+  // (token ranks 8..15).  Declared unconditionally; every use is gated
+  // under `if constexpr (Dims::BS == 16)`, so on the BS<=8 path nvcc
+  // dead-code-eliminates them and BS8 SASS is unchanged.
+  float chunk_d_lo_hi[DOWN_COL_HALVES][4] = {{0.f}};
+  float chunk_d_hi_hi[DOWN_COL_HALVES][4] = {{0.f}};
+  float final_d_hi[DOWN_COL_HALVES][4] = {{0.f}};
 
   // ── Prologue: zero out_accum + re-init the Phase-4 mbarriers ──────────
   // The site-#2 barrier guarantees the barriers are idle at entry.  The
@@ -331,6 +353,17 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   #pragma unroll
       for (std::uint32_t r = 0; r < 4u; ++r) {
         final_d[h][r] = 0.f;
+      }
+    }
+    if constexpr (Dims::BS == 16) {
+      // BS=16: also reset the second-quadrant accumulator (m64n16k32
+      // N=[8,16), token ranks 8..15).
+  #pragma unroll
+      for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+  #pragma unroll
+        for (std::uint32_t r = 0; r < 4u; ++r) {
+          final_d_hi[h][r] = 0.f;
+        }
       }
     }
 
@@ -402,6 +435,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // scale tiles before the WGMMA consumers wait on the barriers.
     __syncthreads();
 
+    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_scales,
+                            e == down_group + DOWN_GROUPS);
+
     // ── Main K-loop ─────────────────────────────────────────────────────
     // Per step: calc warps wait bar_w/bar_a and run the WGMMA chain; the
     // launcher concurrently prefetches step s+1 (or the next expert's
@@ -427,6 +463,10 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           parity_a[read_slot] ^= 1;
         }
   #endif
+        MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter0_after_wait,
+                                e == down_group + DOWN_GROUPS && s == 0u);
+        MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter1_after_wait,
+                                e == down_group + DOWN_GROUPS && s == 1u);
 
   #ifndef MONO_PROFILE_SKIP_CALC_DOWN
         const void* a_slot_base =
@@ -438,7 +478,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         constexpr std::uint32_t B_K_STRIDE = 2u * B_LBO;
         const void* b_slot_base =
             (const void*)&shm->a_down_wgmma[read_slot][0][0][0][0];
-        constexpr std::uint32_t B_SUBSTEP_BYTES = 1024u;
+        // Bytes per K-substep activation atom: T_TILE rows × 128 B/row
+        // (1024 B at BS<=8, 2048 B at BS=16).
+        constexpr std::uint32_t B_SUBSTEP_BYTES = CoreDims::T_TILE * 128u;
 
     #pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
@@ -469,9 +511,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
               std::uint64_t desc_b =
                   make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
-                                           chunk_d_lo[h][1], chunk_d_lo[h][2],
-                                           chunk_d_lo[h][3]);
+              if constexpr (Dims::BS == 16) {
+                // BS=16: one m64n16k32 covers all 16 routed-rank columns;
+                // d[0..3] stay in chunk_d_lo, d[4..7] (ranks 8..15) in
+                // chunk_d_lo_hi.
+                wgmma_m64n16k32_e4m3_e4m3_f32(
+                    desc_a, desc_b, chunk_d_lo[h][0], chunk_d_lo[h][1],
+                    chunk_d_lo[h][2], chunk_d_lo[h][3], chunk_d_lo_hi[h][0],
+                    chunk_d_lo_hi[h][1], chunk_d_lo_hi[h][2],
+                    chunk_d_lo_hi[h][3]);
+              } else {
+                wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_lo[h][0],
+                                             chunk_d_lo[h][1], chunk_d_lo[h][2],
+                                             chunk_d_lo[h][3]);
+              }
             }
 
               // ...and 2 into the hi chunk (K[64..127]).
@@ -485,9 +538,17 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
               std::uint64_t desc_b =
                   make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
-              wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
-                                           chunk_d_hi[h][1], chunk_d_hi[h][2],
-                                           chunk_d_hi[h][3]);
+              if constexpr (Dims::BS == 16) {
+                wgmma_m64n16k32_e4m3_e4m3_f32(
+                    desc_a, desc_b, chunk_d_hi[h][0], chunk_d_hi[h][1],
+                    chunk_d_hi[h][2], chunk_d_hi[h][3], chunk_d_hi_hi[h][0],
+                    chunk_d_hi_hi[h][1], chunk_d_hi_hi[h][2],
+                    chunk_d_hi_hi[h][3]);
+              } else {
+                wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
+                                             chunk_d_hi[h][1], chunk_d_hi[h][2],
+                                             chunk_d_hi[h][3]);
+              }
             }
           }
 
@@ -530,6 +591,40 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             chunk_d_hi[h][0] = chunk_d_hi[h][1] = chunk_d_hi[h][2] =
                 chunk_d_hi[h][3] = 0.f;
           }
+          if constexpr (Dims::BS == 16) {
+            // BS=16: fold the second-quadrant accumulators (token ranks
+            // 8..15) into final_d_hi using the corresponding activation
+            // scales for those ranks.  Same ws — weight scales are not
+            // BS-dependent.
+            const std::uint32_t tok_46 = tok_02 + 8u;
+            const std::uint32_t tok_57 = tok_13 + 8u;
+            const float as_lo_46 = shm->a_down_scale[block_lo][tok_46];
+            const float as_hi_46 = shm->a_down_scale[block_hi][tok_46];
+            const float as_lo_57 = shm->a_down_scale[block_lo][tok_57];
+            const float as_hi_57 = shm->a_down_scale[block_hi][tok_57];
+    #pragma unroll
+            for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+              const float ws = shm->w_down_scale[h][my_wg][ws_col];
+              final_d_hi[h][0] += chunk_d_lo_hi[h][0] * as_lo_46 * ws +
+                                  chunk_d_hi_hi[h][0] * as_hi_46 * ws;
+              final_d_hi[h][1] += chunk_d_lo_hi[h][1] * as_lo_57 * ws +
+                                  chunk_d_hi_hi[h][1] * as_hi_57 * ws;
+              final_d_hi[h][2] += chunk_d_lo_hi[h][2] * as_lo_46 * ws +
+                                  chunk_d_hi_hi[h][2] * as_hi_46 * ws;
+              final_d_hi[h][3] += chunk_d_lo_hi[h][3] * as_lo_57 * ws +
+                                  chunk_d_hi_hi[h][3] * as_hi_57 * ws;
+              chunk_d_lo_hi[h][0] = chunk_d_lo_hi[h][1] = chunk_d_lo_hi[h][2] =
+                  chunk_d_lo_hi[h][3] = 0.f;
+              chunk_d_hi_hi[h][0] = chunk_d_hi_hi[h][1] = chunk_d_hi_hi[h][2] =
+                  chunk_d_hi_hi[h][3] = 0.f;
+            }
+          }
+          MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter0_after_compute,
+                                  e == down_group + DOWN_GROUPS && s == 0u &&
+                                      kk == K_SUBSTEPS_DOWN - 1u);
+          MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter1_after_compute,
+                                  e == down_group + DOWN_GROUPS && s == 1u &&
+                                      kk == K_SUBSTEPS_DOWN - 1u);
         }  // end kk substep loop
   #endif
       }
@@ -659,29 +754,63 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   #ifndef MONO_PROFILE_SKIP_CALC_DOWN
         constexpr unsigned NUM_ACC_STEPS =
             (K_TILES_DOWN > 1u) ? (K_TILES_DOWN - 1u) : 1u;
+        MONO_PHASE_TIMESTAMP_IF_TID(
+            t_down_e1_pf_before_accum, e == down_group + DOWN_GROUPS && s == 0u,
+            CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP);
         if (has_prev_expert && s < NUM_ACC_STEPS) {
           const unsigned thread_in_pf =
               thread_in_block -
               CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP;
           constexpr unsigned PF_THREADS =
               CoreDims::PREFETCH_WARP_COUNT * CoreDims::THREADS_PER_WARP;
-          const uint8_t* prev_rank = shm->down_rank[prev_id];
-          // Slice s covers [floor(s*total/N), floor((s+1)*total/N)):
-          // adjacent, disjoint, covers [0, total) for any runtime total.
-          const unsigned total = batch_size * DOWN_COL_TILE;
-          const unsigned start = (s * total) / NUM_ACC_STEPS;
-          const unsigned end = ((s + 1u) * total) / NUM_ACC_STEPS;
-          for (unsigned tok_col = start + thread_in_pf; tok_col < end;
-               tok_col += PF_THREADS) {
-            const unsigned tok = tok_col / DOWN_COL_TILE;
-            const unsigned col = tok_col % DOWN_COL_TILE;
-            const uint8_t rank_u8 = prev_rank[tok];
-            if (rank_u8 != 0xFFu) {
+          if constexpr (Dims::BS == 16) {
+            // BS16: per-RANK accumulate via the slot→token inverse map.
+            // Iterate ONLY the previous expert's routed ranks —
+            // out_accum[slot_to_token[prev_start+rank]][col] +=
+            // down_out[col][rank] — instead of scanning the full
+            // BS×DOWN_COL_TILE plane and filtering non-routed tokens.
+            // Most experts route 1-2 tokens, so this collapses the
+            // prefetch-warp work from 16×DCT to routed_count×DCT — the
+            // BS16 down-proj bottleneck.  slot_to_token is routing-built
+            // and immutable, so no ping-pong buffer is needed.  Same
+            // slice discipline as the BS8 branch below.
+            const std::uint32_t prev_start =
+                static_cast<std::uint32_t>(shm->expert_slot_start[prev_id]);
+            const std::uint32_t prev_rc =
+                static_cast<std::uint32_t>(shm->expert_routed_count[prev_id]);
+            const unsigned total = prev_rc * DOWN_COL_TILE;
+            const unsigned start = (s * total) / NUM_ACC_STEPS;
+            const unsigned end = ((s + 1u) * total) / NUM_ACC_STEPS;
+            for (unsigned rc = start + thread_in_pf; rc < end;
+                 rc += PF_THREADS) {
+              const unsigned rank = rc / DOWN_COL_TILE;
+              const unsigned col = rc % DOWN_COL_TILE;
+              const unsigned tok = shm->slot_to_token[prev_start + rank];
               shm->out_accum[tok][col] +=
-                  shm->partial_result.down_out[col][rank_u8];
+                  shm->partial_result.down_out[col][rank];
+            }
+          } else {
+            const uint8_t* prev_rank = shm->down_rank[prev_id];
+            // Slice s covers [floor(s*total/N), floor((s+1)*total/N)):
+            // adjacent, disjoint, covers [0, total) for any runtime total.
+            const unsigned total = batch_size * DOWN_COL_TILE;
+            const unsigned start = (s * total) / NUM_ACC_STEPS;
+            const unsigned end = ((s + 1u) * total) / NUM_ACC_STEPS;
+            for (unsigned tok_col = start + thread_in_pf; tok_col < end;
+                 tok_col += PF_THREADS) {
+              const unsigned tok = tok_col / DOWN_COL_TILE;
+              const unsigned col = tok_col % DOWN_COL_TILE;
+              const uint8_t rank_u8 = prev_rank[tok];
+              if (rank_u8 != 0xFFu) {
+                shm->out_accum[tok][col] +=
+                    shm->partial_result.down_out[col][rank_u8];
+              }
             }
           }
         }
+        MONO_PHASE_TIMESTAMP_IF_TID(
+            t_down_e1_pf_after_accum, e == down_group + DOWN_GROUPS && s == 0u,
+            CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP);
   #endif
       }
 
@@ -690,6 +819,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     }  // end K-loop
 
     MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_kloop, e == down_group);
+    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_kloop,
+                            e == down_group + DOWN_GROUPS);
 
     // ── End-of-expert: final_d → down_out[DOWN_COL_TILE][8] ─────────────
     // Half h covers output cols [base_col + h*128, +128); within a half,
@@ -710,6 +841,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             final_d[h][2];
         shm->partial_result.down_out[row_base + 8][col_base + 1] =
             final_d[h][3];
+        if constexpr (Dims::BS == 16) {
+          // BS=16: also write the second-quadrant accumulators (token
+          // ranks 8..15) to the +8 / +9 columns.  At BS=16 T_TILE = 16,
+          // so col_base + 9 (max 15) is in-bounds in
+          // down_out[DOWN_COL_TILE][T_TILE].
+          shm->partial_result.down_out[row_base + 0][col_base + 8] =
+              final_d_hi[h][0];
+          shm->partial_result.down_out[row_base + 0][col_base + 9] =
+              final_d_hi[h][1];
+          shm->partial_result.down_out[row_base + 8][col_base + 8] =
+              final_d_hi[h][2];
+          shm->partial_result.down_out[row_base + 8][col_base + 9] =
+              final_d_hi[h][3];
+        }
       }
   #endif
     }
@@ -719,6 +864,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     __syncthreads();
 
     MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
+    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_writeback,
+                            e == down_group + DOWN_GROUPS);
   }  // end expert loop
 
   // ── Final accumulate for the LAST expert in this block's group ────────
@@ -731,14 +878,33 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     const std::uint32_t e_last =
         down_group +
         ((expert_count - 1u - down_group) / DOWN_GROUPS) * DOWN_GROUPS;
-    const uint8_t* last_rank = shm->down_rank[shmem->experts[e_last].id];
-    for (unsigned tok_col = thread_in_block;
-         tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
-      const unsigned tok = tok_col / DOWN_COL_TILE;
-      const unsigned col = tok_col % DOWN_COL_TILE;
-      const uint8_t rank_u8 = last_rank[tok];
-      if (rank_u8 != 0xFFu) {
-        shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank_u8];
+    const std::uint32_t last_id = shmem->experts[e_last].id;
+    if constexpr (Dims::BS == 16) {
+      // Per-rank final accumulate via the slot→token inverse map
+      // (mirrors the deferred accumulate).  All warps participate — the
+      // K-loop is done.
+      const std::uint32_t last_start =
+          static_cast<std::uint32_t>(shm->expert_slot_start[last_id]);
+      const std::uint32_t last_rc =
+          static_cast<std::uint32_t>(shm->expert_routed_count[last_id]);
+      for (unsigned rc = thread_in_block; rc < last_rc * DOWN_COL_TILE;
+           rc += blockDim.x) {
+        const unsigned rank = rc / DOWN_COL_TILE;
+        const unsigned col = rc % DOWN_COL_TILE;
+        const unsigned tok = shm->slot_to_token[last_start + rank];
+        shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank];
+      }
+    } else {
+      const uint8_t* last_rank = shm->down_rank[last_id];
+      for (unsigned tok_col = thread_in_block;
+           tok_col < batch_size * DOWN_COL_TILE; tok_col += blockDim.x) {
+        const unsigned tok = tok_col / DOWN_COL_TILE;
+        const unsigned col = tok_col % DOWN_COL_TILE;
+        const uint8_t rank_u8 = last_rank[tok];
+        if (rank_u8 != 0xFFu) {
+          shm->out_accum[tok][col] +=
+              shm->partial_result.down_out[col][rank_u8];
+        }
       }
     }
   }

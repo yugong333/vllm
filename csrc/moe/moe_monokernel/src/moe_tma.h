@@ -48,12 +48,17 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
 /**
  * @brief Descriptor for the bf16 activation tensor `[BS, K_hidden]`.
  *
- * SWIZZLE_NONE, boxDim = (128 K, 8 tokens), innermost axis = K.  Used by
- * the Phase-1 routing-window load (`moe_load_full_bf16_input`).
+ * SWIZZLE_NONE, boxDim = (128 K, box_rows tokens), innermost axis = K.
+ * Used by the Phase-1 routing-window load (`moe_load_full_bf16_input`).
+ * `box_rows` = Dims::BS of the launching kernel (8 for the BS8 path, 16
+ * for the BS16 path); rows past `batch_size_cap` are hardware zero-filled
+ * so the armed expect_tx byte count is BS-exact regardless of the runtime
+ * token count.
  */
 CUtensorMap create_activations_tma_desc(const void* activations_ptr,
                                         uint32_t batch_size_cap,
-                                        uint32_t K_hidden);
+                                        uint32_t K_hidden,
+                                        uint32_t box_rows = 8u);
 
 /**
  * @brief Descriptor for the fp8 down-projection weight tensor `[E, K, N]`.
@@ -83,9 +88,12 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
  *
  * SWZ128 precondition: N must be a multiple of 128 (the row stride feeds
  * the swizzle).  `temp_rows` = BS * MAX_TOPK (guard padding excluded).
+ * `t_tile` = rows per TMA issue (CoreDims::T_TILE): 8 on the BS8 path,
+ * 16 (two stacked SWZ128 atoms) on the BS16 path.
  */
 CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
-                                            uint32_t temp_rows, uint32_t N);
+                                            uint32_t temp_rows, uint32_t N,
+                                            uint32_t t_tile = 8u);
 
 // ─── Device-side TMA load helpers ────────────────────────────────────────
 //

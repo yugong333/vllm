@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monokernel shape code generator.
 
 Single source of truth: ``csrc/moe/moe_monokernel/shapes.json``.  The kernel is
@@ -31,6 +33,7 @@ Usage:
   gen_shapes.py --check         # exit 1 if outputs are stale (CI guard)
   gen_shapes.py --print dims    # print one section to stdout (debug)
 """
+
 import argparse
 import json
 import os
@@ -38,7 +41,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", "..", ".."))  # repo root
-MONO = os.path.normpath(os.path.join(HERE, ".."))                    # moe_monokernel/
+MONO = os.path.normpath(os.path.join(HERE, ".."))  # moe_monokernel/
 SHAPES_JSON = os.path.join(MONO, "shapes.json")
 GEN_DIR = os.path.join(MONO, "generated")  # C++ .inc files (#included by sources)
 # The Python registry must be importable from the installed `vllm` package
@@ -72,15 +75,19 @@ def legacy_infix(shape):
     return f"E{shape['E']}_{lc}" if lc else None
 
 
-def uch_of(shape, dct):
+def uch_of(shape, dct, cfg=None):
     """UP_COL_HALVES for a shape/config.
 
     DECOUPLED shapes pin an explicit `up_col_halves` (the up/down grids are
     chosen independently, so UCH does not follow the DCT coupling identity);
-    return it verbatim.  COUPLED shapes derive UCH = max(1, 2*N*DCT/(128*K)),
-    mirroring the C++ `up_col_halves<Dims>` fallback.  `dct` is per-config so
-    a coupled shape with mixed DCT (e.g. 35B cfg4/5 at DCT=512) reports the
-    right UCH per config."""
+    return it verbatim.  Individual configs may also set `uch` to test a
+    decoupled/raw carve without making the whole shape raw.  Otherwise,
+    COUPLED shapes derive UCH = max(1, 2*N*DCT/(128*K)), mirroring the C++
+    `up_col_halves<Dims>` fallback.  `dct` is per-config so a coupled shape
+    with mixed DCT (e.g. 35B cfg4/5 at DCT=512) reports the right UCH per
+    config."""
+    if cfg is not None and cfg.get("uch") is not None:
+        return int(cfg["uch"])
     if shape.get("up_col_halves") is not None:
         return int(shape["up_col_halves"])
     v = (2 * shape["N"] * dct) // (ATOM * shape["K"])
@@ -113,6 +120,7 @@ def load_shapes():
 
 # ── C++ section emitters ────────────────────────────────────────────────────
 
+
 def emit_dims(shapes):
     """Dims_* structs.  The base struct's KernelConfig knobs come from the
     shape's config[0] (the shipped default), so the base Dims and the config-0
@@ -124,12 +132,14 @@ def emit_dims(shapes):
     for s in shapes:
         nm = cpp_name(s)
         c0 = s["configs"][0]
-        uch = uch_of(s, c0["dct"])
+        uch = uch_of(s, c0["dct"], c0)
         struct = f"Dims_BS8_{nm}_BlockFP8_WGMMA_TMA"
-        out.append(f"// {s['display_name']}  (E={s['E']} N={s['N']} K={s['K']}, "
-                   f"default cfg0: grid={c0['grid']} DCT={c0['dct']} "
-                   f"KUP={c0['kup']} KDN={c0['kdn']} SLOTS={c0['slots']} "
-                   f"=> UP_COL_HALVES={uch})")
+        out.append(
+            f"// {s['display_name']}  (E={s['E']} N={s['N']} K={s['K']}, "
+            f"default cfg0: grid={c0['grid']} DCT={c0['dct']} "
+            f"KUP={c0['kup']} KDN={c0['kdn']} SLOTS={c0['slots']} "
+            f"=> UP_COL_HALVES={uch})"
+        )
         out.append(f"struct {struct} {{")
         out.append(f"  static constexpr uint32_t HIDDEN_STATES = {s['K']};")
         out.append(f"  static constexpr uint32_t K = {s['K']};")
@@ -137,18 +147,28 @@ def emit_dims(shapes):
         out.append("  static constexpr uint32_t BS = 8;")
         out.append("  static constexpr uint32_t M = 8;")
         out.append(f"  static constexpr uint32_t NUM_EXPERTS = {s['E']};")
-        out.append("  static constexpr QuantGranularity QUANT_GRAN = "
-                   "QuantGranularity::BLOCK_WISE;")
+        out.append(
+            "  static constexpr QuantGranularity QUANT_GRAN = "
+            "QuantGranularity::BLOCK_WISE;"
+        )
         out.append("  static constexpr uint32_t BLOCK_SCALE_ROW = 128;")
         out.append("  static constexpr uint32_t BLOCK_SCALE_COL = 128;")
-        out.append("  static constexpr uint32_t UP_SCALE_ROWS =\n"
-                   "      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;")
-        out.append("  static constexpr uint32_t UP_SCALE_COLS =\n"
-                   "      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;")
-        out.append("  static constexpr uint32_t DOWN_SCALE_ROWS =\n"
-                   "      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;")
-        out.append("  static constexpr uint32_t DOWN_SCALE_COLS =\n"
-                   "      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;")
+        out.append(
+            "  static constexpr uint32_t UP_SCALE_ROWS =\n"
+            "      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;"
+        )
+        out.append(
+            "  static constexpr uint32_t UP_SCALE_COLS =\n"
+            "      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;"
+        )
+        out.append(
+            "  static constexpr uint32_t DOWN_SCALE_ROWS =\n"
+            "      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;"
+        )
+        out.append(
+            "  static constexpr uint32_t DOWN_SCALE_COLS =\n"
+            "      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;"
+        )
         out.append("  struct KernelConfig {")
         out.append(f"    static constexpr std::uint32_t GRID_SIZE = {c0['grid']};")
         out.append("    static constexpr std::uint32_t BLOCK_SIZE = 384;")
@@ -162,16 +182,19 @@ def emit_dims(shapes):
         # hand-written 122B which set DOWN_COL_TILE=384.  For UCH==1 shapes the
         # hand code omitted it (kernel default), so we omit too.
         if uch >= 2:
-            out.append(f"    static constexpr std::uint32_t DOWN_COL_TILE = "
-                       f"{c0['dct']};")
+            out.append(
+                f"    static constexpr std::uint32_t DOWN_COL_TILE = {c0['dct']};"
+            )
         # UP_COL_HALVES: pinned ONLY for decoupled shapes (explicit
         # `up_col_halves` in shapes.json).  Coupled shapes leave it absent so
         # the kernel derives it from DOWN_COL_TILE (byte-identical to the
         # pre-knob behavior).  When present it decouples the up-grid carve
         # from DCT, which is what lets UP_GROUPS != DOWN_GROUPS.
         if s.get("up_col_halves") is not None:
-            out.append(f"    static constexpr std::uint32_t UP_COL_HALVES = "
-                       f"{int(s['up_col_halves'])};")
+            out.append(
+                f"    static constexpr std::uint32_t UP_COL_HALVES = "
+                f"{int(s['up_col_halves'])};"
+            )
         # SLOTS: omit when it equals the shape's natural default (4 for UCH==1,
         # 2 for UCH>=2) so we reproduce the hand code, which relied on the
         # up_w_slots<Dims> default.  Emit explicitly otherwise.
@@ -184,8 +207,9 @@ def emit_dims(shapes):
         # the zero-regression base==config0 contract.
         natural_slots = 4 if uch == 1 else 2
         if c0["slots"] != natural_slots or s.get("up_col_halves") is not None:
-            out.append(f"    static constexpr std::uint32_t UP_W_SLOTS = "
-                       f"{c0['slots']};")
+            out.append(
+                f"    static constexpr std::uint32_t UP_W_SLOTS = {c0['slots']};"
+            )
         out.append("    static constexpr bool USE_PAIR_LAYOUT = true;")
         out.append("  };")
         out.append("};")
@@ -195,23 +219,118 @@ def emit_dims(shapes):
             # Build the exact legacy struct name from the recorded token.
             legacy = f"Dims_BS8_E{s['E']}_{s['legacy_cpp_name']}_BlockFP8_WGMMA_TMA"
             out.append(f"using {legacy} = {struct};")
+        # BS16 companion tag: identical KernelConfig knobs (config-0), BS
+        # and M doubled to 16.  The kernel template body is shared with
+        # BS8 (moe_kernel_topk_BS8); host dispatch selects the BS16 op for
+        # 8 < token_count <= 16.  Opt-in per shape via `"bs16": true`.
+        if s.get("bs16"):
+            struct16 = f"Dims_BS16_{nm}_BlockFP8_WGMMA_TMA"
+            out.append(
+                f"// BS16 companion of {struct} — selected for token_count in (8, 16]."
+            )
+            out.append(f"struct {struct16} {{")
+            out.append(f"  static constexpr uint32_t HIDDEN_STATES = {s['K']};")
+            out.append(f"  static constexpr uint32_t K = {s['K']};")
+            out.append(f"  static constexpr uint32_t N = {s['N']};")
+            out.append("  static constexpr uint32_t BS = 16;")
+            out.append("  static constexpr uint32_t M = 16;")
+            out.append(f"  static constexpr uint32_t NUM_EXPERTS = {s['E']};")
+            out.append(
+                "  static constexpr QuantGranularity QUANT_GRAN = "
+                "QuantGranularity::BLOCK_WISE;"
+            )
+            out.append("  static constexpr uint32_t BLOCK_SCALE_ROW = 128;")
+            out.append("  static constexpr uint32_t BLOCK_SCALE_COL = 128;")
+            out.append(
+                "  static constexpr uint32_t UP_SCALE_ROWS =\n"
+                "      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;"
+            )
+            out.append(
+                "  static constexpr uint32_t UP_SCALE_COLS =\n"
+                "      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;"
+            )
+            out.append(
+                "  static constexpr uint32_t DOWN_SCALE_ROWS =\n"
+                "      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;"
+            )
+            out.append(
+                "  static constexpr uint32_t DOWN_SCALE_COLS =\n"
+                "      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;"
+            )
+            out.append("  struct KernelConfig {")
+            out.append(f"    static constexpr std::uint32_t GRID_SIZE = {c0['grid']};")
+            out.append("    static constexpr std::uint32_t BLOCK_SIZE = 384;")
+            out.append("    static constexpr bool USE_WGMMA = true;")
+            out.append("    static constexpr bool USE_TMA = true;")
+            out.append(f"    static constexpr std::uint32_t K_STEP_DOWN = {c0['kdn']};")
+            out.append(f"    static constexpr std::uint32_t K_STEP_UP = {c0['kup']};")
+            if uch >= 2:
+                out.append(
+                    f"    static constexpr std::uint32_t DOWN_COL_TILE = {c0['dct']};"
+                )
+            if s.get("up_col_halves") is not None:
+                out.append(
+                    f"    static constexpr std::uint32_t UP_COL_HALVES"
+                    f" = {int(s['up_col_halves'])};"
+                )
+            natural_slots16 = 4 if uch == 1 else 2
+            if c0["slots"] != natural_slots16 or s.get("up_col_halves") is not None:
+                out.append(
+                    f"    static constexpr std::uint32_t UP_W_SLOTS = {c0['slots']};"
+                )
+            out.append("    static constexpr bool USE_PAIR_LAYOUT = true;")
+            out.append("  };")
+            out.append("};")
         out.append("")
     return "\n".join(out)
 
 
+def bs16_config_ids(s):
+    """Config ids to instantiate for the BS16 tunable dispatcher.
+
+    Defaults to all configs for a bs16-enabled shape, but shapes may restrict
+    this when some BS8 candidates exceed the larger BS16 shared-memory layout.
+    """
+    if not s.get("bs16"):
+        return []
+    if s.get("bs16_config_ids") is not None:
+        return list(s["bs16_config_ids"])
+    return [c["id"] for c in s["configs"]]
+
+
+def config_uch_arg(c):
+    """Explicit UCH template arg for DimsTunable; 0 means derive/preserve."""
+    return int(c.get("uch", 0) or 0)
+
+
+def config_x_line(c):
+    note = f"  /* {c['note']} */" if c.get("note") else ""
+    return (
+        f"  X({c['id']}, {c['grid']}, {c['dct']}, {c['kup']}, "
+        f"{c['kdn']}, {c['slots']}, {config_uch_arg(c)}){note}"
+    )
+
+
 def emit_config_table(shapes):
-    """MONO_CONFIGS_<KEY>(X) X-macro tables (id, GRID, DCT, KUP, KDN, SLOTS)."""
+    """MONO_CONFIGS_<KEY>(X) X-macro tables.
+
+    Columns: id, GRID, DCT, KUP, KDN, SLOTS, explicit UCH (0 = derive/preserve).
+    """
     out = [GEN_HEADER]
     for s in shapes:
         nm = cpp_name(s)
         out.append(f"#define MONO_CONFIGS_{nm}(X) \\")
-        lines = []
-        for c in s["configs"]:
-            note = f"  /* {c['note']} */" if c.get("note") else ""
-            lines.append(f"  X({c['id']}, {c['grid']}, {c['dct']}, {c['kup']}, "
-                         f"{c['kdn']}, {c['slots']}){note}")
-        out.append(" \\\n".join(lines))
+        out.append(" \\\n".join(config_x_line(c) for c in s["configs"]))
         out.append("")
+        ids16 = set(bs16_config_ids(s))
+        if ids16:
+            out.append(f"#define MONO_CONFIGS_BS16_{nm}(X) \\")
+            out.append(
+                " \\\n".join(
+                    config_x_line(c) for c in s["configs"] if c["id"] in ids16
+                )
+            )
+            out.append("")
     return "\n".join(out)
 
 
@@ -221,72 +340,176 @@ def emit_wrapper(shapes):
     for s in shapes:
         nm = cpp_name(s)
         struct = f"moe_monokernel::Dims_BS8_{nm}_BlockFP8_WGMMA_TMA"
-        out.append(f"MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(")
+        out.append("MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(")
         out.append(f"    moe_monokernel_topk_BS8_{nm}_BlockFP8_WGMMA_TMA_impl,")
         out.append(f"    {struct})")
         out.append("")
+        if s.get("bs16"):
+            struct16 = f"moe_monokernel::Dims_BS16_{nm}_BlockFP8_WGMMA_TMA"
+            out.append("// BS16 instantiation: reuses the moe_kernel_topk")
+            out.append("// template body; selected by host dispatch for")
+            out.append("// 8 < token_count <= 16.")
+            out.append("MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(")
+            out.append(f"    moe_monokernel_topk_BS16_{nm}_BlockFP8_WGMMA_TMA_impl,")
+            out.append(f"    {struct16})")
+            out.append("")
     # dispatch helpers live in the moe_monokernel namespace
     out.append("namespace moe_monokernel {")
     for s in shapes:
         nm = cpp_name(s)
-        out.append(f"template <typename Base>")
+        out.append("template <typename Base>")
         out.append(f"static inline void dispatch_tunable_{nm}(")
         out.append("    const torch::Tensor& ai, const torch::Tensor& rl,")
         out.append("    const torch::Tensor& ewu, const torch::Tensor& esu,")
-        out.append("    const torch::Tensor& ewd, const torch::Tensor& esd, "
-                   "torch::Tensor& ao,")
+        out.append(
+            "    const torch::Tensor& ewd, const torch::Tensor& esd, torch::Tensor& ao,"
+        )
         out.append("    torch::Tensor& sp, int64_t top_k, int64_t sf, bool renorm,")
         out.append("    const std::optional<torch::Tensor>& eb, double rsf,")
         out.append("    int64_t config_id) {")
-        out.append("#define X(ID, GRID, DCT, KUP, KDN, SLOTS)                "
-                   "                  \\")
-        out.append("  case ID:                                              "
-                   "                   \\")
-        out.append("    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
-                   "KDN, SLOTS>>(  \\")
-        out.append("        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
-                   "eb, rsf,       \\")
-        out.append(f'        "{nm}_cfg" #ID);                                '
-                   "             \\")
+        out.append(
+            "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH)           " + "\\"
+        )
+        out.append(
+            "  case ID:                                              " + "\\"
+        )
+        out.append(
+            "    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
+            "KDN, SLOTS, UCH>>(  " + "\\"
+        )
+        out.append(
+            "        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
+            "eb, rsf,       " + "\\"
+        )
+        out.append(
+            f'        "{nm}_cfg" #ID);                                             ' + "\\"
+        )
         out.append("    return;")
         out.append("  switch (config_id) {")
         out.append(f"    MONO_CONFIGS_{nm}(X)")
         out.append("    default:")
-        out.append(f'      TORCH_CHECK(false, "moe_monokernel {nm}: unknown '
-                   'config_id ", config_id);')
+        out.append(
+            f'      TORCH_CHECK(false, "moe_monokernel {nm}: unknown '
+            'config_id ", config_id);'
+        )
         out.append("  }")
         out.append("#undef X")
         out.append("}")
         out.append("")
+        if bs16_config_ids(s):
+            out.append("template <typename Base>")
+            out.append(f"static inline void dispatch_tunable_BS16_{nm}(")
+            out.append("    const torch::Tensor& ai, const torch::Tensor& rl,")
+            out.append("    const torch::Tensor& ewu, const torch::Tensor& esu,")
+            out.append(
+                "    const torch::Tensor& ewd, const torch::Tensor& esd, torch::Tensor& ao,"
+            )
+            out.append("    torch::Tensor& sp, int64_t top_k, int64_t sf, bool renorm,")
+            out.append("    const std::optional<torch::Tensor>& eb, double rsf,")
+            out.append("    int64_t config_id) {")
+            out.append(
+                "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH)           " + "\\"
+            )
+            out.append(
+                "  case ID:                                              " + "\\"
+            )
+            out.append(
+                "    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
+                "KDN, SLOTS, UCH>>(  " + "\\"
+            )
+            out.append(
+                "        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
+                "eb, rsf,       " + "\\"
+            )
+            out.append(
+                f'        "{nm}_bs16_cfg" #ID);                                  ' + "\\"
+            )
+            out.append("    return;")
+            out.append("  switch (config_id) {")
+            out.append(f"    MONO_CONFIGS_BS16_{nm}(X)")
+            out.append("    default:")
+            out.append(
+                f'      TORCH_CHECK(false, "moe_monokernel BS16 {nm}: unknown '
+                'or unsupported config_id ", config_id);'
+            )
+            out.append("  }")
+            out.append("#undef X")
+            out.append("}")
+            out.append("")
     out.append("}  // namespace moe_monokernel")
     out.append("")
     # tunable_impl free functions
     for s in shapes:
         nm = cpp_name(s)
         out.append(f"void moe_monokernel_topk_BS8_{nm}_tunable_impl(")
-        out.append("    const torch::Tensor& activations_in, const torch::Tensor& "
-                   "router_logits,")
+        out.append(
+            "    const torch::Tensor& activations_in, const torch::Tensor& "
+            "router_logits,"
+        )
         out.append("    const torch::Tensor& expert_weights_up,")
         out.append("    const torch::Tensor& expert_scales_up,")
         out.append("    const torch::Tensor& expert_weights_down,")
-        out.append("    const torch::Tensor& expert_scales_down, torch::Tensor& "
-                   "activations_out,")
-        out.append("    torch::Tensor& scratchpad, int64_t top_k, int64_t "
-                   "scoring_func,")
+        out.append(
+            "    const torch::Tensor& expert_scales_down, torch::Tensor& "
+            "activations_out,"
+        )
+        out.append(
+            "    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,"
+        )
         out.append("    bool renormalize,")
         out.append("    const std::optional<torch::Tensor>& expert_bias,")
         out.append("    double routed_scaling_factor, int64_t config_id) {")
         out.append(f"  moe_monokernel::dispatch_tunable_{nm}<")
         out.append(f"      moe_monokernel::Dims_BS8_{nm}_BlockFP8_WGMMA_TMA>(")
-        out.append("      activations_in, router_logits, expert_weights_up, "
-                   "expert_scales_up,")
-        out.append("      expert_weights_down, expert_scales_down, activations_out, "
-                   "scratchpad,")
-        out.append("      top_k, scoring_func, renormalize, expert_bias, "
-                   "routed_scaling_factor,")
+        out.append(
+            "      activations_in, router_logits, expert_weights_up, expert_scales_up,"
+        )
+        out.append(
+            "      expert_weights_down, expert_scales_down, activations_out, "
+            "scratchpad,"
+        )
+        out.append(
+            "      top_k, scoring_func, renormalize, expert_bias, "
+            "routed_scaling_factor,"
+        )
         out.append("      config_id);")
         out.append("}")
         out.append("")
+        if s.get("bs16"):
+            out.append(f"void moe_monokernel_topk_BS16_{nm}_tunable_impl(")
+            out.append(
+                "    const torch::Tensor& activations_in, const torch::Tensor& "
+                "router_logits,"
+            )
+            out.append("    const torch::Tensor& expert_weights_up,")
+            out.append("    const torch::Tensor& expert_scales_up,")
+            out.append("    const torch::Tensor& expert_weights_down,")
+            out.append(
+                "    const torch::Tensor& expert_scales_down, torch::Tensor& "
+                "activations_out,"
+            )
+            out.append(
+                "    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,"
+            )
+            out.append("    bool renormalize,")
+            out.append("    const std::optional<torch::Tensor>& expert_bias,")
+            out.append("    double routed_scaling_factor, int64_t config_id) {")
+            out.append(f"  moe_monokernel::dispatch_tunable_BS16_{nm}<")
+            out.append(f"      moe_monokernel::Dims_BS16_{nm}_BlockFP8_WGMMA_TMA>(")
+            out.append(
+                "      activations_in, router_logits, expert_weights_up, expert_scales_up,"
+            )
+            out.append(
+                "      expert_weights_down, expert_scales_down, activations_out, "
+                "scratchpad,"
+            )
+            out.append(
+                "      top_k, scoring_func, renormalize, expert_bias, "
+                "routed_scaling_factor,"
+            )
+            out.append("      config_id);")
+            out.append("}")
+            out.append("")
     # Legacy-name forwarders: thin wrappers so old op symbols keep resolving.
     for s in shapes:
         leg = legacy_infix(s)
@@ -317,8 +540,7 @@ def emit_wrapper(shapes):
         out.append("    double routed_scaling_factor, int64_t config_id) {")
         out.append(f"  moe_monokernel_topk_BS8_{nm}_tunable_impl(")
         out.append("      ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, scoring_func,")
-        out.append("      renormalize, expert_bias, routed_scaling_factor, "
-                   "config_id);")
+        out.append("      renormalize, expert_bias, routed_scaling_factor, config_id);")
         out.append("}")
         out.append("")
     return _stableize("\n".join(out))
@@ -353,24 +575,41 @@ def _op_decl(symbol, tunable):
         "    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,\n"
         "    bool renormalize,\n"
         "    const std::optional<torch::Tensor>& expert_bias,\n"
-        f"    double routed_scaling_factor{extra});\n")
+        f"    double routed_scaling_factor{extra});\n"
+    )
 
 
 def emit_ops(shapes):
     out = [GEN_HEADER]
     for s in shapes:
         nm = cpp_name(s)
-        out.append(_op_decl(f"moe_monokernel_topk_BS8_{nm}_BlockFP8_WGMMA_TMA_impl",
-                            tunable=False))
-        out.append(_op_decl(f"moe_monokernel_topk_BS8_{nm}_tunable_impl",
-                            tunable=True))
+        out.append(
+            _op_decl(
+                f"moe_monokernel_topk_BS8_{nm}_BlockFP8_WGMMA_TMA_impl", tunable=False
+            )
+        )
+        out.append(_op_decl(f"moe_monokernel_topk_BS8_{nm}_tunable_impl", tunable=True))
+        if s.get("bs16"):
+            out.append(
+                _op_decl(
+                    f"moe_monokernel_topk_BS16_{nm}_BlockFP8_WGMMA_TMA_impl",
+                    tunable=False,
+                )
+            )
+            out.append(
+                _op_decl(f"moe_monokernel_topk_BS16_{nm}_tunable_impl", tunable=True)
+            )
         leg = legacy_infix(s)
         if leg:
-            out.append(_op_decl(
-                f"moe_monokernel_topk_BS8_{leg}_BlockFP8_WGMMA_TMA_impl",
-                tunable=False))
-            out.append(_op_decl(f"moe_monokernel_topk_BS8_{leg}_tunable_impl",
-                                tunable=True))
+            out.append(
+                _op_decl(
+                    f"moe_monokernel_topk_BS8_{leg}_BlockFP8_WGMMA_TMA_impl",
+                    tunable=False,
+                )
+            )
+            out.append(
+                _op_decl(f"moe_monokernel_topk_BS8_{leg}_tunable_impl", tunable=True)
+            )
     return _stableize("\n".join(out))
 
 
@@ -380,7 +619,7 @@ def _def(symbol, tunable):
     torch_bindings.cpp)."""
     cfg_sig = ", int config_id" if tunable else ""
     return (
-        f'  m.def(\n'
+        f"  m.def(\n"
         f'      "{symbol}(Tensor activations_in,"\n'
         f'      "Tensor router_logits,"\n'
         f'      "Tensor expert_weights_up, Tensor expert_scales_up,"\n'
@@ -411,7 +650,7 @@ def _infix_ops(infix):
 
 def _shape_symbols(shapes):
     """Yield (symbol, tunable) for every op across all shapes (named + tunable,
-    plus legacy-name aliases)."""
+    plus legacy-name aliases and the opt-in BS16 named/tunable ops)."""
     for s in shapes:
         for infix in (cpp_name(s), legacy_infix(s)):
             if not infix:
@@ -419,6 +658,10 @@ def _shape_symbols(shapes):
             named, tun = _infix_ops(infix)
             yield named, False
             yield tun, True
+        if s.get("bs16"):
+            nm = cpp_name(s)
+            yield (f"moe_monokernel_topk_BS16_{nm}_BlockFP8_WGMMA_TMA"), False
+            yield (f"moe_monokernel_topk_BS16_{nm}_tunable"), True
 
 
 def emit_defs(shapes):
@@ -444,44 +687,70 @@ def emit_python(data):
     matching how _custom_ops.py / fp8.py see the weight tensor."""
     shapes = data["shapes"]
     out = [PY_GEN_HEADER]
-    out.append('"""Generated monokernel shape registry. Imported by '
-               '_custom_ops.py and\nthe tuner. Keys use the FUSED N (2*N_half) '
-               'as the weight tensors expose it."""\n')
+    out.append(
+        '"""Generated monokernel shape registry. Imported by '
+        "_custom_ops.py and\nthe tuner. Keys use the FUSED N (2*N_half) "
+        'as the weight tensors expose it."""\n'
+    )
     rows = []
     for s in shapes:
         nm = cpp_name(s)
-        uch_by_cfg = {c["id"]: uch_of(s, c["dct"]) for c in s["configs"]}
+        uch_by_cfg = {c["id"]: uch_of(s, c["dct"], c) for c in s["configs"]}
         raw_ids = sorted([cid for cid, u in uch_by_cfg.items() if u >= 2])
         all_raw = all(u >= 2 for u in uch_by_cfg.values())
         # Per-config knob dicts (id-keyed) so the tuner reads configs straight
         # from the registry instead of re-parsing the C++ X-macro tables.
         configs = {
-            c["id"]: dict(grid=c["grid"], down_col_tile=c["dct"],
-                          k_step_up=c["kup"], k_step_down=c["kdn"],
-                          up_w_slots=c["slots"],
-                          up_col_halves=uch_by_cfg[c["id"]])
+            c["id"]: dict(
+                grid=c["grid"],
+                down_col_tile=c["dct"],
+                k_step_up=c["kup"],
+                k_step_down=c["kdn"],
+                up_w_slots=c["slots"],
+                up_col_halves=uch_by_cfg[c["id"]],
+            )
             for c in s["configs"]
         }
         row = dict(
-            key=s["key"], aliases=s.get("aliases", []),
-            E=s["E"], N_half=s["N"], K=s["K"], N_fused=2 * s["N"],
-            default_top_k=s["default_top_k"], display_name=s["display_name"],
+            key=s["key"],
+            aliases=s.get("aliases", []),
+            E=s["E"],
+            N_half=s["N"],
+            K=s["K"],
+            N_fused=2 * s["N"],
+            default_top_k=s["default_top_k"],
+            display_name=s["display_name"],
             cpp=nm,
             named_op=f"moe_monokernel_topk_BS8_{nm}_BlockFP8_WGMMA_TMA",
+            named_op_bs16=(
+                f"moe_monokernel_topk_BS16_{nm}_BlockFP8_WGMMA_TMA"
+                if s.get("bs16")
+                else None
+            ),
             tunable_op=f"moe_monokernel_topk_BS8_{nm}_tunable",
+            tunable_op_bs16=(
+                f"moe_monokernel_topk_BS16_{nm}_tunable" if s.get("bs16") else None
+            ),
+            bs16_config_ids=bs16_config_ids(s),
             config_macro=f"MONO_CONFIGS_{nm}",
             configs=configs,
-            raw_upproj_config_ids=raw_ids, all_raw=all_raw,
+            raw_upproj_config_ids=raw_ids,
+            all_raw=all_raw,
         )
         # Optional routing metadata (runtime args to the kernel, recorded per
         # shape so the accuracy/tuning harness exercises the serving routing).
-        for opt in ("scoring_func", "use_expert_bias", "routed_scaling_factor",
-                    "up_col_halves"):
+        for opt in (
+            "scoring_func",
+            "use_expert_bias",
+            "routed_scaling_factor",
+            "up_col_halves",
+        ):
             if s.get(opt) is not None:
                 row[opt] = s[opt]
         rows.append(row)
     # repr() (not json.dumps) so booleans render as Python True/False.
     import pprint
+
     out.append("SHAPES = " + pprint.pformat(rows, indent=4, width=88, sort_dicts=False))
     out.append("")
     out.append("# (E, N_fused, K) -> row, for O(1) dispatch.")
@@ -578,20 +847,28 @@ def render(data):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true",
-                    help="exit 1 if any generated file is stale (CI guard)")
-    ap.add_argument("--print", dest="section", choices=[
-        "dims", "config_table", "wrapper", "ops", "defs", "impls", "python"],
-        help="print one section to stdout and exit (no files written)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if any generated file is stale (CI guard)",
+    )
+    ap.add_argument(
+        "--print",
+        dest="section",
+        choices=["dims", "config_table", "wrapper", "ops", "defs", "impls", "python"],
+        help="print one section to stdout and exit (no files written)",
+    )
     args = ap.parse_args()
 
     data = load_shapes()
 
     if args.section:
         key = {"python": "monokernel_shapes.py"}.get(
-            args.section, f"{args.section}_generated.inc")
+            args.section, f"{args.section}_generated.inc"
+        )
         print(render(data)[key])
         return
 
@@ -608,15 +885,16 @@ def main():
                     f.write(content)
     if args.check:
         if stale:
-            print(f"STALE generated files (re-run gen_shapes.py): {stale}",
-                  file=sys.stderr)
+            print(
+                f"STALE generated files (re-run gen_shapes.py): {stale}",
+                file=sys.stderr,
+            )
             sys.exit(1)
         print("generated files up to date")
     else:
         for fn in rendered:
             print(f"  {os.path.relpath(os.path.join(out_dir_for(fn), fn), ROOT)}")
-        print(f"wrote {len(rendered)} files ({len(stale)} changed: "
-              f"{stale or 'none'})")
+        print(f"wrote {len(rendered)} files ({len(stale)} changed: {stale or 'none'})")
         print(f"shapes: {[s['key'] for s in data['shapes']]}")
 
 

@@ -87,23 +87,16 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
  *   normalizer (exact — the routed output is linear in the weights).
  */
 template <typename Dims>
-__device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
-                         bool renormalize,
-                         const __nv_bfloat16* __restrict__ router_logits,
-                         uint32_t num_tokens, MoE_SHM<Dims>* shmem,
-                         const float* __restrict__ expert_bias = nullptr,
-                         float routed_scaling_factor = 1.0f) {
-  static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
+__device__ static __forceinline__ void topK_one_token(
+    uint32_t warp_idx, uint32_t top_k, ScoringFunc scoring_func,
+    bool renormalize, const __nv_bfloat16* __restrict__ router_logits,
+    MoE_SHM<Dims>* shmem, const float* __restrict__ expert_bias,
+    float routed_scaling_factor) {
   static_assert(Dims::BS * Dims::NUM_EXPERTS < UINT32_MAX,
                 "Batch size or number of experts too high for uint32 indices.");
 
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-  uint32_t warp_idx = get_calc_warp<Dims>();
   uint32_t tid = get_thread<Dims>();
-
-  if (warp_idx >= num_tokens) {
-    return;
-  }
 
   // Per-thread expert slice: thread t owns experts {t, t+32, t+64, ...}.
   // NUM_EXPERTS % 32 == 0 keeps the fill loop statically bounded so the
@@ -241,6 +234,47 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
 }
 
 /**
+ * @brief Top-K driver: maps calc warps onto tokens and runs
+ * topK_one_token per (warp, token).
+ *
+ * BS<=8: each calc warp routes exactly one token (`tok == warp_idx`);
+ * padding warps (`warp_idx >= num_tokens`) do nothing.
+ *
+ * BS=16: there are still only CALC_WARP_COUNT (8) calc warps but up to 16
+ * real tokens, so each calc warp routes TWO tokens — `warp_idx` (pass 0)
+ * and `warp_idx + 8` (pass 1).  Without the second pass,
+ * `topk_ids_flat[64..127]` (tokens 8..15) would stay uninitialized and
+ * prepare_moe_topk_BS8's ranking would consume garbage ids.  The second
+ * pass is gated under `if constexpr (Dims::BS == 16)` so the BS8
+ * instruction stream is unchanged.
+ */
+template <typename Dims>
+__device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
+                         bool renormalize,
+                         const __nv_bfloat16* __restrict__ router_logits,
+                         uint32_t num_tokens, MoE_SHM<Dims>* shmem,
+                         const float* __restrict__ expert_bias = nullptr,
+                         float routed_scaling_factor = 1.0f) {
+  static_assert(Dims::BS <= 16, "topK_BS8 supports BS<=16");
+  using CoreDims = MoECoreDims<Dims>;
+
+  const uint32_t warp_idx = get_calc_warp<Dims>();
+  if (warp_idx < num_tokens) {
+    topK_one_token<Dims>(warp_idx, top_k, scoring_func, renormalize,
+                         router_logits, shmem, expert_bias,
+                         routed_scaling_factor);
+  }
+  if constexpr (Dims::BS == 16) {
+    const uint32_t tok2 = warp_idx + CoreDims::CALC_WARP_COUNT;  // 8..15
+    if (tok2 < num_tokens) {
+      topK_one_token<Dims>(tok2, top_k, scoring_func, renormalize,
+                           router_logits, shmem, expert_bias,
+                           routed_scaling_factor);
+    }
+  }
+}
+
+/**
  * @brief Builds the routing tables from topk_ids_flat (warp 0 only).
  *
  * Outputs:
@@ -267,7 +301,7 @@ template <typename Dims>
 __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                                      MoE_SHM<Dims>* __restrict__ shm,
                                      MoEGemmSpec<Dims>* __restrict__ spec) {
-  static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
+  static_assert(Dims::BS <= 16, "prepare_moe_topk_BS8 supports BS<=16");
   static_assert(use_tma<Dims>::value, "BS8 prepare path is TMA-only.");
   // `spec` is only used for MONO_PROFILE_PHASE_TIMING.
   (void)spec;
@@ -277,14 +311,14 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   if (threadIdx.x >= 32) return;
 
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-  constexpr uint32_t MAX_PAIRS = Dims::BS * MAX_TOPK;  // <= 64 for BS=8
+  constexpr uint32_t MAX_PAIRS = Dims::BS * MAX_TOPK;  // 64 (BS8), 128 (BS16)
   constexpr uint32_t BLK = Dims::NUM_EXPERTS / 32;
   static_assert(Dims::NUM_EXPERTS % 32 == 0,
                 "NUM_EXPERTS must be a multiple of 32 for warp blocking of "
                 "expert_routed_count[] / expert_slot_start[].");
   static_assert(
-      MAX_PAIRS <= 64,
-      "Phase A caches up to 2 pair-eids per lane (BS * top_k <= 64).");
+      MAX_PAIRS <= 128,
+      "Phase A caches up to 4 pair-eids per lane (BS * top_k <= 128).");
 
   const uint32_t tid = threadIdx.x;
   const uint32_t n_pairs = batch_size * top_k;
@@ -296,6 +330,11 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   // Phase-C ranking.  Out-of-range pairs hold the 0xFFFF sentinel.
   const uint32_t p0 = tid;        // chunk-0 pair index (lane → pair)
   const uint32_t p1 = tid + 32u;  // chunk-1 pair index
+  // chunk-2 / chunk-3 pair indices — only meaningful when MAX_PAIRS > 64
+  // (BS=16: 4 pairs/lane).  On BS=8 they are unused and DCE'd, so no new
+  // SASS is emitted for the BS8 instantiation.
+  [[maybe_unused]] const uint32_t p2 = tid + 64u;  // chunk-2 pair index
+  [[maybe_unused]] const uint32_t p3 = tid + 96u;  // chunk-3 pair index
   auto load_pair_eid = [&](uint32_t pair) -> uint16_t {
     if (pair >= n_pairs) return (uint16_t)0xFFFF;
     const uint32_t tok = pair / top_k;
@@ -304,6 +343,15 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   };
   const uint16_t eid0 = load_pair_eid(p0);
   const uint16_t eid1 = load_pair_eid(p1);
+  // chunk-2 / chunk-3 eid caches: the SHM loads are gated under
+  // `MAX_PAIRS > 64u` so BS=8 issues no load and the variables fold to a
+  // dead sentinel that ptxas eliminates.
+  [[maybe_unused]] uint16_t eid2 = (uint16_t)0xFFFF;
+  [[maybe_unused]] uint16_t eid3 = (uint16_t)0xFFFF;
+  if constexpr (MAX_PAIRS > 64u) {
+    eid2 = load_pair_eid(p2);
+    eid3 = load_pair_eid(p3);
+  }
 
   // Vectorized zero of expert_routed_count: each lane owns BLK contiguous
   // u8 entries; the store width must equal the lane slice (the base is
@@ -365,6 +413,28 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
       tma_shm->expert_routed_count[eid1] += static_cast<uint8_t>(count);
     }
     __syncwarp();
+  }
+  if constexpr (MAX_PAIRS > 64u) {
+    {
+      const uint32_t key = static_cast<uint32_t>(eid2);
+      const uint32_t match = __match_any_sync(FULL_MASK, key);
+      const uint32_t count = __popc(match);
+      const uint32_t lowest = __ffs(match) - 1u;
+      if (eid2 < Dims::NUM_EXPERTS && tid == lowest) {
+        tma_shm->expert_routed_count[eid2] += static_cast<uint8_t>(count);
+      }
+      __syncwarp();
+    }
+    {
+      const uint32_t key = static_cast<uint32_t>(eid3);
+      const uint32_t match = __match_any_sync(FULL_MASK, key);
+      const uint32_t count = __popc(match);
+      const uint32_t lowest = __ffs(match) - 1u;
+      if (eid3 < Dims::NUM_EXPERTS && tid == lowest) {
+        tma_shm->expert_routed_count[eid3] += static_cast<uint8_t>(count);
+      }
+      __syncwarp();
+    }
   }
 
   MONO_PHASE_TIMESTAMP(t_after_prepare_phaseA);
@@ -495,20 +565,98 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     }
   }
 
+  // Chunk-2 / chunk-3 ranking (BS=16 only, MAX_PAIRS > 64).  A pair's
+  // global rank within its expert's slab is its intra-chunk rank plus the
+  // count of same-eid pairs in all LOWER-indexed chunks (chunk order is
+  // pair index order: tid, tid+32, tid+64, tid+96).
+  [[maybe_unused]] uint32_t rank2_intra = 0;
+  [[maybe_unused]] uint32_t rank2_carry = 0;
+  [[maybe_unused]] uint32_t rank3_intra = 0;
+  [[maybe_unused]] uint32_t rank3_carry = 0;
+  if constexpr (MAX_PAIRS > 64u) {
+    const uint32_t match2 =
+        __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid2));
+    rank2_intra = __popc(match2 & lane_mask);
+    const uint32_t match3 =
+        __match_any_sync(FULL_MASK, static_cast<uint32_t>(eid3));
+    rank3_intra = __popc(match3 & lane_mask);
+
+    // Chunk-2 carry: same-eid pairs in chunks 0 and 1.
+    if (n_pairs > 64) {
+  #pragma unroll
+      for (int src = 0; src < 32; ++src) {
+        const uint32_t q =
+            __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid2), src);
+        const uint32_t b0 =
+            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
+        const uint32_t b1 =
+            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid1) == q);
+        if (static_cast<int>(tid) == src) rank2_carry = __popc(b0) + __popc(b1);
+      }
+    }
+    // Chunk-3 carry: same-eid pairs in chunks 0, 1 and 2.
+    if (n_pairs > 96) {
+  #pragma unroll
+      for (int src = 0; src < 32; ++src) {
+        const uint32_t q =
+            __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid3), src);
+        const uint32_t b0 =
+            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
+        const uint32_t b1 =
+            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid1) == q);
+        const uint32_t b2 =
+            __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid2) == q);
+        if (static_cast<int>(tid) == src)
+          rank3_carry = __popc(b0) + __popc(b1) + __popc(b2);
+      }
+    }
+  }
+
   // Record sorted_slot and down_rank together — `rank` is exactly the
   // value the down-proj would otherwise recompute per expert.  Each
   // (eid, tok) pair is unique (a token's top-k experts are distinct), so
   // the writes are race-free.
   if (p0 < n_pairs && eid0 != 0xFFFF) {
-    tma_shm->sorted_slot[p0] =
+    const uint8_t slot0 =
         static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
+    tma_shm->sorted_slot[p0] = slot0;
     tma_shm->down_rank[eid0][p0 / top_k] = static_cast<uint8_t>(rank0);
+    if constexpr (Dims::BS == 16) {
+      // Inverse map for the down-proj per-rank accumulate (BS16 only).
+      tma_shm->slot_to_token[slot0] = static_cast<uint8_t>(p0 / top_k);
+    }
   }
   if (p1 < n_pairs && eid1 != 0xFFFF) {
-    tma_shm->sorted_slot[p1] = static_cast<uint8_t>(
+    const uint8_t slot1 = static_cast<uint8_t>(
         tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
+    tma_shm->sorted_slot[p1] = slot1;
     tma_shm->down_rank[eid1][p1 / top_k] =
         static_cast<uint8_t>(rank1_intra + rank1_carry);
+    if constexpr (Dims::BS == 16) {
+      tma_shm->slot_to_token[slot1] = static_cast<uint8_t>(p1 / top_k);
+    }
+  }
+  if constexpr (MAX_PAIRS > 64u) {
+    if (p2 < n_pairs && eid2 != 0xFFFF) {
+      const uint32_t rank2 = rank2_intra + rank2_carry;
+      const uint8_t slot2 =
+          static_cast<uint8_t>(tma_shm->expert_slot_start[eid2] + rank2);
+      tma_shm->sorted_slot[p2] = slot2;
+      tma_shm->down_rank[eid2][p2 / top_k] = static_cast<uint8_t>(rank2);
+      if constexpr (Dims::BS == 16) {
+        tma_shm->slot_to_token[slot2] = static_cast<uint8_t>(p2 / top_k);
+      }
+    }
+    if (p3 < n_pairs && eid3 != 0xFFFF) {
+      const uint32_t rank3 = rank3_intra + rank3_carry;
+      const uint8_t slot3 =
+          static_cast<uint8_t>(tma_shm->expert_slot_start[eid3] + rank3);
+      tma_shm->sorted_slot[p3] = slot3;
+      tma_shm->down_rank[eid3][p3 / top_k] = static_cast<uint8_t>(rank3);
+      if constexpr (Dims::BS == 16) {
+        tma_shm->slot_to_token[slot3] = static_cast<uint8_t>(p3 / top_k);
+      }
+    }
   }
 
   MONO_PHASE_TIMESTAMP(t_after_prepare_phaseC);

@@ -361,6 +361,18 @@ struct MoEGemmSpec {
     int64_t t_down_after_prologue;
     int64_t t_down_after_expert0_kloop;
     int64_t t_down_after_expert0_accum;
+    // Steady-state (second expert, e1 = down_group + DOWN_GROUPS) per-expert
+    // breakdown: scale loads, per-iter TMA wait vs WGMMA compute, epilogue
+    // writeback, and the deferred accumulate bracket (PF warp 8 lane 0).
+    int64_t t_down_e1_after_scales;
+    int64_t t_down_e1_iter0_after_wait;
+    int64_t t_down_e1_iter0_after_compute;
+    int64_t t_down_e1_iter1_after_wait;
+    int64_t t_down_e1_iter1_after_compute;
+    int64_t t_down_e1_after_kloop;
+    int64_t t_down_e1_after_writeback;
+    int64_t t_down_e1_pf_before_accum;
+    int64_t t_down_e1_pf_after_accum;
     int64_t t_down_after_all_experts;
     int64_t t_after_down;
     int64_t t_after_barrier3;
@@ -643,7 +655,11 @@ struct MoECoreDims {
                 "MoEGemmSpec::DOWN_GROUPS must match "
                 "MoECoreDims::DOWN_GROUPS.");
 
-  static constexpr std::uint32_t T_TILE = 8;
+  // Per-block token-tile width consumed by the FP8 activation staging
+  // and the down-proj WGMMA B operand.  8 for BS<=8 (one 8-token SWZ128
+  // atom); Dims::BS for the BS16 path (two stacked 8-token atoms, the
+  // m64n16k32 N extent).
+  static constexpr std::uint32_t T_TILE = (Dims::BS <= 8) ? 8u : Dims::BS;
 };
 
 /**
@@ -663,17 +679,19 @@ struct MoE_SHM {
       static constexpr uint32_t K_BLOCKS_TOTAL =
           Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
 
-      // BS-dependent extents collapse to 1 for Dims::BS > 8 so non-BS8
+      // BS-dependent extents collapse to 1 for Dims::BS > 16 so oversized
       // Dims (only Dims_Max, used for max-size bookkeeping) don't inflate
-      // sizeof(MoE_SHM).
+      // sizeof(MoE_SHM).  Both the BS8 and BS16 WGMMA+TMA tags get the
+      // live extents; for BS8 the expansion is unchanged (BS8 SASS
+      // bit-identity preserved).
       static constexpr uint32_t BF16_IN_FULL_K_BLOCKS =
-          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+          (Dims::BS <= 16) ? K_BLOCKS_TOTAL : 1;
       static constexpr uint32_t BF16_IN_FULL_BS =
-          (Dims::BS <= 8) ? Dims::BS : 1;
+          (Dims::BS <= 16) ? Dims::BS : 1;
       static constexpr uint32_t BF16_IN_FULL_K =
-          (Dims::BS <= 8) ? CoreDims::K_STEP_WGMMA : 1;
+          (Dims::BS <= 16) ? CoreDims::K_STEP_WGMMA : 1;
       static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS =
-          (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+          (Dims::BS <= 16) ? K_BLOCKS_TOTAL : 1;
 
       static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
       // 16-K fp8 chunks per 128-K SWZ128 atom.
@@ -832,6 +850,29 @@ struct MoE_SHM {
       static constexpr uint32_t UP_RANK_FOR_TOK_PREV_LEN =
           (use_pair_layout<Dims>::value ? Dims::BS : 0u);
       uint8_t up_rank_for_tok_prev[UP_RANK_FOR_TOK_PREV_LEN];
+      // Down-proj slot→token inverse map (BS16 only).  Built once in
+      // routing Phase C (alongside `sorted_slot[pair] = slot`) via the
+      // companion scatter `slot_to_token[slot] = pair / top_k`, read-only
+      // afterwards.  It lets the down-proj accumulate iterate an expert's
+      // routed RANKS directly —
+      //   out_accum[slot_to_token[expert_start + rank]][col] +=
+      //       down_out[col][rank]
+      // — instead of walking the full BS×DOWN_COL_TILE plane and
+      // discarding non-routed tokens via the down_rank 0xFF filter.  At
+      // BS=16 the plane walk costs 16×256 cells per expert while the
+      // useful work is routed_count×256 (routed_count is 1-2 for most
+      // experts), so the per-rank form removes ~8x of the deferred
+      // accumulate traffic — the down-proj bottleneck at BS16.  Global
+      // and immutable for the whole kernel, so the deferred accumulate
+      // needs no ping-pong (unlike the up-proj rank snapshot).
+      //
+      // Extent collapses to 0 for BS<=8 — that path keeps the down_rank
+      // plane walk (batch_size×DCT is only 2048 there and the SASS stays
+      // byte-identical).  Placed at the END of the struct so its
+      // presence/absence shifts no other field's offset.
+      static constexpr uint32_t SLOT_TO_TOKEN_LEN =
+          (Dims::BS == 16u) ? MAX_PAIRS : 0u;
+      uint8_t slot_to_token[SLOT_TO_TOKEN_LEN];
     } tiny_wgmma_tma;
 
     // The bf16 input view must alias the weight views exactly — a layout

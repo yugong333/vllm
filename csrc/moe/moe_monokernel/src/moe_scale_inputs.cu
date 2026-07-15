@@ -56,12 +56,15 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
     const A_element (&bf16_row)[BF16InCols],
     AQ_element (&fp8_act)[Fp8NumChunks][Fp8Tok][Fp8KInner], std::uint32_t tok,
     std::uint32_t batch_size, float* __restrict__ act_scale_for_step) {
-  static_assert(Dims::BS <= 8, "Streaming quantize is for BS<=8");
+  static_assert(Dims::BS <= 16, "Streaming quantize supports BS<=16");
   static_assert(BF16InCols == 128, "bf16_row must have 128 K cols");
   static_assert(Fp8NumChunks == 8, "fp8_act must have 8 K-chunks of 16");
-  static_assert(Fp8Tok == 8 || Fp8Tok == 9,
-                "fp8_act must have 8 or 9 (kc-padded) token rows; only the "
-                "first 8 are written");
+  static_assert(Fp8Tok == MoECoreDims<Dims>::T_TILE ||
+                    Fp8Tok == MoECoreDims<Dims>::T_TILE + 1,
+                "fp8_act must have T_TILE or T_TILE+1 (kc-padded) token "
+                "rows; only the first T_TILE are written.  T_TILE is 8 for "
+                "BS<=8 and 16 for BS=16, so this resolves to 8/9 on the "
+                "BS8 path and 16/17 on the BS16 path.");
   static_assert(Fp8KInner == 16, "fp8_act inner dim must be 16");
 
   const std::uint32_t thread = get_thread<Dims>();  // 0..31
@@ -144,7 +147,7 @@ __device__ inline void routing_phase_quantize(
     float (&act_scale)[ScaleKBlocks][ScaleBs], std::uint32_t batch_size) {
   using CoreDims = MoECoreDims<Dims>;
 
-  static_assert(Dims::BS <= 8, "routing_phase_quantize is BS8-only");
+  static_assert(Dims::BS <= 16, "routing_phase_quantize supports BS<=16");
   constexpr std::uint32_t K_BLOCKS_TOTAL =
       Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
   static_assert(KBlocks == K_BLOCKS_TOTAL,

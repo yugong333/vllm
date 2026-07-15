@@ -55,7 +55,10 @@ __device__ void moe_kernel_topk_BS8(
     CUtensorMap const& up_weights_desc, CUtensorMap const& activations_desc,
     CUtensorMap const& down_weights_desc,
     CUtensorMap const& down_activations_desc) {
-  static_assert(Dims::BS <= 8);
+  static_assert(Dims::BS <= 16,
+                "moe_kernel_topk_BS8 supports BS<=16 (the BS16 tag reuses "
+                "this template body; token_count > 16 is rejected by the "
+                "host dispatcher).");
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
   static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");

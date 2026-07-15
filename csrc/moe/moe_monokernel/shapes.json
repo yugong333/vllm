@@ -17,6 +17,8 @@
       "E": 256,
       "N": 512,
       "K": 2048,
+      "bs16": true,
+      "bs16_config_ids": [0, 1, 2, 3, 6],
       "default_top_k": 8,
       "configs": [
         {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
@@ -24,7 +26,8 @@
         {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
         {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
         {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
-        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"},
+        {"id": 6, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2, "uch": 2, "note": "BS16-safe decoupled/raw candidate: UCH=2 with DCT=256 to stay within SHM budget"}
       ]
     },
     {

@@ -167,7 +167,7 @@ void launch_moe_monokernel(
        the baked-in M always matches replays. */
     activations_desc = create_activations_tma_desc(
         reinterpret_cast<const void*>(activations_in_ptr), num_tokens,
-        dims::HIDDEN_STATES);
+        dims::HIDDEN_STATES, /*box_rows=*/dims::BS);
     /* Down weights: raw row-major [E, K, N], never pre-interleaved.
        row_box is pinned to 128 because DOWN_COL_TILE=384 (122B) exceeds
        the 256-row TMA boxDim cap; the kernel issues one 128-row TMA per
@@ -181,7 +181,8 @@ void launch_moe_monokernel(
     const void* temp_fp8_ptr = reinterpret_cast<const char*>(scratchpad_ptr) +
                                MoEGemmSpec<dims>::TEMP_FP8_OFFSET;
     down_activations_desc = create_down_activation_tma_desc(
-        temp_fp8_ptr, MoEGemmSpec<dims>::TEMP_ROWS_TMA, dims::N);
+        temp_fp8_ptr, MoEGemmSpec<dims>::TEMP_ROWS_TMA, dims::N,
+        /*t_tile=*/moe_monokernel::MoECoreDims<dims>::T_TILE);
   }
 
   void* kernel_args[] = {(void*)&activations_in_ptr,

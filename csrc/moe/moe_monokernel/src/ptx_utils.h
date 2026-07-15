@@ -131,6 +131,44 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(
       : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
 }
 
+/**
+ * @brief wgmma.mma_async m64n16k32 fp8×fp8 → fp32, SHM A and SHM B.
+ *
+ * BS16 up/down-projection shape: one instruction consumes all 16 token
+ * columns per K-substep instead of two stacked m64n8k32 issues.
+ *
+ * Accumulator layout (per thread in the warpgroup, for N=16):
+ *   d[0..7] — 8 fp32 values.  The mapping is the m64n8k32 fragment
+ *   replicated for the second 8-column quadrant (N=[8,16)):
+ *     d[0]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 0
+ *     d[1]: row = w*16 + l/4 + 0,  col = (l%4)*2 + 1
+ *     d[2]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 0
+ *     d[3]: row = w*16 + l/4 + 8,  col = (l%4)*2 + 1
+ *     d[4]: row = w*16 + l/4 + 0,  col = 8 + (l%4)*2 + 0
+ *     d[5]: row = w*16 + l/4 + 0,  col = 8 + (l%4)*2 + 1
+ *     d[6]: row = w*16 + l/4 + 8,  col = 8 + (l%4)*2 + 0
+ *     d[7]: row = w*16 + l/4 + 8,  col = 8 + (l%4)*2 + 1
+ *   (64 M rows × 16 N columns / 128 lanes = 8 fp32 elements per lane.)
+ *
+ * Hard-codes scale_D = 1 (accumulate) and scaleA = scaleB = +1, matching
+ * wgmma_m64n8k32_e4m3_e4m3_f32 — the only modes this kernel uses.
+ */
+__device__ static __forceinline__ void wgmma_m64n16k32_e4m3_e4m3_f32(
+    std::uint64_t desc_a, std::uint64_t desc_b, float& d0, float& d1, float& d2,
+    float& d3, float& d4, float& d5, float& d6, float& d7) {
+  constexpr std::uint32_t scale_D = 1;
+  asm volatile(
+      "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %10, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, p, %11, %12;\n"
+      "}\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3), "+f"(d4), "+f"(d5), "+f"(d6),
+        "+f"(d7)
+      : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
+}
+
 // ── Hopper mbarrier helpers (sm_90a) ──────────────────────────────────────
 //
 // Wrappers around the `mbarrier.*` family used to gate TMA transfers.  An

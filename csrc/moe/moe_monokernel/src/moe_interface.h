@@ -68,7 +68,8 @@ struct base_explicit_uch_or_zero {
 // per-shape config table; the runtime dispatcher (moe_wrapper.cu) picks one
 // by config_id.  config_id 0 always equals the bare `Base` Dims.
 template <typename Base, std::uint32_t GRID, std::uint32_t DCT,
-          std::uint32_t KUP, std::uint32_t KDN, std::uint32_t SLOTS>
+          std::uint32_t KUP, std::uint32_t KDN, std::uint32_t SLOTS,
+          std::uint32_t UCH = 0>
 struct DimsTunable {
   static constexpr uint32_t HIDDEN_STATES = Base::HIDDEN_STATES;
   static constexpr uint32_t K = Base::K;
@@ -93,14 +94,17 @@ struct DimsTunable {
     static constexpr std::uint32_t DOWN_COL_TILE = DCT;
     static constexpr std::uint32_t UP_W_SLOTS = SLOTS;
     // Decoupled shapes pin UP_COL_HALVES on the Base — use it verbatim.
-    // Coupled shapes derive it from THIS config's DCT (not Base's config-0
-    // DCT), since one shape can mix DCT values across configs.
+    // Coupled shapes normally derive it from THIS config's DCT (not Base's
+    // config-0 DCT), since one shape can mix DCT values across configs.
+    // A nonzero UCH template argument lets an individual config opt into a
+    // decoupled/raw up-proj carve without making the whole shape raw.
     static constexpr std::uint32_t UP_COL_HALVES =
-        base_explicit_uch_or_zero<Base>::value != 0u
-            ? base_explicit_uch_or_zero<Base>::value
-            : (((2u * N * DCT) / (128u * HIDDEN_STATES) > 0u)
-                   ? (2u * N * DCT) / (128u * HIDDEN_STATES)
-                   : 1u);
+        UCH != 0u ? UCH
+                  : (base_explicit_uch_or_zero<Base>::value != 0u
+                         ? base_explicit_uch_or_zero<Base>::value
+                         : (((2u * N * DCT) / (128u * HIDDEN_STATES) > 0u)
+                                ? (2u * N * DCT) / (128u * HIDDEN_STATES)
+                                : 1u));
     static constexpr bool USE_PAIR_LAYOUT = Base::KernelConfig::USE_PAIR_LAYOUT;
   };
 };
