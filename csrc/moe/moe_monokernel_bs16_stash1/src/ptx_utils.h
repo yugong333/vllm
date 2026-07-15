@@ -248,9 +248,8 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(
  * no spill).
  */
 __device__ static __forceinline__ void wgmma_m64n16k32_e4m3_e4m3_f32(
-    std::uint64_t desc_a, std::uint64_t desc_b,
-    float& d0, float& d1, float& d2, float& d3,
-    float& d4, float& d5, float& d6, float& d7) {
+    std::uint64_t desc_a, std::uint64_t desc_b, float& d0, float& d1, float& d2,
+    float& d3, float& d4, float& d5, float& d6, float& d7) {
   // scale_D = 1 → accumulate into d0..d7.
   constexpr std::uint32_t scale_D = 1;
   asm volatile(
@@ -260,8 +259,8 @@ __device__ static __forceinline__ void wgmma_m64n16k32_e4m3_e4m3_f32(
       "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, p, %11, %12;\n"
       "}\n"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3),
-        "+f"(d4), "+f"(d5), "+f"(d6), "+f"(d7)
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3), "+f"(d4), "+f"(d5), "+f"(d6),
+        "+f"(d7)
       : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
 }
 

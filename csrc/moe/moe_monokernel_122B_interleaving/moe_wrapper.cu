@@ -126,14 +126,13 @@ static_assert(
          128-K substep (16 KB at DOWN_COL_TILE=128, 32 KB at                   \
          DOWN_COL_TILE=256), halving the issue count when the M tile           \
          is 256 rows. */                                                       \
-      /* row_box is pinned to 128 (one 128-row atom per TMA): the TMA      \
-         boxDim hardware cap is 256, so DOWN_COL_TILE=384 cannot be a       \
-         single box.  The 122B down-proj kernel issues DOWN_COL_HALVES      \
-         128-row TMAs per K-substep at GM col base_col + h*128. */          \
+      /* row_box is pinned to 128 (one 128-row atom per TMA): the TMA          \
+         boxDim hardware cap is 256, so DOWN_COL_TILE=384 cannot be a          \
+         single box.  The 122B down-proj kernel issues DOWN_COL_HALVES         \
+         128-row TMAs per K-substep at GM col base_col + h*128. */             \
       down_weights_desc = create_down_weight_tma_desc(                         \
           reinterpret_cast<const void*>(expert_weights_down_ptr),              \
-          dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N,                     \
-          /*row_box=*/128u);                                                  \
+          dims::NUM_EXPERTS, dims::HIDDEN_STATES, dims::N, /*row_box=*/128u);  \
       /* Down-projection activation descriptor reads from `spec->temp_fp8`     \
          which lives inside the scratchpad.  Compute the device pointer        \
          from the scratchpad base + the compile-time offset of temp_fp8        \

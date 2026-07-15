@@ -14,7 +14,8 @@
 //        - `create_up_weight_tma_desc(weights_ptr, E=256, N=1408, K=3584)`
 //        - `create_activations_tma_desc(acts_ptr, BS=8, K_hidden=3584)`
 //        - `create_down_weight_tma_desc(weights_ptr, E=256, K=3584, N=512)`
-//        - `create_down_activation_tma_desc(acts_ptr, TEMP_ROWS=64, N=512, t_tile=8)`
+//        - `create_down_activation_tma_desc(acts_ptr, TEMP_ROWS=64, N=512,
+//        t_tile=8)`
 //   3. Assert `sizeof(CUtensorMap) == 128` so a layout change in the CUDA
 //      Driver API surface shows up loudly instead of silently.
 //   4. Assert that each returned descriptor has at least one non-zero byte

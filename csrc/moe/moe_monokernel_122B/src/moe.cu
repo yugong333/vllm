@@ -297,8 +297,7 @@ __device__ void moe_kernel_topk_BS8(
     // First 8 per-128-K-block activation scales for token 0
     // (act_scale is [blk][tok]).
     constexpr uint32_t NB = MoE_SHM<Dims>::ACT_SCALE_BLOCKS;
-    printf("[MONO_DBG] tok0 act_scale[blk] (first %u):",
-           NB < 8u ? NB : 8u);
+    printf("[MONO_DBG] tok0 act_scale[blk] (first %u):", NB < 8u ? NB : 8u);
     for (uint32_t b = 0; b < NB && b < 8u; ++b)
       printf(" %.6e", (float)shmem->act_scale[b][0]);
     printf("\n");
@@ -428,7 +427,8 @@ __device__ void moe_kernel_topk_BS8(
     printf("[MONO_DBG] temp_fp8[dest_row][0:16]:");
     for (uint32_t c = 0; c < 16u; ++c)
       printf(" %.4f", (float)spec->temp_fp8[dest_row * Dims::N + c]);
-    printf("\n[MONO_DBG] temp_act_scale[dest_row][0:%u]:", SCOLS < 8u ? SCOLS : 8u);
+    printf("\n[MONO_DBG] temp_act_scale[dest_row][0:%u]:",
+           SCOLS < 8u ? SCOLS : 8u);
     for (uint32_t c = 0; c < SCOLS && c < 8u; ++c)
       printf(" %.6e", spec->temp_act_scale[dest_row * SCOLS + c]);
     printf("\n");

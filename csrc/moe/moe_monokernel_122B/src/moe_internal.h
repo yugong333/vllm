@@ -1334,8 +1334,7 @@ struct MoE_SHM {
         // 64 KB).  Both land at 64 KB total so the union dominator is
         // `w_down_wgmma`.  The depth is `UP_W_SLOTS` (declared at struct
         // scope above); the up-proj K-loop lookahead modulus tracks it.
-        alignas(1024)
-            W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
+        alignas(1024) W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
         alignas(1024) W_element
             w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL]
                         [CoreDims::K_STEP_WGMMA];  // 128 wide × M

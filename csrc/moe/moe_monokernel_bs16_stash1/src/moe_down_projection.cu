@@ -235,8 +235,9 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     std::uint32_t batch_size, MoEGemmSpec<Dims>* __restrict__ spec,
     MoE_SHM<Dims>* __restrict__ shmem, CUtensorMap const& down_weights_desc,
     CUtensorMap const& down_activations_desc) {
-  static_assert(Dims::BS <= 16,
-                "moe_down_projection_BS8_allexperts_wgmma_tma supports BS<=16 (Req 8)");
+  static_assert(
+      Dims::BS <= 16,
+      "moe_down_projection_BS8_allexperts_wgmma_tma supports BS<=16 (Req 8)");
   using CoreDims = MoECoreDims<Dims>;
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
@@ -305,8 +306,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL =
       CoreDims::T_TILE *
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_NUM_CHUNKS *
-      MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK *
-      K_SUBSTEPS_DOWN;
+      MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK * K_SUBSTEPS_DOWN;
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
       MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
@@ -558,19 +558,19 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     if (need_first_expert_prime && is_tma_launcher_thread<Dims>()) {
   #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
       if constexpr (DOWN_PIPE_DEPTH == 4u) {
-        // 4-deep pipeline (BS16): prime the first 2 ring slots (tiles
-        // 0 and 1) — mirrors the up-proj pre-loop arming bar_w[0] and
-        // bar_w[1].  The in-loop launcher then fills slots 2,3 at iters
-        // 0,1 and cross-stitches the NEXT expert into slots 0,1 at the
-        // last two iters.  K_SUBSTEPS_DOWN == 1 here (K_STEP_DOWN=128),
-        // so each ring slot is exactly one 32 KB weight tile plus one
-        // activation atom.
+          // 4-deep pipeline (BS16): prime the first 2 ring slots (tiles
+          // 0 and 1) — mirrors the up-proj pre-loop arming bar_w[0] and
+          // bar_w[1].  The in-loop launcher then fills slots 2,3 at iters
+          // 0,1 and cross-stitches the NEXT expert into slots 0,1 at the
+          // last two iters.  K_SUBSTEPS_DOWN == 1 here (K_STEP_DOWN=128),
+          // so each ring slot is exactly one 32 KB weight tile plus one
+          // activation atom.
     #pragma unroll
         for (std::uint32_t ps = 0; ps < 2u; ++ps) {
           const std::uint32_t prime_k = ps * K_STEP_DOWN;
           mbarrier_arrive_expect_tx(&shm->bar_w[ps],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
             W_element* dest_base =
                 &shm->w_down_wgmma[ps][kk * DOWN_COL_TILE][0];
@@ -584,7 +584,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           if (routed_count > 0u) {
             mbarrier_arrive_expect_tx(&shm->bar_a[ps],
                                       /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
               tma_load_down_wgmma_activation_bulk(
                   down_activations_desc,
@@ -596,52 +596,52 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           }
         }
       } else {
-      // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
-      // and issue ONE TMA per 128-K substep covering the full
-      // DOWN_COL_TILE M-rows.  The descriptor's boxDim row dimension
-      // is set to DOWN_COL_TILE host-side (see
-      // `create_down_weight_tma_desc(... row_box=DOWN_COL_TILE)`), so
-      // each TMA delivers `DOWN_COL_TILE * 128` bytes at once
-      // (16 KB for DOWN_COL_TILE=128, 32 KB for DOWN_COL_TILE=256).
-      // The two 128-row sub-atoms inside a 256-row delivery still
-      // observe the SWZ128 byte layout, so the consumer-side WGMMA A
-      // descriptor (which addresses one 128-row sub-atom per WGMMA
-      // call) is unchanged.
-      //
-      // Per-K-substep destination row offset into `w_down_wgmma[slot]`:
-      //   kk-th substep starts at row `kk * DOWN_COL_TILE`.
-      // All atoms retire into the same bar_w[0], so a single
-      // `mbarrier.try_wait.parity` on the compute side drains them all.
-      mbarrier_arrive_expect_tx(&shm->bar_w[0],
-                                /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
-      for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-        W_element* dest_base = &shm->w_down_wgmma[0][kk * DOWN_COL_TILE][0];
-        tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
-                                 /*K=*/Dims::HIDDEN_STATES,
-                                 /*base_col=*/base_col,
-                                 /*k_start=*/kk * K_STEP_WGMMA,
-                                 /*dest_smem_ptr=*/(void*)dest_base,
-                                 /*bar_smem_ptr=*/&shm->bar_w[0]);
-      }
-
-      // Activation tile for K-step 0: only issue when routed_count > 0.
-      // One TMA per 128-K sub-block (each delivers a 1024-B SWZ128
-      // atom into `a_down_wgmma[slot][kk]`).  All atoms retire into
-      // `bar_a[0]`; the launcher arms it once with the total tx_bytes.
-      if (routed_count > 0u) {
-        mbarrier_arrive_expect_tx(&shm->bar_a[0],
-                                  /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+        // Weight tile for K-step 0: arm bar_w[0] with the TOTAL tx_bytes
+        // and issue ONE TMA per 128-K substep covering the full
+        // DOWN_COL_TILE M-rows.  The descriptor's boxDim row dimension
+        // is set to DOWN_COL_TILE host-side (see
+        // `create_down_weight_tma_desc(... row_box=DOWN_COL_TILE)`), so
+        // each TMA delivers `DOWN_COL_TILE * 128` bytes at once
+        // (16 KB for DOWN_COL_TILE=128, 32 KB for DOWN_COL_TILE=256).
+        // The two 128-row sub-atoms inside a 256-row delivery still
+        // observe the SWZ128 byte layout, so the consumer-side WGMMA A
+        // descriptor (which addresses one 128-row sub-atom per WGMMA
+        // call) is unchanged.
+        //
+        // Per-K-substep destination row offset into `w_down_wgmma[slot]`:
+        //   kk-th substep starts at row `kk * DOWN_COL_TILE`.
+        // All atoms retire into the same bar_w[0], so a single
+        // `mbarrier.try_wait.parity` on the compute side drains them all.
+        mbarrier_arrive_expect_tx(&shm->bar_w[0],
+                                  /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
     #pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-          tma_load_down_wgmma_activation_bulk(
-              down_activations_desc,
-              /*k_start=*/kk * K_STEP_WGMMA,
-              /*expert_slot_start=*/expert_start,
-              /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
-              /*bar_smem_ptr=*/&shm->bar_a[0]);
+          W_element* dest_base = &shm->w_down_wgmma[0][kk * DOWN_COL_TILE][0];
+          tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                   /*K=*/Dims::HIDDEN_STATES,
+                                   /*base_col=*/base_col,
+                                   /*k_start=*/kk * K_STEP_WGMMA,
+                                   /*dest_smem_ptr=*/(void*)dest_base,
+                                   /*bar_smem_ptr=*/&shm->bar_w[0]);
         }
-      }
+
+        // Activation tile for K-step 0: only issue when routed_count > 0.
+        // One TMA per 128-K sub-block (each delivers a 1024-B SWZ128
+        // atom into `a_down_wgmma[slot][kk]`).  All atoms retire into
+        // `bar_a[0]`; the launcher arms it once with the total tx_bytes.
+        if (routed_count > 0u) {
+          mbarrier_arrive_expect_tx(&shm->bar_a[0],
+                                    /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+    #pragma unroll
+          for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+            tma_load_down_wgmma_activation_bulk(
+                down_activations_desc,
+                /*k_start=*/kk * K_STEP_WGMMA,
+                /*expert_slot_start=*/expert_start,
+                /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
+                /*bar_smem_ptr=*/&shm->bar_a[0]);
+          }
+        }
       }  // end `if constexpr (DOWN_PIPE_DEPTH == 4u) { … } else { … }`
   #endif
     }
@@ -819,15 +819,11 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 // the same 4 fp32 accumulators as the BS<=8 path
                 // (token ranks 0..7); d[4..7] cover N=[8,16) (token
                 // ranks 8..15) and live in chunk_d_lo_hi[h][0..3].
-                wgmma_m64n16k32_e4m3_e4m3_f32(desc_a, desc_b,
-                                              chunk_d_lo[h][0],
-                                              chunk_d_lo[h][1],
-                                              chunk_d_lo[h][2],
-                                              chunk_d_lo[h][3],
-                                              chunk_d_lo_hi[h][0],
-                                              chunk_d_lo_hi[h][1],
-                                              chunk_d_lo_hi[h][2],
-                                              chunk_d_lo_hi[h][3]);
+                wgmma_m64n16k32_e4m3_e4m3_f32(
+                    desc_a, desc_b, chunk_d_lo[h][0], chunk_d_lo[h][1],
+                    chunk_d_lo[h][2], chunk_d_lo[h][3], chunk_d_lo_hi[h][0],
+                    chunk_d_lo_hi[h][1], chunk_d_lo_hi[h][2],
+                    chunk_d_lo_hi[h][3]);
               } else {
                 // BS<=8: preserved BS8 issue — m64n8k32 with the
                 // 4-register fragment, byte-identical to today
@@ -850,15 +846,11 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               std::uint64_t desc_b =
                   make_wgmma_desc(b_ptr, B_LBO, B_SBO, B_SWIZZLE);
               if constexpr (Dims::BS == 16) {
-                wgmma_m64n16k32_e4m3_e4m3_f32(desc_a, desc_b,
-                                              chunk_d_hi[h][0],
-                                              chunk_d_hi[h][1],
-                                              chunk_d_hi[h][2],
-                                              chunk_d_hi[h][3],
-                                              chunk_d_hi_hi[h][0],
-                                              chunk_d_hi_hi[h][1],
-                                              chunk_d_hi_hi[h][2],
-                                              chunk_d_hi_hi[h][3]);
+                wgmma_m64n16k32_e4m3_e4m3_f32(
+                    desc_a, desc_b, chunk_d_hi[h][0], chunk_d_hi[h][1],
+                    chunk_d_hi[h][2], chunk_d_hi[h][3], chunk_d_hi_hi[h][0],
+                    chunk_d_hi_hi[h][1], chunk_d_hi_hi[h][2],
+                    chunk_d_hi_hi[h][3]);
               } else {
                 wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d_hi[h][0],
                                              chunk_d_hi[h][1], chunk_d_hi[h][2],
@@ -944,10 +936,10 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                                   chunk_d_hi_hi[h][2] * as_hi_46 * ws;
               final_d_hi[h][3] += chunk_d_lo_hi[h][3] * as_lo_57 * ws +
                                   chunk_d_hi_hi[h][3] * as_hi_57 * ws;
-              chunk_d_lo_hi[h][0] = chunk_d_lo_hi[h][1] =
-                  chunk_d_lo_hi[h][2] = chunk_d_lo_hi[h][3] = 0.f;
-              chunk_d_hi_hi[h][0] = chunk_d_hi_hi[h][1] =
-                  chunk_d_hi_hi[h][2] = chunk_d_hi_hi[h][3] = 0.f;
+              chunk_d_lo_hi[h][0] = chunk_d_lo_hi[h][1] = chunk_d_lo_hi[h][2] =
+                  chunk_d_lo_hi[h][3] = 0.f;
+              chunk_d_hi_hi[h][0] = chunk_d_hi_hi[h][1] = chunk_d_hi_hi[h][2] =
+                  chunk_d_hi_hi[h][3] = 0.f;
             }
           }
         }  // end kk substep loop
@@ -1023,21 +1015,21 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             const std::uint32_t nk = (s + 2u) * K_STEP_DOWN;
             mbarrier_arrive_expect_tx(&shm->bar_w[la_slot],
                                       /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
               W_element* dest_base =
                   &shm->w_down_wgmma[la_slot][kk * DOWN_COL_TILE][0];
-              tma_load_down_wgmma_tile(
-                  down_weights_desc, /*expert_id=*/id,
-                  /*K=*/Dims::HIDDEN_STATES, /*base_col=*/base_col,
-                  /*k_start=*/nk + kk * K_STEP_WGMMA,
-                  /*dest_smem_ptr=*/(void*)dest_base,
-                  /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
+              tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                       /*K=*/Dims::HIDDEN_STATES,
+                                       /*base_col=*/base_col,
+                                       /*k_start=*/nk + kk * K_STEP_WGMMA,
+                                       /*dest_smem_ptr=*/(void*)dest_base,
+                                       /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
             }
             if (routed_count > 0u) {
               mbarrier_arrive_expect_tx(&shm->bar_a[la_slot],
                                         /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
               for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
                 tma_load_down_wgmma_activation_bulk(
                     down_activations_desc,
@@ -1059,26 +1051,25 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
             const std::uint32_t next_expert_start =
                 static_cast<std::uint32_t>(shm->expert_slot_start[next_id]);
-            const std::uint32_t next_tile =
-                (s == K_TILES_DOWN - 2u) ? 0u : 1u;
+            const std::uint32_t next_tile = (s == K_TILES_DOWN - 2u) ? 0u : 1u;
             const std::uint32_t nk = next_tile * K_STEP_DOWN;
             mbarrier_arrive_expect_tx(&shm->bar_w[la_slot],
                                       /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
               W_element* dest_base =
                   &shm->w_down_wgmma[la_slot][kk * DOWN_COL_TILE][0];
-              tma_load_down_wgmma_tile(
-                  down_weights_desc, /*expert_id=*/next_id,
-                  /*K=*/Dims::HIDDEN_STATES, /*base_col=*/base_col,
-                  /*k_start=*/nk + kk * K_STEP_WGMMA,
-                  /*dest_smem_ptr=*/(void*)dest_base,
-                  /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
+              tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/next_id,
+                                       /*K=*/Dims::HIDDEN_STATES,
+                                       /*base_col=*/base_col,
+                                       /*k_start=*/nk + kk * K_STEP_WGMMA,
+                                       /*dest_smem_ptr=*/(void*)dest_base,
+                                       /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
             }
             if (next_routed_count > 0u) {
               mbarrier_arrive_expect_tx(&shm->bar_a[la_slot],
                                         /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-      #pragma unroll
+    #pragma unroll
               for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
                 tma_load_down_wgmma_activation_bulk(
                     down_activations_desc,
@@ -1091,93 +1082,93 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             }
           }
         } else {
-        if (s + 1 < K_TILES_DOWN) {
-          const std::uint32_t next_slot = (s + 1) & 1;
-          const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
+          if (s + 1 < K_TILES_DOWN) {
+            const std::uint32_t next_slot = (s + 1) & 1;
+            const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
 
-          // Next weight tile — ONE TMA per 128-K substep (covers the
-          // full DOWN_COL_TILE M-rows), same structure as the priming
-          // block.  Single bar_w arm with the TOTAL tx_bytes drains
-          // every atom in one wait on the compute side.
-          mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
-                                    /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
-          for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-            W_element* dest_base =
-                &shm->w_down_wgmma[next_slot][kk * DOWN_COL_TILE][0];
-            tma_load_down_wgmma_tile(
-                down_weights_desc, /*expert_id=*/id,
-                /*K=*/Dims::HIDDEN_STATES,
-                /*base_col=*/base_col,
-                /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                /*dest_smem_ptr=*/(void*)dest_base,
-                /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
-          }
-
-          // Next activation tile — only if any tokens route to this
-          // expert.  K_SUBSTEPS_DOWN back-to-back 1024-B atoms.
-          if (routed_count > 0u) {
-            mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
-                                      /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+            // Next weight tile — ONE TMA per 128-K substep (covers the
+            // full DOWN_COL_TILE M-rows), same structure as the priming
+            // block.  Single bar_w arm with the TOTAL tx_bytes drains
+            // every atom in one wait on the compute side.
+            mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
+                                      /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
     #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-              tma_load_down_wgmma_activation_bulk(
-                  down_activations_desc,
+              W_element* dest_base =
+                  &shm->w_down_wgmma[next_slot][kk * DOWN_COL_TILE][0];
+              tma_load_down_wgmma_tile(
+                  down_weights_desc, /*expert_id=*/id,
+                  /*K=*/Dims::HIDDEN_STATES,
+                  /*base_col=*/base_col,
                   /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
-                  /*expert_slot_start=*/expert_start,
-                  /*dest_smem_ptr=*/
-                  &shm->a_down_wgmma[next_slot][kk][0][0][0],
-                  /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
+                  /*dest_smem_ptr=*/(void*)dest_base,
+                  /*bar_smem_ptr=*/&shm->bar_w[next_slot]);
             }
-          }
-        } else if (e + DOWN_GROUPS < expert_count) {
-          // ── INTER-EXPERT LOOKAHEAD ────────────────────────────────
-          //
-          // Prefetch the NEXT expert's K=0 weight + activation tiles
-          // into the slot that's about to be freed.  With
-          // K_TILES_DOWN even, that slot is index 0 — same slot the
-          // next expert's `read_slot = s & 1` lookup picks at s=0,
-          // so the next expert's K-loop starts on data already in
-          // SHM with the parity bookkeeping already aligned via the
-          // hoisted `parity_w[]` / `parity_a[]` state.
-          const std::uint32_t lookahead_slot = (s + 1) & 1;  // == 0
-          const std::uint32_t next_e = e + DOWN_GROUPS;
-          const std::uint32_t next_id = shmem->experts[next_e].id;
-          const std::uint32_t next_routed_count =
-              static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
-          const std::uint32_t next_expert_start =
-              static_cast<std::uint32_t>(shm->expert_slot_start[next_id]);
 
-          mbarrier_arrive_expect_tx(&shm->bar_w[lookahead_slot],
-                                    /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
+            // Next activation tile — only if any tokens route to this
+            // expert.  K_SUBSTEPS_DOWN back-to-back 1024-B atoms.
+            if (routed_count > 0u) {
+              mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
+                                        /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
     #pragma unroll
-          for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-            W_element* dest_base =
-                &shm->w_down_wgmma[lookahead_slot][kk * DOWN_COL_TILE][0];
-            tma_load_down_wgmma_tile(
-                down_weights_desc, /*expert_id=*/next_id,
-                /*K=*/Dims::HIDDEN_STATES,
-                /*base_col=*/base_col,
-                /*k_start=*/kk * K_STEP_WGMMA,
-                /*dest_smem_ptr=*/(void*)dest_base,
-                /*bar_smem_ptr=*/&shm->bar_w[lookahead_slot]);
-          }
+              for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+                tma_load_down_wgmma_activation_bulk(
+                    down_activations_desc,
+                    /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                    /*expert_slot_start=*/expert_start,
+                    /*dest_smem_ptr=*/
+                    &shm->a_down_wgmma[next_slot][kk][0][0][0],
+                    /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
+              }
+            }
+          } else if (e + DOWN_GROUPS < expert_count) {
+            // ── INTER-EXPERT LOOKAHEAD ────────────────────────────────
+            //
+            // Prefetch the NEXT expert's K=0 weight + activation tiles
+            // into the slot that's about to be freed.  With
+            // K_TILES_DOWN even, that slot is index 0 — same slot the
+            // next expert's `read_slot = s & 1` lookup picks at s=0,
+            // so the next expert's K-loop starts on data already in
+            // SHM with the parity bookkeeping already aligned via the
+            // hoisted `parity_w[]` / `parity_a[]` state.
+            const std::uint32_t lookahead_slot = (s + 1) & 1;  // == 0
+            const std::uint32_t next_e = e + DOWN_GROUPS;
+            const std::uint32_t next_id = shmem->experts[next_e].id;
+            const std::uint32_t next_routed_count =
+                static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
+            const std::uint32_t next_expert_start =
+                static_cast<std::uint32_t>(shm->expert_slot_start[next_id]);
 
-          if (next_routed_count > 0u) {
-            mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
-                                      /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+            mbarrier_arrive_expect_tx(&shm->bar_w[lookahead_slot],
+                                      /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
     #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-              tma_load_down_wgmma_activation_bulk(
-                  down_activations_desc,
+              W_element* dest_base =
+                  &shm->w_down_wgmma[lookahead_slot][kk * DOWN_COL_TILE][0];
+              tma_load_down_wgmma_tile(
+                  down_weights_desc, /*expert_id=*/next_id,
+                  /*K=*/Dims::HIDDEN_STATES,
+                  /*base_col=*/base_col,
                   /*k_start=*/kk * K_STEP_WGMMA,
-                  /*expert_slot_start=*/next_expert_start,
-                  /*dest_smem_ptr=*/
-                  &shm->a_down_wgmma[lookahead_slot][kk][0][0][0],
-                  /*bar_smem_ptr=*/&shm->bar_a[lookahead_slot]);
+                  /*dest_smem_ptr=*/(void*)dest_base,
+                  /*bar_smem_ptr=*/&shm->bar_w[lookahead_slot]);
+            }
+
+            if (next_routed_count > 0u) {
+              mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
+                                        /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+    #pragma unroll
+              for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+                tma_load_down_wgmma_activation_bulk(
+                    down_activations_desc,
+                    /*k_start=*/kk * K_STEP_WGMMA,
+                    /*expert_slot_start=*/next_expert_start,
+                    /*dest_smem_ptr=*/
+                    &shm->a_down_wgmma[lookahead_slot][kk][0][0][0],
+                    /*bar_smem_ptr=*/&shm->bar_a[lookahead_slot]);
+              }
             }
           }
-        }
         }  // end `if constexpr (DOWN_PIPE_DEPTH == 4u) { … } else { … }`
   #endif
       }
@@ -1448,8 +1439,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         const unsigned rank = rc / DOWN_COL_TILE;
         const unsigned col = rc % DOWN_COL_TILE;
         const unsigned tok = shm->slot_to_token[last_start + rank];
-        shm->out_accum[tok][col] +=
-            shm->partial_result.down_out[col][rank];
+        shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank];
       }
     } else {
       for (unsigned tok_col = thread_in_block;

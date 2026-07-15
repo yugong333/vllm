@@ -1368,7 +1368,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
   constexpr uint32_t K_TILES = CoreDims::K_TILES_UP;         // 3072/128 = 24
   constexpr uint32_t WGMMAS_PER_SUBSTEP = CoreDims::WGMMAS_PER_STEP;  // 4
   constexpr uint32_t UP_SCALE_COLS = Dims::UP_SCALE_COLS;             // 24
-  constexpr uint32_t HALVES = CoreDims::UP_COL_HALVES;               // 2
+  constexpr uint32_t HALVES = CoreDims::UP_COL_HALVES;                // 2
 
   // A operand descriptor strides (128×128 Major::K B128 swizzle).
   constexpr uint64_t A_LBO = 16ULL;
@@ -1577,8 +1577,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                   (const void*)((const char*)a_kk_base + j * A_K_STRIDE);
               const void* b_ptr =
                   (const void*)&shm->fp8_act_full[kblk][j * 2][0][0];
-              uint64_t desc_a =
-                  make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
+              uint64_t desc_a = make_wgmma_desc(a_ptr, A_LBO, A_SBO, A_SWIZZLE);
               uint64_t desc_b = make_wgmma_desc(b_ptr, B_LBO, B_SBO, 0);
               wgmma_m64n8k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
                                            chunk_d2, chunk_d3);
@@ -1615,11 +1614,13 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
         const bool has_next_s = (s + 1u < K_TILES);
         if (has_next_s) {
           // Intra-expert: fetch iter (s+1).
-          mbarrier_arrive_expect_tx(&shm->bar_w[next_slot], UP_W_TX_BYTES_TOTAL);
+          mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
+                                    UP_W_TX_BYTES_TOTAL);
           tma_slot(next_slot, id, s + 1u);
         } else if (has_next_e) {
           // Cross-expert stitch: fetch next expert's iter 0.
-          mbarrier_arrive_expect_tx(&shm->bar_w[next_slot], UP_W_TX_BYTES_TOTAL);
+          mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
+                                    UP_W_TX_BYTES_TOTAL);
           tma_slot(next_slot, next_id, 0u);
         }
   #endif
@@ -1664,7 +1665,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
                                      base_row_up + 96 + col};
         bool wr[4];
         float v[4];
-  #pragma unroll
+    #pragma unroll
         for (int i = 0; i < 4; ++i) {
           wr[i] = store_local && (oc[i] < Dims::N);
           v[i] = wr[i] ? pv[i] : 0.f;
@@ -1682,7 +1683,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
         const float inv_scale = FP8_MAX / block_max;
 
         if (store_local && tok < batch_size) {
-  #pragma unroll
+    #pragma unroll
           for (int i = 0; i < 4; ++i) {
             if (wr[i]) {
               spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =
@@ -1721,7 +1722,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
           store_odd = (rw_odd != 0.f);
         }
 
-  #ifdef DEBUG_MOE_PRINT
+    #ifdef DEBUG_MOE_PRINT
         // Raw WGMMA accumulators for the FIRST expert, block 0, warp 0
         // lane 0 (tok_even=0).  TWO-TMA layout: atom0 = pure GATE, atom1 =
         // pure UP, both for features {fR, fR+8}; register i pairs gate
@@ -1737,7 +1738,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
               id, final_d[0][0], final_d[1][0], final_d[0][2], final_d[1][2],
               base_row_up);
         }
-  #endif
+    #endif
         // TWO-TMA combine: silu(gate)*up across atoms, register-by-register.
         // final_d[0][i] = gate, final_d[1][i] = up for the same (feature,
         // token).  Each thread owns two output features fR and fR+8 (× 2
@@ -1745,16 +1746,22 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
         // the block's full [0,128) feature tile across the 8 calc warps.
         const float* gd = final_d[0];  // gate (atom0)
         const float* ud = final_d[1];  // up   (atom1)
-        float v_lo_even = __fdividef(rw_even * ud[0] * gd[0],
-                                     1.0f + __expf(-gd[0]));
-        float v_lo_odd = __fdividef(rw_odd * ud[1] * gd[1],
-                                    1.0f + __expf(-gd[1]));
-        float v_hi_even = __fdividef(rw_even * ud[2] * gd[2],
-                                     1.0f + __expf(-gd[2]));
-        float v_hi_odd = __fdividef(rw_odd * ud[3] * gd[3],
-                                    1.0f + __expf(-gd[3]));
-        if (!store_even) { v_lo_even = 0.f; v_hi_even = 0.f; }
-        if (!store_odd) { v_lo_odd = 0.f; v_hi_odd = 0.f; }
+        float v_lo_even =
+            __fdividef(rw_even * ud[0] * gd[0], 1.0f + __expf(-gd[0]));
+        float v_lo_odd =
+            __fdividef(rw_odd * ud[1] * gd[1], 1.0f + __expf(-gd[1]));
+        float v_hi_even =
+            __fdividef(rw_even * ud[2] * gd[2], 1.0f + __expf(-gd[2]));
+        float v_hi_odd =
+            __fdividef(rw_odd * ud[3] * gd[3], 1.0f + __expf(-gd[3]));
+        if (!store_even) {
+          v_lo_even = 0.f;
+          v_hi_even = 0.f;
+        }
+        if (!store_odd) {
+          v_lo_odd = 0.f;
+          v_hi_odd = 0.f;
+        }
         const uint32_t f_lo = (is_wg1 ? 64u : 0u) + warp_in_wg * 16u + lane / 4;
         const uint32_t f_hi = f_lo + 8u;
         shm->partial_result.post_silu_scratch[f_lo][tok_even] = v_lo_even;
@@ -1794,23 +1801,23 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
 
     // TWO-TMA layout: post_silu_scratch indexed by base-relative feature
     // [0,128); read features {col, col+32, col+64, col+96} (= oc[i]-base).
-    const float pv[4] = {
-        shm->partial_result.post_silu_scratch[col][tok],
-        shm->partial_result.post_silu_scratch[col + 32][tok],
-        shm->partial_result.post_silu_scratch[col + 64][tok],
-        shm->partial_result.post_silu_scratch[col + 96][tok]};
+    const float pv[4] = {shm->partial_result.post_silu_scratch[col][tok],
+                         shm->partial_result.post_silu_scratch[col + 32][tok],
+                         shm->partial_result.post_silu_scratch[col + 64][tok],
+                         shm->partial_result.post_silu_scratch[col + 96][tok]};
     const std::uint32_t oc[4] = {base_row_up + col, base_row_up + 32 + col,
-                                 base_row_up + 64 + col, base_row_up + 96 + col};
+                                 base_row_up + 64 + col,
+                                 base_row_up + 96 + col};
     bool wr[4];
     float v[4];
-  #pragma unroll
+    #pragma unroll
     for (int i = 0; i < 4; ++i) {
       wr[i] = store_local && (oc[i] < Dims::N);
       v[i] = wr[i] ? pv[i] : 0.f;
     }
 
-    float local_max = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
-                            fmaxf(fabsf(v[2]), fabsf(v[3])));
+    float local_max =
+        fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
     float block_max = warp_reduce_max_float(local_max);
     if (block_max < __FLT_MIN__) block_max = 1.0f;
     constexpr float FP8_MAX = 448.0f;
@@ -1819,7 +1826,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     const float inv_scale = FP8_MAX / block_max;
 
     if (store_local && tok < batch_size) {
-  #pragma unroll
+    #pragma unroll
       for (int i = 0; i < 4; ++i) {
         if (wr[i]) {
           spec->temp_fp8[dest_row_local * Dims::N + oc[i]] =

@@ -3,8 +3,6 @@
 
 #pragma once
 
-
-
 #include <cuda.h>
 #include <cuda/pipeline>
 #include <cuda_bf16.h>

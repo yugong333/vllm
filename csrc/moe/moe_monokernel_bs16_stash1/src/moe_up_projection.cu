@@ -691,11 +691,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
               // T_TILE (Req 7.4); the same `b_ptr` indexes both
               // halves' token columns since the m64n16k32 N-stride
               // lives within the activation tile padded row stride.
-              wgmma_m64n16k32_e4m3_e4m3_f32(desc_a, desc_b,
-                                            chunk_d0, chunk_d1,
-                                            chunk_d2, chunk_d3,
-                                            chunk_d4, chunk_d5,
-                                            chunk_d6, chunk_d7);
+              wgmma_m64n16k32_e4m3_e4m3_f32(desc_a, desc_b, chunk_d0, chunk_d1,
+                                            chunk_d2, chunk_d3, chunk_d4,
+                                            chunk_d5, chunk_d6, chunk_d7);
             } else {
               // BS<=8: preserved BS8 issue — 4 chained m64n8k32 with a
               // 4-register fragment, byte-identical to today
@@ -1357,10 +1355,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
           // silu(gate) * up * rw, with the same `__fdividef` pattern
           // used for val0/val1 above.
-          float val2 = __fdividef(rw_46 * final_d6 * final_d4,
-                                  1.0f + __expf(-final_d4));
-          float val3 = __fdividef(rw_57 * final_d7 * final_d5,
-                                  1.0f + __expf(-final_d5));
+          float val2 =
+              __fdividef(rw_46 * final_d6 * final_d4, 1.0f + __expf(-final_d4));
+          float val3 =
+              __fdividef(rw_57 * final_d7 * final_d5, 1.0f + __expf(-final_d5));
 
           if (!store_46) val2 = 0.f;
           if (!store_57) val3 = 0.f;
@@ -1463,148 +1461,148 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // each).  All warps are free at this point — the K-loop is done.
   if (has_pending_writeback && is_calc) {
   #ifndef MONO_PROFILE_SKIP_CALC_UP
-   if constexpr (Dims::BS <= 8) {
-    const uint32_t tok = warp;          // 0..7
-    const uint32_t col_in_half = lane;  // 0..31
-    {
-      // ── DEFER post-loop drain: last expert, on calc warps ──
-      //
-      // Under V2+DEFER, calc warps inside the K-loop wrote
-      // silu(gate)*up*rw to `shm->partial_result.post_silu_scratch`
-      // for the previous expert, and PF warps drained that scratch in
-      // the next expert's iter-0/iter-1 (see the in-K-loop V2 PF
-      // bodies around the iter-0 / iter-1 sites).  The LAST expert
-      // has no successor expert to defer to, so we drain it here
-      // post-K-loop on calc warps with the same row/col mapping the
-      // PF bodies use.  Reading from `wgmma_out` here would be
-      // incorrect under V2 — calc warps stored to post_silu_scratch,
-      // not wgmma_out.
-      constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
+    if constexpr (Dims::BS <= 8) {
+      const uint32_t tok = warp;          // 0..7
+      const uint32_t col_in_half = lane;  // 0..31
+      {
+        // ── DEFER post-loop drain: last expert, on calc warps ──
+        //
+        // Under V2+DEFER, calc warps inside the K-loop wrote
+        // silu(gate)*up*rw to `shm->partial_result.post_silu_scratch`
+        // for the previous expert, and PF warps drained that scratch in
+        // the next expert's iter-0/iter-1 (see the in-K-loop V2 PF
+        // bodies around the iter-0 / iter-1 sites).  The LAST expert
+        // has no successor expert to defer to, so we drain it here
+        // post-K-loop on calc warps with the same row/col mapping the
+        // PF bodies use.  Reading from `wgmma_out` here would be
+        // incorrect under V2 — calc warps stored to post_silu_scratch,
+        // not wgmma_out.
+        constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
-      // ── Section A: topk lookup via cache ─────────────────────────
-      // Read from `up_rank_for_tok_prev` — the snapshot taken at the
-      // calc-warp epilogue of the LAST expert.  See the in-K-loop
-      // V2+DEFER PF body comment for the rationale.  Note: the
-      // post-loop drain runs AFTER the expert loop exits, so even
-      // though no "next expert" exists to overwrite the cache, the
-      // last calc-warp epilogue is what populated _prev — we read
-      // _prev here for consistency with the in-K-loop bodies.
-      bool store_local = false;
-      std::uint32_t dest_row_local = 0;
-      if (tok < batch_size) {
-        const uint8_t k = shm->up_rank_for_tok_prev[tok];
-        if (k != 0xFFu) {
-          store_local = true;
-          dest_row_local = shm->sorted_slot[tok * top_k + k];
+        // ── Section A: topk lookup via cache ─────────────────────────
+        // Read from `up_rank_for_tok_prev` — the snapshot taken at the
+        // calc-warp epilogue of the LAST expert.  See the in-K-loop
+        // V2+DEFER PF body comment for the rationale.  Note: the
+        // post-loop drain runs AFTER the expert loop exits, so even
+        // though no "next expert" exists to overwrite the cache, the
+        // last calc-warp epilogue is what populated _prev — we read
+        // _prev here for consistency with the in-K-loop bodies.
+        bool store_local = false;
+        std::uint32_t dest_row_local = 0;
+        if (tok < batch_size) {
+          const uint8_t k = shm->up_rank_for_tok_prev[tok];
+          if (k != 0xFFu) {
+            store_local = true;
+            dest_row_local = shm->sorted_slot[tok * top_k + k];
+          }
         }
+
+        // ── Section B: 2 post_silu_scratch SHM reads ─────────────────
+        // (rw * silu(gate) * up was already baked in by calc warps.)
+        const float val1_l =
+            shm->partial_result.post_silu_scratch[col_in_half][tok];
+        const float val2_l =
+            shm->partial_result.post_silu_scratch[col_in_half + 64][tok];
+
+        const std::uint32_t out_col_1_l = base_row_up + col_in_half;
+        const std::uint32_t out_col_2_l = base_row_up + 32 + col_in_half;
+        const bool write1_l = store_local && (out_col_1_l < Dims::N);
+        const bool write2_l = store_local && (out_col_2_l < Dims::N);
+        float v1 = write1_l ? val1_l : 0.f;
+        float v2 = write2_l ? val2_l : 0.f;
+
+        // ── Section D: warp-reduce-max + fp8 quantize ────────────────
+        float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
+        float block_max_l = warp_reduce_max_float(local_max_l);
+        if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
+        constexpr float FP8_MAX = 448.0f;
+        constexpr float FP8_MAX_INV = 1.0f / 448.0f;
+        const float block_scale_l = block_max_l * FP8_MAX_INV;
+        const float inv_scale_l = FP8_MAX / block_max_l;
+        const AQ_element q1_l = (AQ_element)(v1 * inv_scale_l);
+        const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
+
+        // ── Section E: GM stores ─────────────────────────────────────
+        if (store_local && tok < batch_size) {
+          if (write1_l) {
+            spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
+          }
+          if (write2_l) {
+            spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
+          }
+          if (lane == 0) {
+            constexpr std::uint32_t SCALE_COLS =
+                MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
+            spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
+                block_scale_l;
+          }
+        }
+        (void)MAX_TOPK;  // unused under DEFER (cache replaces topk scan).
       }
-
-      // ── Section B: 2 post_silu_scratch SHM reads ─────────────────
-      // (rw * silu(gate) * up was already baked in by calc warps.)
-      const float val1_l =
-          shm->partial_result.post_silu_scratch[col_in_half][tok];
-      const float val2_l =
-          shm->partial_result.post_silu_scratch[col_in_half + 64][tok];
-
-      const std::uint32_t out_col_1_l = base_row_up + col_in_half;
-      const std::uint32_t out_col_2_l = base_row_up + 32 + col_in_half;
-      const bool write1_l = store_local && (out_col_1_l < Dims::N);
-      const bool write2_l = store_local && (out_col_2_l < Dims::N);
-      float v1 = write1_l ? val1_l : 0.f;
-      float v2 = write2_l ? val2_l : 0.f;
-
-      // ── Section D: warp-reduce-max + fp8 quantize ────────────────
-      float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
-      float block_max_l = warp_reduce_max_float(local_max_l);
-      if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
-      constexpr float FP8_MAX = 448.0f;
-      constexpr float FP8_MAX_INV = 1.0f / 448.0f;
-      const float block_scale_l = block_max_l * FP8_MAX_INV;
-      const float inv_scale_l = FP8_MAX / block_max_l;
-      const AQ_element q1_l = (AQ_element)(v1 * inv_scale_l);
-      const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
-
-      // ── Section E: GM stores ─────────────────────────────────────
-      if (store_local && tok < batch_size) {
-        if (write1_l) {
-          spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
-        }
-        if (write2_l) {
-          spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
-        }
-        if (lane == 0) {
-          constexpr std::uint32_t SCALE_COLS =
-              MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-          spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
-              block_scale_l;
-        }
-      }
-      (void)MAX_TOPK;  // unused under DEFER (cache replaces topk scan).
-    }
-   } else {
-    // ── BS=16 post-loop drain: 2-pass over 8 calc warps ─────────────
-    // CALC_WARP_COUNT = 8, but BS=16 has 16 tokens to drain.  Each
-    // calc warp drains 2 tokens via a pass-counter `t_off`:
-    //   pass 0: tok = warp        → tokens [0..7]
-    //   pass 1: tok = warp + 8    → tokens [8..15]
-    // The body is bit-identical to the BS<=8 drain above, just
-    // wrapped in a 2-iteration loop.  Gated under
-    // `if constexpr` so BS=8 SASS is unchanged (Req 13.2).
-    const uint32_t col_in_half = lane;  // 0..31
+    } else {
+      // ── BS=16 post-loop drain: 2-pass over 8 calc warps ─────────────
+      // CALC_WARP_COUNT = 8, but BS=16 has 16 tokens to drain.  Each
+      // calc warp drains 2 tokens via a pass-counter `t_off`:
+      //   pass 0: tok = warp        → tokens [0..7]
+      //   pass 1: tok = warp + 8    → tokens [8..15]
+      // The body is bit-identical to the BS<=8 drain above, just
+      // wrapped in a 2-iteration loop.  Gated under
+      // `if constexpr` so BS=8 SASS is unchanged (Req 13.2).
+      const uint32_t col_in_half = lane;  // 0..31
     #pragma unroll
-    for (uint32_t t_off = 0; t_off < 2u; ++t_off) {
-      const uint32_t tok = warp + t_off * CoreDims::CALC_WARP_COUNT;
-      constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
+      for (uint32_t t_off = 0; t_off < 2u; ++t_off) {
+        const uint32_t tok = warp + t_off * CoreDims::CALC_WARP_COUNT;
+        constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
-      bool store_local = false;
-      std::uint32_t dest_row_local = 0;
-      if (tok < batch_size) {
-        const uint8_t k = shm->up_rank_for_tok_prev[tok];
-        if (k != 0xFFu) {
-          store_local = true;
-          dest_row_local = shm->sorted_slot[tok * top_k + k];
+        bool store_local = false;
+        std::uint32_t dest_row_local = 0;
+        if (tok < batch_size) {
+          const uint8_t k = shm->up_rank_for_tok_prev[tok];
+          if (k != 0xFFu) {
+            store_local = true;
+            dest_row_local = shm->sorted_slot[tok * top_k + k];
+          }
         }
+
+        const float val1_l =
+            shm->partial_result.post_silu_scratch[col_in_half][tok];
+        const float val2_l =
+            shm->partial_result.post_silu_scratch[col_in_half + 64][tok];
+
+        const std::uint32_t out_col_1_l = base_row_up + col_in_half;
+        const std::uint32_t out_col_2_l = base_row_up + 32 + col_in_half;
+        const bool write1_l = store_local && (out_col_1_l < Dims::N);
+        const bool write2_l = store_local && (out_col_2_l < Dims::N);
+        float v1 = write1_l ? val1_l : 0.f;
+        float v2 = write2_l ? val2_l : 0.f;
+
+        float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
+        float block_max_l = warp_reduce_max_float(local_max_l);
+        if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
+        constexpr float FP8_MAX = 448.0f;
+        constexpr float FP8_MAX_INV = 1.0f / 448.0f;
+        const float block_scale_l = block_max_l * FP8_MAX_INV;
+        const float inv_scale_l = FP8_MAX / block_max_l;
+        const AQ_element q1_l = (AQ_element)(v1 * inv_scale_l);
+        const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
+
+        if (store_local && tok < batch_size) {
+          if (write1_l) {
+            spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
+          }
+          if (write2_l) {
+            spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
+          }
+          if (lane == 0) {
+            constexpr std::uint32_t SCALE_COLS =
+                MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
+            spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
+                block_scale_l;
+          }
+        }
+        (void)MAX_TOPK;
       }
-
-      const float val1_l =
-          shm->partial_result.post_silu_scratch[col_in_half][tok];
-      const float val2_l =
-          shm->partial_result.post_silu_scratch[col_in_half + 64][tok];
-
-      const std::uint32_t out_col_1_l = base_row_up + col_in_half;
-      const std::uint32_t out_col_2_l = base_row_up + 32 + col_in_half;
-      const bool write1_l = store_local && (out_col_1_l < Dims::N);
-      const bool write2_l = store_local && (out_col_2_l < Dims::N);
-      float v1 = write1_l ? val1_l : 0.f;
-      float v2 = write2_l ? val2_l : 0.f;
-
-      float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
-      float block_max_l = warp_reduce_max_float(local_max_l);
-      if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
-      constexpr float FP8_MAX = 448.0f;
-      constexpr float FP8_MAX_INV = 1.0f / 448.0f;
-      const float block_scale_l = block_max_l * FP8_MAX_INV;
-      const float inv_scale_l = FP8_MAX / block_max_l;
-      const AQ_element q1_l = (AQ_element)(v1 * inv_scale_l);
-      const AQ_element q2_l = (AQ_element)(v2 * inv_scale_l);
-
-      if (store_local && tok < batch_size) {
-        if (write1_l) {
-          spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
-        }
-        if (write2_l) {
-          spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
-        }
-        if (lane == 0) {
-          constexpr std::uint32_t SCALE_COLS =
-              MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;
-          spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] =
-              block_scale_l;
-        }
-      }
-      (void)MAX_TOPK;
     }
-   }
   #endif
   }
 }

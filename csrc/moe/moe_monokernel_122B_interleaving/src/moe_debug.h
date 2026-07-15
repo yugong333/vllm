@@ -37,35 +37,35 @@
     // serializes the launch.
     //
     // `MONO_DBG_PHASE("label")` — print a phase banner once (block0/t0).
-    #define MONO_DBG_PHASE(label)                \
-      do {                                       \
-        if (blockIdx.x == 0 && threadIdx.x == 0) \
+    #define MONO_DBG_PHASE(label)                   \
+      do {                                          \
+        if (blockIdx.x == 0 && threadIdx.x == 0)    \
           printf("[MONO_DBG] === %s ===\n", label); \
       } while (0)
 
     // `MONO_DBG_VALS("label", ptr, n)` — print n values of a float-
     // convertible array (works for float / __nv_bfloat16 / fp8 via the
     // (float) cast) from block0/t0, on one line.
-    #define MONO_DBG_VALS(label, ptr, n)                  \
-      do {                                                \
-        if (blockIdx.x == 0 && threadIdx.x == 0) {        \
-          printf("[MONO_DBG] %s:", label);                \
-          for (int _i = 0; _i < (int)(n); ++_i)           \
-            printf(" %.5f", (float)((ptr)[_i]));          \
-          printf("\n");                                   \
-        }                                                 \
+    #define MONO_DBG_VALS(label, ptr, n)           \
+      do {                                         \
+        if (blockIdx.x == 0 && threadIdx.x == 0) { \
+          printf("[MONO_DBG] %s:", label);         \
+          for (int _i = 0; _i < (int)(n); ++_i)    \
+            printf(" %.5f", (float)((ptr)[_i]));   \
+          printf("\n");                            \
+        }                                          \
       } while (0)
 
     // `MONO_DBG_VALS_T(tid, "label", ptr, n)` — same but from a chosen
     // thread (e.g. a calc-warp lane that holds the value of interest).
-    #define MONO_DBG_VALS_T(tid, label, ptr, n)              \
-      do {                                                   \
-        if (blockIdx.x == 0 && threadIdx.x == (tid)) {       \
-          printf("[MONO_DBG] %s:", label);                   \
-          for (int _i = 0; _i < (int)(n); ++_i)              \
-            printf(" %.5f", (float)((ptr)[_i]));             \
-          printf("\n");                                      \
-        }                                                    \
+    #define MONO_DBG_VALS_T(tid, label, ptr, n)        \
+      do {                                             \
+        if (blockIdx.x == 0 && threadIdx.x == (tid)) { \
+          printf("[MONO_DBG] %s:", label);             \
+          for (int _i = 0; _i < (int)(n); ++_i)        \
+            printf(" %.5f", (float)((ptr)[_i]));       \
+          printf("\n");                                \
+        }                                              \
       } while (0)
 
   #else

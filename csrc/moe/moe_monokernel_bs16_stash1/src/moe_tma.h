@@ -207,8 +207,8 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
  *                        for `BS=8, MAX_TOPK=8`, 128 for `BS=16, MAX_TOPK=8`).
  * @param N               Down-projection reduction dimension.
  * @param t_tile          Per-atom row count for `boxDim[1]` (= 8 at
- *                        BS<=8, 16 at BS=16).  This is `MoECoreDims<Dims>::T_TILE`,
- *                        NOT `temp_rows`: each TMA atom transfers
+ *                        BS<=8, 16 at BS=16).  This is
+ * `MoECoreDims<Dims>::T_TILE`, NOT `temp_rows`: each TMA atom transfers
  *                        `t_tile` rows even though the source slab spans
  *                        `temp_rows` rows globally.  Defaults to 8 to
  *                        preserve byte-identical descriptor encoding for

@@ -97,9 +97,8 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
 // baseline/sass.pre.txt.
 template <typename Dims>
 __device__ static __forceinline__ void topK_one_token(
-    uint32_t token, uint32_t top_k, ScoringFunc scoring_func,
-    bool renormalize, const __nv_bfloat16* __restrict__ router_logits,
-    MoE_SHM<Dims>* shmem) {
+    uint32_t token, uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
+    const __nv_bfloat16* __restrict__ router_logits, MoE_SHM<Dims>* shmem) {
   constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
   uint32_t tid = get_thread<Dims>();
 
@@ -236,8 +235,7 @@ __device__ static __forceinline__ void topK_one_token(
       }
       float inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 1.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[token * MAX_TOPK + k] =
-            (uint16_t)topk_experts[k];
+        shmem->topk_ids_flat[token * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[token * MAX_TOPK + k] = exp_vals[k] * inv;
       }
     } else {
@@ -253,8 +251,7 @@ __device__ static __forceinline__ void topK_one_token(
       float inv =
           renormalize ? ((sum_sig > 0.0f) ? (1.0f / sum_sig) : 1.0f) : 1.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        shmem->topk_ids_flat[token * MAX_TOPK + k] =
-            (uint16_t)topk_experts[k];
+        shmem->topk_ids_flat[token * MAX_TOPK + k] = (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[token * MAX_TOPK + k] = sig_vals[k] * inv;
       }
     }
@@ -315,7 +312,8 @@ template <typename Dims>
 __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                                      MoE_SHM<Dims>* __restrict__ shm,
                                      MoEGemmSpec<Dims>* __restrict__ spec) {
-  static_assert(Dims::BS <= 16, "prepare_moe_topk_BS8 supports BS<=16 (Req 3.1)");
+  static_assert(Dims::BS <= 16,
+                "prepare_moe_topk_BS8 supports BS<=16 (Req 3.1)");
   static_assert(use_tma<Dims>::value,
                 "BS8 prepare path is TMA-only after the 3-phase rewrite. "
                 "All instantiated BS8 variants set USE_TMA=true and the "
@@ -649,7 +647,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     // Chunk-2 cross-chunk carry: count of chunk-0 and chunk-1 pairs that
     // share each lane's eid2 (two 32-round sweeps).
     if (n_pairs > 64) {
-    #pragma unroll
+  #pragma unroll
       for (int src = 0; src < 32; ++src) {
         const uint32_t q =
             __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid2), src);
@@ -657,15 +655,14 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
             __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid0) == q);
         const uint32_t b1 =
             __ballot_sync(FULL_MASK, static_cast<uint32_t>(eid1) == q);
-        if (static_cast<int>(tid) == src)
-          rank2_carry = __popc(b0) + __popc(b1);
+        if (static_cast<int>(tid) == src) rank2_carry = __popc(b0) + __popc(b1);
       }
     }
 
     // Chunk-3 cross-chunk carry: count of chunk-0, chunk-1, and chunk-2
     // pairs that share each lane's eid3 (three 32-round sweeps).
     if (n_pairs > 96) {
-    #pragma unroll
+  #pragma unroll
       for (int src = 0; src < 32; ++src) {
         const uint32_t q =
             __shfl_sync(FULL_MASK, static_cast<uint32_t>(eid3), src);

@@ -397,8 +397,7 @@ struct MoEGemmSpec {
   // The down-projection writes its result via fp32 atomicAdd into a
   // single-buffer `down_partial_out[BS][HIDDEN_STATES]` (no per-group
   // dimension); Phase 5 reads each cell once and casts to bf16.
-  static constexpr uint32_t DOWN_COL_TILE =
-      use_tma<Dims>::value ? 256u : 128u;
+  static constexpr uint32_t DOWN_COL_TILE = use_tma<Dims>::value ? 256u : 128u;
   static constexpr uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
@@ -1207,12 +1206,11 @@ struct MoE_SHM {
       // leading axis as a sequence of `DOWN_ACT_K_SUBSTEPS` 1024-B
       // atoms — each atom is exactly one K_STEP_WGMMA=128 K-substep
       // of the outer K-step.
-      alignas(1024)
-          AQ_element a_down_wgmma[CoreDims::DOWN_PIPE_DEPTH]
-                                 [DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
-                                 [FP8_ACT_NUM_CHUNKS]
-                                 [FP8_ACT_K_CHUNK];  // 2 KB (down, K=128)
-                                                     // 4 KB (down, K=256)
+      alignas(1024) AQ_element
+          a_down_wgmma[CoreDims::DOWN_PIPE_DEPTH][DOWN_ACT_K_SUBSTEPS]
+                      [CoreDims::T_TILE][FP8_ACT_NUM_CHUNKS]
+                      [FP8_ACT_K_CHUNK];  // 2 KB (down, K=128)
+                                          // 4 KB (down, K=256)
 
       // ── NEW: single-buffer fp8_act covering all K substeps ──────────
       // Single-buffer FP8 activation buffer for the BS8 TMA+WGMMA
