@@ -465,7 +465,11 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
           float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
           float block_max_l = warp_reduce_max_float(local_max_l);
-          if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
+          // Eps-clamp tiny maxima: a block_max slightly above FLT_MIN
+          // still overflows inv_scale (448/block_max > FLT_MAX for
+          // block_max < ~1.32e-36), NaN-ing the whole block after the
+          // fp8 cast. 1e-10 matches vLLM's group-quant eps.
+          block_max_l = fmaxf(block_max_l, 1e-10f);
           constexpr float FP8_MAX = 448.0f;
           constexpr float FP8_MAX_INV = 1.0f / 448.0f;
           const float block_scale_l = block_max_l * FP8_MAX_INV;
@@ -611,7 +615,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
       float local_max_l = fmaxf(fabsf(v1), fabsf(v2));
       float block_max_l = warp_reduce_max_float(local_max_l);
-      if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
+      // Eps-clamp tiny maxima (overflow-safe inv_scale); see the
+      // pair-layout epilogue above for the full rationale.
+      block_max_l = fmaxf(block_max_l, 1e-10f);
       constexpr float FP8_MAX = 448.0f;
       constexpr float FP8_MAX_INV = 1.0f / 448.0f;
       const float block_scale_l = block_max_l * FP8_MAX_INV;
@@ -973,7 +979,9 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
           float local_max = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])),
                                   fmaxf(fabsf(v[2]), fabsf(v[3])));
           float block_max = warp_reduce_max_float(local_max);
-          if (block_max < __FLT_MIN__) block_max = 1.0f;
+          // Eps-clamp tiny maxima (overflow-safe inv_scale); see the
+          // pair-layout epilogue above for the full rationale.
+          block_max = fmaxf(block_max, 1e-10f);
           constexpr float FP8_MAX = 448.0f;
           constexpr float FP8_MAX_INV = 1.0f / 448.0f;
           const float block_scale = block_max * FP8_MAX_INV;
@@ -1095,7 +1103,9 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
     float local_max =
         fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
     float block_max = warp_reduce_max_float(local_max);
-    if (block_max < __FLT_MIN__) block_max = 1.0f;
+    // Eps-clamp tiny maxima (overflow-safe inv_scale); see the
+    // pair-layout epilogue above for the full rationale.
+    block_max = fmaxf(block_max, 1e-10f);
     constexpr float FP8_MAX = 448.0f;
     constexpr float FP8_MAX_INV = 1.0f / 448.0f;
     const float block_scale = block_max * FP8_MAX_INV;

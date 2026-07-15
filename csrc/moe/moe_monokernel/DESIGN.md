@@ -8,7 +8,7 @@ no intermediate kernel boundaries, capturable into a CUDA Graph.
 Targets: Qwen3.5-35B / 122B and other shapes declared in `shapes.json`
 (E experts, N = `moe_intermediate_size` per half, K = hidden size).
 
-```
+```text
 GM in:  activations [BS,K] bf16      router_logits [BS,E] bf16
         w_up   [E,2N,K] fp8 + block scales [E,2N/128,K/128] fp32
         w_down [E,K,N]  fp8 + block scales [E,K/128,N/128]  fp32
@@ -41,21 +41,21 @@ Every stage below is parameterized by the five tunable KernelConfig knobs
 `UP_W_SLOTS` = SLOTS) plus the optional pinned `UP_COL_HALVES` (UCH).  All
 stage geometry derives from them:
 
-| derived quantity | formula | meaning |
-|---|---|---|
-| `UCH` | pinned, else `max(1, 2N·DCT / (128·K))` | 128-row M-atoms per up-block |
-| `UP_GRID` | `2N / (128·UCH)` | blocks per expert, up-proj |
-| `UP_GROUPS` | `GRID_SIZE / UP_GRID` | experts in parallel, up-proj |
-| `K_TILES_UP` | `K / KUP` | up-proj outer K iterations |
-| `K_SUBSTEPS_UP` | `KUP / 128` | 128-K substeps per iteration |
-| `UP_ARM_DISTANCE` | `max(1, SLOTS − 2)` | weight-TMA prefetch distance |
-| `DOWN_GRID` | `K / DCT` | blocks per expert, down-proj |
-| `DOWN_GROUPS` | `GRID_SIZE / DOWN_GRID` | experts in parallel, down-proj |
-| `DOWN_COL_HALVES` | `DCT / 128` | 128-col WGMMA passes per K-step |
-| `K_TILES_DOWN` | `N / KDN` | down-proj outer K iterations |
-| `K_SUBSTEPS_DOWN` | `KDN / 128` | 128-K substeps per iteration |
-| `K_BLOCKS_TOTAL` | `K / 128` | routing-window / quantization atoms |
-| coupled? | `UP_GROUPS == DOWN_GROUPS` | picks the site-#2 barrier variant |
+| derived quantity  | formula                                 | meaning                             |
+| ----------------- | --------------------------------------- | ----------------------------------- |
+| `UCH`             | pinned, else `max(1, 2N·DCT / (128·K))` | 128-row M-atoms per up-block        |
+| `UP_GRID`         | `2N / (128·UCH)`                        | blocks per expert, up-proj          |
+| `UP_GROUPS`       | `GRID_SIZE / UP_GRID`                   | experts in parallel, up-proj        |
+| `K_TILES_UP`      | `K / KUP`                               | up-proj outer K iterations          |
+| `K_SUBSTEPS_UP`   | `KUP / 128`                             | 128-K substeps per iteration        |
+| `UP_ARM_DISTANCE` | `max(1, SLOTS − 2)`                     | weight-TMA prefetch distance        |
+| `DOWN_GRID`       | `K / DCT`                               | blocks per expert, down-proj        |
+| `DOWN_GROUPS`     | `GRID_SIZE / DOWN_GRID`                 | experts in parallel, down-proj      |
+| `DOWN_COL_HALVES` | `DCT / 128`                             | 128-col WGMMA passes per K-step     |
+| `K_TILES_DOWN`    | `N / KDN`                               | down-proj outer K iterations        |
+| `K_SUBSTEPS_DOWN` | `KDN / 128`                             | 128-K substeps per iteration        |
+| `K_BLOCKS_TOTAL`  | `K / 128`                               | routing-window / quantization atoms |
+| coupled?          | `UP_GROUPS == DOWN_GROUPS`              | picks the site-#2 barrier variant   |
 
 Constraints tying the knobs together: `GRID_SIZE` must be a multiple of
 `UP_GRID` and `DOWN_GRID` and ≤ SM count; `K_TILES_UP % SLOTS == 0` (the
@@ -69,24 +69,24 @@ defaults** for the three production shapes, written as
 (35B / 122B / GLM 5.2); the full per-config tables for every shipped shape
 are in "Shipped configurations" at the end of this document.
 
-| cfg-0 example | 35B (N=512, K=2048) | 122B (N=1024, K=3072) | GLM 5.2 (N=256, K=6144) |
-|---|---|---|---|
-| `GRID_SIZE` | 128 | 128 | 128 |
-| knobs (DCT/KUP/KDN/SLOTS) | 256/256/256/4 | 384/256/128/2 | 384/256/128/2 |
-| `UCH` | 1 (interleaved) | 2 (raw) | 2 (raw, pinned) |
-| `UP_GRID` × `UP_GROUPS` | 8 × 16 | 8 × 16 | 2 × 64 |
-| `K_TILES_UP` × substeps | 8 × 2 | 12 × 2 | 24 × 2 |
-| SLOTS / arm distance | 4 / 2 | 2 / 1 | 2 / 1 |
-| DCT / halves | 256 / 2 | 384 / 3 | 384 / 3 |
-| `DOWN_GRID` × `DOWN_GROUPS` | 8 × 16 | 8 × 16 | 16 × 8 |
-| `K_TILES_DOWN` × substeps | 2 × 2 | 8 × 1 | 2 × 1 |
-| coupled? | yes | yes | no (64 ≠ 8) |
-| `K_BLOCKS_TOTAL` | 16 | 24 | 48 |
-| routing-window tile (BS=8) | 32 KB | 48 KB | 96 KB |
+| cfg-0 example               | 35B (N=512, K=2048) | 122B (N=1024, K=3072) | GLM 5.2 (N=256, K=6144) |
+| --------------------------- | ------------------- | --------------------- | ----------------------- |
+| `GRID_SIZE`                 | 128                 | 128                   | 128                     |
+| knobs (DCT/KUP/KDN/SLOTS)   | 256/256/256/4       | 384/256/128/2         | 384/256/128/2           |
+| `UCH`                       | 1 (interleaved)     | 2 (raw)               | 2 (raw, pinned)         |
+| `UP_GRID` × `UP_GROUPS`     | 8 × 16              | 8 × 16                | 2 × 64                  |
+| `K_TILES_UP` × substeps     | 8 × 2               | 12 × 2                | 24 × 2                  |
+| SLOTS / arm distance        | 4 / 2               | 2 / 1                 | 2 / 1                   |
+| DCT / halves                | 256 / 2             | 384 / 3               | 384 / 3                 |
+| `DOWN_GRID` × `DOWN_GROUPS` | 8 × 16              | 8 × 16                | 16 × 8                  |
+| `K_TILES_DOWN` × substeps   | 2 × 2               | 8 × 1                 | 2 × 1                   |
+| coupled?                    | yes                 | yes                   | no (64 ≠ 8)             |
+| `K_BLOCKS_TOTAL`            | 16                  | 24                    | 48                      |
+| routing-window tile (BS=8)  | 32 KB               | 48 KB                 | 96 KB                   |
 
 ## Phase pipeline
 
-```
+```text
 Phase 1  routing (calc warps: topK_BS8)          ∥  routing-window TMA:
                                                     full [BS,K] bf16 tile
                                                     → SHM bf16_in_full,
@@ -427,11 +427,11 @@ expert:
 The dominant space is a union whose members have strictly disjoint lifetimes
 (separated by the Phase-2 trailing sync and the site-#2 barrier):
 
-| view | phase | size (35B cfg0) |
-|---|---|---|
-| `bf16_in_full[K/128][BS][128]` | 1–2 | 32 KB |
-| `w_wgmma[UP_W_SLOTS][M_total][128]` | 3 | 64 KB |
-| `w_down_wgmma[2][DCT·K_SUBSTEPS][128]` | 4 | dominates |
+| view                                   | phase | size (35B cfg0) |
+| -------------------------------------- | ----- | --------------- |
+| `bf16_in_full[K/128][BS][128]`         | 1–2   | 32 KB           |
+| `w_wgmma[UP_W_SLOTS][M_total][128]`    | 3     | 64 KB           |
+| `w_down_wgmma[2][DCT·K_SUBSTEPS][128]` | 4     | dominates       |
 
 Other notable fields:
 
@@ -518,12 +518,12 @@ CUDA-Graph-replay safe (parity keeps alternating across replays).
 Four `CUtensorMap`s are built host-side per launch (`moe_tma.cu`) and passed
 as `__grid_constant__` kernel parameters:
 
-| descriptor | tensor | box | swizzle |
-|---|---|---|---|
-| up weights | `[E·2N, K]` fp8 (interleaved or raw) | 128×128 | 128B |
-| activations | `[BS, K]` bf16 | 8×128 | none |
-| down weights | `[E·K, N]` fp8 (raw) | 128×128 | 128B |
-| down activations | `temp_fp8 [rows, N]` fp8 | 8×128 | 128B |
+| descriptor       | tensor                               | box     | swizzle |
+| ---------------- | ------------------------------------ | ------- | ------- |
+| up weights       | `[E·2N, K]` fp8 (interleaved or raw) | 128×128 | 128B    |
+| activations      | `[BS, K]` bf16                       | 8×128   | none    |
+| down weights     | `[E·K, N]` fp8 (raw)                 | 128×128 | 128B    |
+| down activations | `temp_fp8 [rows, N]` fp8             | 8×128   | 128B    |
 
 The TMA hardware applies the 8-row × 128-B core-matrix XOR swizzle at write
 time, producing the canonical CUTLASS Major::K B128 layout that the WGMMA
@@ -539,14 +539,14 @@ issues and why DCT=384 uses three 128-row weight TMAs per substep.
 
 Per-shape `KernelConfig` knobs, swept by the tuner:
 
-| knob | meaning | constraints |
-|---|---|---|
-| `GRID_SIZE` | total blocks | ≤ SM count; multiple of UP_GRID and DOWN_GRID |
-| `DOWN_COL_TILE` | output cols per down-block | mult. of 128; divides K; ≤ 512 |
-| `K_STEP_UP` | up K per outer iter | mult. of 128; divides K; `K_TILES_UP % SLOTS == 0` |
-| `K_STEP_DOWN` | down K per outer iter | mult. of 128; divides N; `K_TILES_DOWN` even |
-| `UP_W_SLOTS` | weight-TMA lookahead depth | power of two ≥ 2 |
-| `UP_COL_HALVES` | up M-atoms per block | derived from DCT (coupled) or pinned (decoupled); ≤ 2 |
+| knob            | meaning                    | constraints                                           |
+| --------------- | -------------------------- | ----------------------------------------------------- |
+| `GRID_SIZE`     | total blocks               | ≤ SM count; multiple of UP_GRID and DOWN_GRID         |
+| `DOWN_COL_TILE` | output cols per down-block | mult. of 128; divides K; ≤ 512                        |
+| `K_STEP_UP`     | up K per outer iter        | mult. of 128; divides K; `K_TILES_UP % SLOTS == 0`    |
+| `K_STEP_DOWN`   | down K per outer iter      | mult. of 128; divides N; `K_TILES_DOWN` even          |
+| `UP_W_SLOTS`    | weight-TMA lookahead depth | power of two ≥ 2                                      |
+| `UP_COL_HALVES` | up M-atoms per block       | derived from DCT (coupled) or pinned (decoupled); ≤ 2 |
 
 `shapes.json` is the single source of truth.  `tools/gen_shapes.py` emits the
 `Dims_*` structs, the `MONO_CONFIGS_*` X-macro tables, wrapper/binding
@@ -590,76 +590,76 @@ configs read the raw tensor ("raw").
 
 `qwen3.5_35b` (aliases: 35b, qwen3.5, qwen3_5_35b) — E=256, N_half=512, K=2048, default top_k=8
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 256 | 256 | 256 | 4 | 1 (il) | 8×16 | 8×16 | 8/2 | default, UCH=1 interleaved |
-| 1 | 128 | 256 | 128 | 128 | 4 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 2 | 128 | 256 | 128 | 128 | 2 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 3 | 128 | 256 | 256 | 256 | 2 | 1 (il) | 8×16 | 8×16 | 8/2 |  |
-| 4 | 128 | 512 | 256 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 8/4 | UCH=2 raw (no interleave) |
-| 5 | 128 | 512 | 128 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128 |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                       |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | -------------------------- |
+| 0   | 128  | 256 | 256 | 256 | 4     | 1 (il)  | 8×16 | 8×16 | 8/2  | default, UCH=1 interleaved |
+| 1   | 128  | 256 | 128 | 128 | 4     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 2   | 128  | 256 | 128 | 128 | 2     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 3   | 128  | 256 | 256 | 256 | 2     | 1 (il)  | 8×16 | 8×16 | 8/2  |                            |
+| 4   | 128  | 512 | 256 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 8/4  | UCH=2 raw (no interleave)  |
+| 5   | 128  | 512 | 128 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128         |
 
 ### Qwen3.5-122B block-wise FP8
 
 `qwen3.5_122b` (aliases: 122b, qwen3_5_122b) — E=256, N_half=1024, K=3072, default top_k=8
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 384 | 256 | 128 | 2 | 2 (raw) | 8×16 | 8×16 | 12/8 | default (KUP=256, 188KB); fastest on H200 BS8 M=1..8, see tune_monokernel |
-| 1 | 128 | 384 | 128 | 128 | 2 | 2 (raw) | 8×16 | 8×16 | 24/8 | former default (KUP=128) |
-| 2 | 128 | 384 | 128 | 128 | 4 | 2 (raw) | 8×16 | 8×16 | 24/8 | SLOTS=4 (188KB) |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                                                                      |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | ------------------------------------------------------------------------- |
+| 0   | 128  | 384 | 256 | 128 | 2     | 2 (raw) | 8×16 | 8×16 | 12/8 | default (KUP=256, 188KB); fastest on H200 BS8 M=1..8, see tune_monokernel |
+| 1   | 128  | 384 | 128 | 128 | 2     | 2 (raw) | 8×16 | 8×16 | 24/8 | former default (KUP=128)                                                  |
+| 2   | 128  | 384 | 128 | 128 | 4     | 2 (raw) | 8×16 | 8×16 | 24/8 | SLOTS=4 (188KB)                                                           |
 
 ### E256 N_half256 K6144 decoupled block-wise FP8
 
 `e256_n256_k6144` (aliases: glm52, n256k6144) — E=256, N_half=256, K=6144, default top_k=8, `UP_COL_HALVES` pinned to 2 (decoupled)
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 384 | 256 | 128 | 2 | 2 (raw) | 2×64 | 16×8 | 24/2 | default (tuned 2026-07-02, H200 synthetic sweep: best at every M 1/2/4/8, 1.19x/1.19x/1.14x/1.05x vs Triton); UCH=2 raw, UP_GRID=2/UP_GROUPS=64, DOWN_GRID=16/DOWN_GROUPS=8, R=8; KUP=256 => 24 up K-steps; SHM~219KB |
-| 1 | 128 | 384 | 128 | 128 | 2 | 2 (raw) | 2×64 | 16×8 | 48/2 | KUP=128 (48 up K-steps); lowest SHM ~187KB; former default |
-| 2 | 128 | 384 | 128 | 128 | 4 | 2 (raw) | 2×64 | 16×8 | 48/2 | SLOTS=4 deeper up-weight lookahead; SHM~219KB |
-| 3 | 112 | 384 | 256 | 128 | 2 | 2 (raw) | 2×56 | 16×7 | 24/2 | grid=112 partial (DOWN 16x7, UP_GROUPS=56); loses at M=8 (0.84x) |
-| 4 | 120 | 256 | 256 | 128 | 2 | 2 (raw) | 2×60 | 24×5 | 24/2 | DCT=256: DOWN 24x5, UP_GROUPS=60; runner-up at M=1 |
-| 5 | 96 | 128 | 256 | 128 | 2 | 2 (raw) | 2×48 | 48×2 | 24/2 | DCT=128: DOWN 48x2, UP_GROUPS=48; loses badly at M>=4 |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                                                                                                                                                                                                                  |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0   | 128  | 384 | 256 | 128 | 2     | 2 (raw) | 2×64 | 16×8 | 24/2 | default (tuned 2026-07-02, H200 synthetic sweep: best at every M 1/2/4/8, 1.19x/1.19x/1.14x/1.05x vs Triton); UCH=2 raw, UP_GRID=2/UP_GROUPS=64, DOWN_GRID=16/DOWN_GROUPS=8, R=8; KUP=256 => 24 up K-steps; SHM~219KB |
+| 1   | 128  | 384 | 128 | 128 | 2     | 2 (raw) | 2×64 | 16×8 | 48/2 | KUP=128 (48 up K-steps); lowest SHM ~187KB; former default                                                                                                                                                            |
+| 2   | 128  | 384 | 128 | 128 | 4     | 2 (raw) | 2×64 | 16×8 | 48/2 | SLOTS=4 deeper up-weight lookahead; SHM~219KB                                                                                                                                                                         |
+| 3   | 112  | 384 | 256 | 128 | 2     | 2 (raw) | 2×56 | 16×7 | 24/2 | grid=112 partial (DOWN 16x7, UP_GROUPS=56); loses at M=8 (0.84x)                                                                                                                                                      |
+| 4   | 120  | 256 | 256 | 128 | 2     | 2 (raw) | 2×60 | 24×5 | 24/2 | DCT=256: DOWN 24x5, UP_GROUPS=60; runner-up at M=1                                                                                                                                                                    |
+| 5   | 96   | 128 | 256 | 128 | 2     | 2 (raw) | 2×48 | 48×2 | 24/2 | DCT=128: DOWN 48x2, UP_GROUPS=48; loses badly at M>=4                                                                                                                                                                 |
 
 ### E-sweep E=64 (N512 K2048) block-wise FP8
 
 `e64_n512_k2048` (aliases: e64) — E=64, N_half=512, K=2048, default top_k=8
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 256 | 256 | 256 | 4 | 1 (il) | 8×16 | 8×16 | 8/2 | default, UCH=1 interleaved |
-| 1 | 128 | 256 | 128 | 128 | 4 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 2 | 128 | 256 | 128 | 128 | 2 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 3 | 128 | 256 | 256 | 256 | 2 | 1 (il) | 8×16 | 8×16 | 8/2 |  |
-| 4 | 128 | 512 | 256 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 8/4 | UCH=2 raw (no interleave) |
-| 5 | 128 | 512 | 128 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128 |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                       |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | -------------------------- |
+| 0   | 128  | 256 | 256 | 256 | 4     | 1 (il)  | 8×16 | 8×16 | 8/2  | default, UCH=1 interleaved |
+| 1   | 128  | 256 | 128 | 128 | 4     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 2   | 128  | 256 | 128 | 128 | 2     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 3   | 128  | 256 | 256 | 256 | 2     | 1 (il)  | 8×16 | 8×16 | 8/2  |                            |
+| 4   | 128  | 512 | 256 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 8/4  | UCH=2 raw (no interleave)  |
+| 5   | 128  | 512 | 128 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128         |
 
 ### E-sweep E=128 (N512 K2048) block-wise FP8
 
 `e128_n512_k2048` (aliases: e128) — E=128, N_half=512, K=2048, default top_k=8
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 256 | 256 | 256 | 4 | 1 (il) | 8×16 | 8×16 | 8/2 | default, UCH=1 interleaved |
-| 1 | 128 | 256 | 128 | 128 | 4 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 2 | 128 | 256 | 128 | 128 | 2 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 3 | 128 | 256 | 256 | 256 | 2 | 1 (il) | 8×16 | 8×16 | 8/2 |  |
-| 4 | 128 | 512 | 256 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 8/4 | UCH=2 raw (no interleave) |
-| 5 | 128 | 512 | 128 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128 |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                       |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | -------------------------- |
+| 0   | 128  | 256 | 256 | 256 | 4     | 1 (il)  | 8×16 | 8×16 | 8/2  | default, UCH=1 interleaved |
+| 1   | 128  | 256 | 128 | 128 | 4     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 2   | 128  | 256 | 128 | 128 | 2     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 3   | 128  | 256 | 256 | 256 | 2     | 1 (il)  | 8×16 | 8×16 | 8/2  |                            |
+| 4   | 128  | 512 | 256 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 8/4  | UCH=2 raw (no interleave)  |
+| 5   | 128  | 512 | 128 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128         |
 
 ### E-sweep E=512 (N512 K2048) block-wise FP8
 
 `e512_n512_k2048` (aliases: e512) — E=512, N_half=512, K=2048, default top_k=8
 
-| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH | UP | DOWN | KT | note |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | 128 | 256 | 256 | 256 | 4 | 1 (il) | 8×16 | 8×16 | 8/2 | default, UCH=1 interleaved |
-| 1 | 128 | 256 | 128 | 128 | 4 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 2 | 128 | 256 | 128 | 128 | 2 | 1 (il) | 8×16 | 8×16 | 16/4 |  |
-| 3 | 128 | 256 | 256 | 256 | 2 | 1 (il) | 8×16 | 8×16 | 8/2 |  |
-| 4 | 128 | 512 | 256 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 8/4 | UCH=2 raw (no interleave) |
-| 5 | 128 | 512 | 128 | 128 | 2 | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128 |
+| cfg | GRID | DCT | KUP | KDN | SLOTS | UCH     | UP   | DOWN | KT   | note                       |
+| --- | ---- | --- | --- | --- | ----- | ------- | ---- | ---- | ---- | -------------------------- |
+| 0   | 128  | 256 | 256 | 256 | 4     | 1 (il)  | 8×16 | 8×16 | 8/2  | default, UCH=1 interleaved |
+| 1   | 128  | 256 | 128 | 128 | 4     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 2   | 128  | 256 | 128 | 128 | 2     | 1 (il)  | 8×16 | 8×16 | 16/4 |                            |
+| 3   | 128  | 256 | 256 | 256 | 2     | 1 (il)  | 8×16 | 8×16 | 8/2  |                            |
+| 4   | 128  | 512 | 256 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 8/4  | UCH=2 raw (no interleave)  |
+| 5   | 128  | 512 | 128 | 128 | 2     | 2 (raw) | 4×32 | 4×32 | 16/4 | UCH=2 raw, KUP=128         |
 
 See `README.md` in this directory for the operational runbook (build, tune,
 accuracy testing, vLLM integration, nsys/ncu profiling).

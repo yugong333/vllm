@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from enum import IntEnum
 import contextlib
+from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -215,7 +215,7 @@ MOE_SCORING_SOFTMAX = 1
 def _resolve_monokernel_config_id(E: int, N: int, K: int) -> int:
     """Resolve the monokernel KernelConfig id for a shape from the
     `MONOKERNEL_CONFIG` env var.  Returns -1 (use shipped default) if unset
-    or unparseable.
+    or unparsable.
 
     Accepted forms:
       MONOKERNEL_CONFIG=2                 -> id 2 for ANY shape

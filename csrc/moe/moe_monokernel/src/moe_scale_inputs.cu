@@ -95,7 +95,11 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
   float local_max =
       fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
   float blk_max = warp_reduce_max_float(local_max);
-  if (blk_max < __FLT_MIN__) blk_max = 1.f;
+  // Eps-clamp tiny maxima: blk_max slightly above FLT_MIN still overflows
+  // blk_inv_scale (448/blk_max > FLT_MAX for blk_max < ~1.32e-36), NaN-ing
+  // the whole block after the fp8 cast. 1e-10 matches vLLM's group-quant
+  // eps.
+  blk_max = fmaxf(blk_max, 1e-10f);
 
   const float blk_act_scale = blk_max * FP8_MAX_INV;
   const float blk_inv_scale = FP8_MAX / blk_max;

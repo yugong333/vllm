@@ -25,10 +25,11 @@ namespace moe_monokernel {
  * tie-break ("lower expert index wins") — a lowest-lane tie-break would
  * pick a different expert because experts map to lanes as `expert % 32`.
  */
-__device__ static inline uint32_t warp_min_expert_with_max(
-    float my_max, float warp_max, uint32_t my_expert) {
+__device__ static inline uint32_t warp_min_expert_with_max(float my_max,
+                                                           float warp_max,
+                                                           uint32_t my_expert) {
   uint32_t cand = (my_max == warp_max) ? my_expert : 0xFFFFFFFFu;
-#pragma unroll
+  #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     uint32_t other = __shfl_xor_sync(FULL_MASK, cand, off);
     cand = other < cand ? other : cand;
@@ -123,21 +124,28 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   #pragma unroll
   for (uint32_t i = 0; i < MAX_PER_THREAD; ++i) {
     const uint32_t idx = i * 32u + tid;
-    const float logit = (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
-    scores[i] = use_bias ? (1.0f / (1.0f + __expf(-logit)) + expert_bias[idx])
-                         : logit;
+    const float logit =
+        (float)router_logits[warp_idx * Dims::NUM_EXPERTS + idx];
+    const float metric =
+        use_bias ? (1.0f / (1.0f + __expf(-logit)) + expert_bias[idx]) : logit;
+    // Invalid/padded rows can carry NaN/Inf router scores under CUDA graph
+    // replay. Treat them as very low scores, but keep them distinct from the
+    // already-selected sentinel (-inf) so top-k still returns unique experts.
+    scores[i] = (isnan(metric) || isinf(metric)) ? -FLT_MAX : metric;
     expert_id[i] = idx;
   }
 
   // ── Slow path: softmax + renormalize=False ─────────────────────────────
   if (scoring_func == ScoringFunc::SOFTMAX && !renormalize) {
     warp_softmax_inplace<MAX_PER_THREAD>(scores);
+    constexpr float EXCLUDED_SCORE = -INFINITY;
     for (uint32_t k = 0; k < top_k; k++) {
-      float max_val = -FLT_MAX;
-      uint32_t max_expert = 0;
+      float max_val = EXCLUDED_SCORE;
+      uint32_t max_expert = 0xFFFFFFFFu;
   #pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
-        if (scores[i] > max_val) {
+        if (scores[i] > max_val ||
+            (scores[i] == max_val && expert_id[i] < max_expert)) {
           max_val = scores[i];
           max_expert = expert_id[i];
         }
@@ -147,12 +155,13 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
           warp_min_expert_with_max(max_val, warp_max, max_expert);
       float winning_weight = warp_max * routed_scaling_factor;
       if (tid == 0u) {
-        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)winning_expert;
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] =
+            (uint16_t)winning_expert;
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
       }
   #pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
-        if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
+        if (expert_id[i] == winning_expert) scores[i] = EXCLUDED_SCORE;
       }
     }
     return;
@@ -164,12 +173,14 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
   // numerical-safety shift uses topk_scores[0] — no extra warp reduction.
   float topk_scores[MoE_SHM<Dims>::MAX_TOPK];
   uint32_t topk_experts[MoE_SHM<Dims>::MAX_TOPK];
+  constexpr float EXCLUDED_SCORE = -INFINITY;
   for (uint32_t k = 0; k < top_k; k++) {
-    float max_val = -FLT_MAX;
-    uint32_t max_expert = 0;
+    float max_val = EXCLUDED_SCORE;
+    uint32_t max_expert = 0xFFFFFFFFu;
   #pragma unroll
     for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
-      if (scores[i] > max_val) {
+      if (scores[i] > max_val ||
+          (scores[i] == max_val && expert_id[i] < max_expert)) {
         max_val = scores[i];
         max_expert = expert_id[i];
       }
@@ -181,7 +192,7 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
     topk_experts[k] = winning_expert;
   #pragma unroll
     for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
-      if (expert_id[i] == winning_expert) scores[i] = -FLT_MAX;
+      if (expert_id[i] == winning_expert) scores[i] = EXCLUDED_SCORE;
     }
   }
 
@@ -213,9 +224,8 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
       float sig_vals[MoE_SHM<Dims>::MAX_TOPK];
       float sum_sig = 0.0f;
       for (uint32_t k = 0; k < top_k; k++) {
-        sig_vals[k] = use_bias
-                          ? (topk_scores[k] - expert_bias[topk_experts[k]])
-                          : (1.0f / (1.0f + __expf(-topk_scores[k])));
+        sig_vals[k] = use_bias ? (topk_scores[k] - expert_bias[topk_experts[k]])
+                               : (1.0f / (1.0f + __expf(-topk_scores[k])));
         sum_sig += sig_vals[k];
       }
       float inv =
@@ -272,8 +282,9 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   static_assert(Dims::NUM_EXPERTS % 32 == 0,
                 "NUM_EXPERTS must be a multiple of 32 for warp blocking of "
                 "expert_routed_count[] / expert_slot_start[].");
-  static_assert(MAX_PAIRS <= 64,
-                "Phase A caches up to 2 pair-eids per lane (BS * top_k <= 64).");
+  static_assert(
+      MAX_PAIRS <= 64,
+      "Phase A caches up to 2 pair-eids per lane (BS * top_k <= 64).");
 
   const uint32_t tid = threadIdx.x;
   const uint32_t n_pairs = batch_size * top_k;
@@ -426,7 +437,8 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
       const uint32_t b = lane_slot_offset + count_prefix[2u * j + 1u];
       w[j] = a | (b << 16);
     }
-    auto* dst = reinterpret_cast<uint32_t*>(&tma_shm->expert_slot_start[tid * BLK]);
+    auto* dst =
+        reinterpret_cast<uint32_t*>(&tma_shm->expert_slot_start[tid * BLK]);
     if constexpr (BLK == 2u) {
       dst[0] = w[0];
     } else if constexpr (BLK == 4u) {
