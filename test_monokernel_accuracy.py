@@ -13,18 +13,16 @@ WGMMA path now: the up-proj epilogue fuses fp8 quantization and writes
 to temp_fp8 + temp_act_scale instead of writing bf16 to temp_bf16, so
 the Section 2 SiLU comparison is skipped for BS8.
 
-Scratchpad layout (MoEGemmSpec<Dims_BSx>):
+Scratchpad layout (MoEGemmSpec<Dims_BSx>, BS = 8 or 16 — both are the
+same TMA+WGMMA path, BS16 just doubles the token extents):
   activations[BS][K]                        fp8
-  temp_bf16[TEMP_ROWS][N]                   bf16  (BS64 path)
-  temp_block_max[TEMP_ROWS][UP_PROJ_BLOCKS] fp32
-  temp_fp8[TEMP_ROWS][N]                    fp8   (BS8 WGMMA)
-  temp_act_scale[TEMP_ROWS][N / 64]         fp32  (BS8 WGMMA)
-  down_partial_out[DOWN_GROUPS][BS][K]      fp32  (BS8 WGMMA)
+  temp_fp8[TEMP_ROWS][N]                    fp8   (WGMMA)
+  temp_act_scale[TEMP_ROWS][N / 64]         fp32  (WGMMA)
+  down_partial_out[BS][K]                   fp32  (WGMMA, single buffer)
   act_scale[BS][K/128]                      fp32  (per-token block-wise)
 
 Usage:
     python test_monokernel_accuracy.py                      # defaults to 'coder'
-    python test_monokernel_accuracy.py --model coder        # Qwen3-Coder-30B-A3B
     python test_monokernel_accuracy.py --model qwen3.5      # (when available)
 """
 
@@ -94,11 +92,13 @@ MODELS = {
         # `op_bs8` points at the canonical WGMMA_TMA op.  It requires the
         # gate/up PAIR interleave (`interleave_for_tma_wgmma_up_v2`).
         "op_bs8": "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
+        # BS16 companion (8 < M <= 16): same template body instantiated at
+        # Dims::BS == 16 (m64n16k32 up/down WGMMA); shape-keyed symbol.
+        "op_bs16": "moe_monokernel_topk_BS16_E256_N512_K2048_BlockFP8_WGMMA_TMA",  # noqa: E501
         # Hopper cluster + DSHM + multicast-TMA variant of the BS8 path
         # (see `.kiro/specs/monokernel-cluster-multicast`). Selected via
         # the `--cluster` CLI flag; only meaningful on sm_90a.
         "op_bs8_cluster": "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_Cluster",  # noqa: E501
-        "op_bs64": "moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8",
     },
     "qwen3.5_122b": {
         "display_name": "Qwen3.5-122B block-wise FP8",
@@ -115,9 +115,8 @@ MODELS = {
         # (`torch.ops.vllm.moe_monokernel_topk`), which is the exact path
         # vLLM serving runs.
         "op_bs8": "moe_monokernel_topk_BS8_E256_Qwen3_5_122B_BlockFP8_WGMMA_TMA",
-        # No cluster / BS64 variant for 122B.
+        # No cluster variant for 122B.
         "op_bs8_cluster": None,
-        "op_bs64": None,
     },
     # ── E-sweep shapes (35B N/K, varying expert count) ───────────────────
     # Declared in csrc/moe/moe_monokernel/shapes.json; ops are shape-keyed
@@ -126,21 +125,30 @@ MODELS = {
     # build + occupancy at E=512.
     "e64": {
         "display_name": "E-sweep E=64 (N512 K2048) block-wise FP8",
-        "E": 64, "N_HALF": 512, "K": 2048, "default_top_k": 8,
+        "E": 64,
+        "N_HALF": 512,
+        "K": 2048,
+        "default_top_k": 8,
         "op_bs8": "moe_monokernel_topk_BS8_E64_N512_K2048_BlockFP8_WGMMA_TMA",
-        "op_bs8_cluster": None, "op_bs64": None,
+        "op_bs8_cluster": None,
     },
     "e128": {
         "display_name": "E-sweep E=128 (N512 K2048) block-wise FP8",
-        "E": 128, "N_HALF": 512, "K": 2048, "default_top_k": 8,
+        "E": 128,
+        "N_HALF": 512,
+        "K": 2048,
+        "default_top_k": 8,
         "op_bs8": "moe_monokernel_topk_BS8_E128_N512_K2048_BlockFP8_WGMMA_TMA",
-        "op_bs8_cluster": None, "op_bs64": None,
+        "op_bs8_cluster": None,
     },
     "e512": {
         "display_name": "E-sweep E=512 (N512 K2048) block-wise FP8",
-        "E": 512, "N_HALF": 512, "K": 2048, "default_top_k": 8,
+        "E": 512,
+        "N_HALF": 512,
+        "K": 2048,
+        "default_top_k": 8,
         "op_bs8": "moe_monokernel_topk_BS8_E512_N512_K2048_BlockFP8_WGMMA_TMA",
-        "op_bs8_cluster": None, "op_bs64": None,
+        "op_bs8_cluster": None,
     },
     # ── Decoupled up/down carve (UP_GROUPS=64 != DOWN_GROUPS=8, R=8) ─────
     # UP_COL_HALVES=2 pinned explicitly (raw two-TMA up-proj, NO interleave);
@@ -148,7 +156,10 @@ MODELS = {
     # scoring + top_k=8 is the serving config for this shape.
     "glm52": {
         "display_name": "E256 N_half256 K6144 decoupled block-wise FP8",
-        "E": 256, "N_HALF": 256, "K": 6144, "default_top_k": 8,
+        "E": 256,
+        "N_HALF": 256,
+        "K": 6144,
+        "default_top_k": 8,
         # Serving config for this shape scores with sigmoid (renormalized),
         # not softmax; the reference and kernel calls follow this field.
         "scoring_func": "sigmoid",
@@ -163,7 +174,7 @@ MODELS = {
         # layout math can't derive it from the DCT coupling identity.
         "up_col_halves": 2,
         "op_bs8": "moe_monokernel_topk_BS8_E256_N256_K6144_BlockFP8_WGMMA_TMA",
-        "op_bs8_cluster": None, "op_bs64": None,
+        "op_bs8_cluster": None,
     },
     "coder": {
         "display_name": "Qwen3-Coder-30B-A3B",
@@ -174,7 +185,6 @@ MODELS = {
         # Not currently wired in moe_monokernel/moe_wrapper.cu — re-add the
         # Qwen3Coder wrappers + torch bindings to enable.
         "op_bs8": None,
-        "op_bs64": None,
     },
 }
 
@@ -204,11 +214,15 @@ def _register_models_from_registry():
             "K": row["K"],
             "default_top_k": row["default_top_k"],
             "op_bs8": row["named_op"],
+            "op_bs16": row.get("named_op_bs16"),
             "op_bs8_cluster": None,
-            "op_bs64": None,
         }
-        for opt in ("scoring_func", "use_expert_bias",
-                    "routed_scaling_factor", "up_col_halves"):
+        for opt in (
+            "scoring_func",
+            "use_expert_bias",
+            "routed_scaling_factor",
+            "up_col_halves",
+        ):
             if row.get(opt) is not None:
                 entry[opt] = row[opt]
         for n in names:
@@ -237,10 +251,12 @@ def get_model_op(model_cfg, M, use_cluster=False):
         key = "op_bs8_cluster"
     elif M <= 8:
         key = "op_bs8"
+    elif M <= 16:
+        key = "op_bs16"
     else:
         raise RuntimeError(
-            f"Batch size M={M} > 8 is not supported: the BS64 monokernel "
-            f"path has been removed. Use M <= 8 (the BS8 TMA+WGMMA path)."
+            f"Batch size M={M} > 16 is not supported. Use M <= 8 (BS8) or "
+            f"8 < M <= 16 (BS16, shapes with bs16=true in shapes.json)."
         )
     op_name = model_cfg.get(key)
     if op_name is None:
@@ -374,7 +390,10 @@ def routing_softmax_topk(logits_bf16, top_k):
 
 
 def routing_sigmoid_topk(
-    logits_bf16, top_k, renormalize=True, expert_bias=None,
+    logits_bf16,
+    top_k,
+    renormalize=True,
+    expert_bias=None,
     routed_scaling_factor=1.0,
 ):
     """Sigmoid scoring → topk → optional renormalize (matches CUDA kernel).
@@ -447,33 +466,6 @@ def quant_fp8_activation_block_wise(x_float, group_size=128):
         x_fp8[g0:g1] = (block * inv_s).clamp(-448, 448).to(torch.float8_e4m3fn)
 
     return x_fp8, scales
-
-
-# ── Read temp_bf16 from scratchpad ───────────────────────────────────────────
-
-
-def read_temp_bf16_from_scratchpad(scratchpad_bytes, M, top_k, is_bs8, N_HALF, K):
-    """
-    Read the SiLU output (temp_bf16) from the monokernel's scratchpad.
-
-    Layout of MoEGemmSpec (no DEBUG_MOE):
-      activations: [BS][K] fp8  → BS*K bytes
-      temp_bf16:   [TEMP_ROWS * N] bf16
-      temp_block_max: [TEMP_ROWS * UP_PROJ_BLOCKS] fp32
-      act_scale:   [BS][K/128] fp32  (per-token block-wise, 16 scales per token)
-    """
-    BS = 8 if is_bs8 else 64
-    TEMP_ROWS = BS * 8 + 8  # SPEC_MAX_TOPK=8
-    act_bytes = BS * K  # fp8 = 1 byte each
-    temp_offset = act_bytes
-    temp_count = TEMP_ROWS * N_HALF
-    temp_bytes = temp_count * 2  # bf16 = 2 bytes
-
-    raw = scratchpad_bytes[temp_offset : temp_offset + temp_bytes]
-    temp = raw.view(torch.bfloat16).reshape(TEMP_ROWS, N_HALF)
-
-    # Only return the rows that were actually written: M * top_k rows
-    return temp[: M * top_k].clone()
 
 
 def read_wgmma_intermediates_from_scratchpad(
@@ -774,12 +766,14 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     kernel_op = get_model_op(model_cfg, M, use_cluster=use_cluster)
 
     is_bs8 = M <= 8
-    path = "BS8" if is_bs8 else "BS64"
+    path = "BS8" if is_bs8 else "BS16"
     sep = "=" * 72
 
     print(f"\n{'#' * 72}")
-    print(f"# ACCURACY [{model_cfg['display_name']}]: {path} M={M} top_k={top_k}"
-          f" scoring={scoring_func}")
+    print(
+        f"# ACCURACY [{model_cfg['display_name']}]: {path} M={M} top_k={top_k}"
+        f" scoring={scoring_func}"
+    )
     print(f"{'#' * 72}")
 
     # Setup — block-wise quantization for all paths
@@ -796,19 +790,19 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         # Synthesize a per-expert bias with the same magnitude regime as GLM
         # 5.2's e_score_correction_bias (~7.0, small spread), so selection is
         # dominated by the bias just like production. float32 [E] on device.
-        expert_bias = (
-            7.0 + 0.05 * torch.randn(E, device=DEV, dtype=torch.float32)
-        )
+        expert_bias = 7.0 + 0.05 * torch.randn(E, device=DEV, dtype=torch.float32)
     if scoring_func == "sigmoid":
         topk_w, topk_ids = routing_sigmoid_topk(
-            logits, top_k, expert_bias=expert_bias,
+            logits,
+            top_k,
+            expert_bias=expert_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
     else:
         topk_w, topk_ids = routing_softmax_topk(logits, top_k)
 
     # Allocate scratchpad as raw bytes so we can read back temp_bf16
-    BS = 8 if is_bs8 else 64
+    BS = 8 if is_bs8 else 16  # Dims::BS of the dispatched kernel
     TEMP_ROWS = BS * 8 + 8
     UP_PROJ_BLOCKS = (N_HALF + 7) // 8
     ACT_SCALE_BLOCKS = (K + 127) // 128  # per-token block-wise: K/128 scales
@@ -819,36 +813,30 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     #   down_partial_out [DOWN_GROUPS][BS][K]          fp32
     # GRID_SIZE is 128 for the WGMMA BS8 kernel.
     #
-    # DOWN_COL_TILE is variant-dependent after Phase 2a of the
-    # software-grid-sync spec:
-    #   * BS8 TMA+WGMMA:   DOWN_COL_TILE = 256 → DOWN_GRID = K/256 = 8,
-    #                      DOWN_GROUPS = GRID_SIZE / 8 = 16 (== UP_GROUPS).
-    #   * BS64 / non-TMA:  DOWN_COL_TILE = 128 → DOWN_GRID = K/128 = 16,
-    #                      DOWN_GROUPS = GRID_SIZE / 16 = 8.
-    # Mirrors MoECoreDims<Dims>::DOWN_COL_TILE / DOWN_GRID / DOWN_GROUPS
-    # so the host-side scratchpad buffer matches the kernel's
-    # `down_partial_out[DOWN_GROUPS][BS][HIDDEN_STATES]` footprint.
     # Shape-derived layout constants.  These mirror MoECoreDims<Dims> /
     # MoEGemmSpec<Dims> in moe_internal.h and MUST track the per-shape
     # geometry, not 35B literals:
     #   * UP_COL_HALVES   = (2*N_HALF * DOWN_COL_TILE) / (128 * K)
     #                       — 1 for 35B, 2 for 122B.
-    #   * DOWN_COL_TILE    = K / DOWN_GRID; for the BS8 TMA path it is the
+    #   * DOWN_COL_TILE    = K / DOWN_GRID; for the TMA path it is the
     #                       value that makes DOWN_GROUPS == UP_GROUPS == 16
     #                       (256 for 35B's K=2048, 384 for 122B's K=3072).
     #   * DOWN_ACT_BLOCK_SIZE = UP_COL_HALVES * 64 (64 for 35B, 128 for 122B)
     #     ⇒ TEMP_ACT_SCALE_COLS = N_HALF / DOWN_ACT_BLOCK_SIZE.
+    # BS8 and BS16 share the same TMA+WGMMA grid geometry (the BS16 Dims
+    # tag inherits DOWN_COL_TILE / GRID_SIZE from the shape's config-0);
+    # only the token extents (BS, TEMP_ROWS) differ.
     # `down_partial_out` is a SINGLE [BS][K] buffer in the current kernel
     # (no per-DOWN_GROUPS dimension); Phase 5 reads each cell once.
     GRID_SIZE = 128
-    if is_bs8 and model_cfg.get("up_col_halves") is not None:
+    if model_cfg.get("up_col_halves") is not None:
         # DECOUPLED shape: UCH is pinned explicitly (the coupling identity
         # below has no integer solution).  Only UP_COL_HALVES feeds the
         # scratchpad layout (via DOWN_ACT_BLOCK_SIZE); the down-side carve
         # doesn't change the MoEGemmSpec field sizes.
         UP_COL_HALVES = model_cfg["up_col_halves"]
-    elif is_bs8:
-        # BS8 TMA+WGMMA: DOWN_COL_TILE chosen so DOWN_GROUPS == UP_GROUPS.
+    else:
+        # TMA+WGMMA: DOWN_COL_TILE chosen so DOWN_GROUPS == UP_GROUPS.
         # UP_GROUPS = GRID_SIZE / (2*N_HALF / 128) for UP_COL_HALVES=1, but
         # the invariant the kernel enforces is DOWN_GRID = K / DOWN_COL_TILE
         # with DOWN_GROUPS = 16, i.e. DOWN_COL_TILE = K / (GRID_SIZE / 16).
@@ -856,17 +844,12 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         DOWN_GRID = GRID_SIZE // DOWN_GROUPS  # 8
         DOWN_COL_TILE = K // DOWN_GRID  # 256 (35B) / 384 (122B)
         UP_COL_HALVES = (2 * N_HALF * DOWN_COL_TILE) // (128 * K)  # 1 / 2
-    else:
-        DOWN_COL_TILE = 128
-        DOWN_GRID = K // DOWN_COL_TILE
-        DOWN_GROUPS = GRID_SIZE // DOWN_GRID if DOWN_GRID > 0 else 1
-        UP_COL_HALVES = 1
     DOWN_ACT_BLOCK_SIZE = max(UP_COL_HALVES * 64, 64)
     TEMP_ACT_SCALE_COLS = N_HALF // DOWN_ACT_BLOCK_SIZE
     spec_size = (
         BS * K  # activations fp8
-        + TEMP_ROWS * N_HALF * 2  # temp_bf16 (legacy BS64; kept for margin)
-        + TEMP_ROWS * UP_PROJ_BLOCKS * 4  # temp_block_max (legacy BS64)
+        + TEMP_ROWS * N_HALF * 2  # sizing margin (legacy removed buffers)
+        + TEMP_ROWS * UP_PROJ_BLOCKS * 4  # sizing margin (legacy)
         + TEMP_ROWS * N_HALF * 1  # temp_fp8 (WGMMA path)
         + TEMP_ROWS * TEMP_ACT_SCALE_COLS * 4  # temp_act_scale (WGMMA)
         + BS * K * 4  # down_partial_out [BS][K] (single buffer, WGMMA)
@@ -878,7 +861,7 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
 
     # ── Run CUDA monokernel ──────────────────────────────────────────────
     # High-level op: allocates activations_out internally and dispatches
-    # to BS8/BS64 based on M. See vllm/_custom_ops.py moe_monokernel_topk.
+    # to BS8/BS16 based on M. See vllm/_custom_ops.py moe_monokernel_topk.
     cuda_out = kernel_op(
         x,
         logits,
@@ -1009,12 +992,8 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     # temp_bf16.  So for BS8, temp_bf16 is stale and we skip the
     # Section 2 SiLU comparison below.
     scratch_bytes = scratchpad.view(torch.uint8)
-    if is_bs8:
-        cuda_silu = None
-    else:
-        cuda_silu = read_temp_bf16_from_scratchpad(
-            scratch_bytes, M, top_k, is_bs8, N_HALF, K
-        )
+    # Both BS8 and BS16 are the WGMMA path (quant fused into the epilogue);
+    # temp_bf16 no longer exists, so there is no raw SiLU dump to read.
 
     # ── Run Python reference ─────────────────────────────────────────────
     py_out, py_gate_up, py_silu = python_reference(
@@ -1040,19 +1019,24 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
         print(f"\n{sep}")
         print("STEP-BY-STEP INTERMEDIATES (CUDA scratchpad vs Py reference)")
         print(sep)
-        interm = read_wgmma_intermediates_from_scratchpad(
-            scratch_bytes, N_HALF, K, E,
+        intermediates = read_wgmma_intermediates_from_scratchpad(
+            scratch_bytes,
+            N_HALF,
+            K,
+            E,
             up_col_halves=model_cfg.get("up_col_halves"),
         )
-        act_blk = interm["act_blk"]
-        print(f"  up-proj activation-quant block size = {act_blk} "
-              f"(expect 64 for 35B, 128 for 122B/decoupled)")
+        act_blk = intermediates["act_blk"]
+        print(
+            f"  up-proj activation-quant block size = {act_blk} "
+            f"(expect 64 for 35B, 128 for 122B/decoupled)"
+        )
 
         # Dequantize all written up rows: row r, feature f uses scale
         # column f // act_blk.
         n_rows = M * top_k
-        up_fp8 = interm["up_fp8"][:n_rows].float()  # [n_rows, N_HALF]
-        up_scale = interm["up_scale"][:n_rows]  # [n_rows, N_HALF/act_blk]
+        up_fp8 = intermediates["up_fp8"][:n_rows].float()  # [n_rows, N_HALF]
+        up_scale = intermediates["up_scale"][:n_rows]  # [n_rows, N_HALF/act_blk]
         up_deq = up_fp8 * up_scale.repeat_interleave(act_blk, dim=1)
 
         # Best-cosine match each reference SiLU row → kernel up row.
@@ -1065,16 +1049,20 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
             best = max(cos_sim(up_deq[r], ref) for r in range(n_rows))
             if best < worst_up:
                 worst_up, worst_vrow = best, vrow
-        print(f"  UP   : worst ref-row best-match cos={worst_up:.6f} "
-              f"(vrow={worst_vrow})  [1.0 = up phase correct]")
+        print(
+            f"  UP   : worst ref-row best-match cos={worst_up:.6f} "
+            f"(vrow={worst_vrow})  [1.0 = up phase correct]"
+        )
 
         # Down output is natural [tok][hidden]; compare directly to py_out
         # (pre-bf16-cast fp32 sum over top_k).
-        down_out = interm["down_out"][:M].float()  # [M, K]
+        down_out = intermediates["down_out"][:M].float()  # [M, K]
         down_cos = cos_sim(down_out, py_out[:M].float())
         dm, dmn = err_stats(down_out, py_out[:M].float())
-        print(f"  DOWN : down_partial_out vs py_out  cos={down_cos:.6f}  "
-              f"max_err={dm:.4f}  mean_err={dmn:.4f}")
+        print(
+            f"  DOWN : down_partial_out vs py_out  cos={down_cos:.6f}  "
+            f"max_err={dm:.4f}  mean_err={dmn:.4f}"
+        )
         # Per-token down cosine to spot a single bad token / col-stripe.
         for tok in range(min(M, 4)):
             tc = cos_sim(down_out[tok], py_out[tok].float())
@@ -1108,33 +1096,11 @@ def accuracy_test(model_cfg, M, top_k, seed=42, use_cluster=False):
     # ── 2. SiLU output ──────────────────────────────────────────────────
     print(f"\n{sep}")
     print("2. SiLU OUTPUT (token 0)")
-    if is_bs8:
-        print(
-            "   (skipped — BS8 WGMMA path fuses quant into the epilogue "
-            "and no longer writes bf16 to temp_bf16)"
-        )
-        print(sep)
-    else:
-        print("   CUDA reads from scratchpad temp_bf16 (rw baked in)")
-        print("   Triton has NO rw in SiLU")
-        print(sep)
-        for ki in range(min(top_k, 2)):
-            eid = topk_ids[0, ki].item()
-            rw = topk_w[0, ki].item()
-            vrow = 0 * top_k + ki
-            cs = cuda_silu[vrow]
-            ps = py_silu[vrow]
-            ts = tri_silu[vrow]
-            cp = cos_sim(cs, ps)
-            ct = cos_sim(cs, ts)
-            print(f"  Expert {eid} (k={ki}, rw={rw:.4f}):")
-            print(f"    CUDA vs Py-mono: cos={cp:.6f}  (both have rw)")
-            print(f"    CUDA vs Triton:  cos={ct:.6f}  (Triton has no rw)")
-            print(
-                f"    CUDA norm={cs.float().norm():.2f}  "
-                f"Py norm={ps.float().norm():.2f}  "
-                f"Tri norm={ts.float().norm():.2f}"
-            )
+    print(
+        "   (skipped — the WGMMA path fuses quant into the epilogue "
+        "and no longer writes bf16 to temp_bf16)"
+    )
+    print(sep)
 
     # ── 3. Down projection / final output ────────────────────────────────
     print(f"\n{sep}")
@@ -1383,8 +1349,16 @@ def route_capture_perf(model_cfg, snapshots, seed=42, use_cluster=False):
 
         def cuda_fn():
             return kernel_op(
-                x, logits, w13c, s13c, w2c, s2c, scratchpad,
-                top_k=top_k, scoring_func="softmax", renormalize=True,
+                x,
+                logits,
+                w13c,
+                s13c,
+                w2c,
+                s2c,
+                scratchpad,
+                top_k=top_k,
+                scoring_func="softmax",
+                renormalize=True,
             )
 
         def triton_fn():
@@ -1477,8 +1451,7 @@ def parse_args():
         "--route-layer",
         type=int,
         default=None,
-        help="With --route-capture, only benchmark snapshots from this "
-        "MoE layer_id.",
+        help="With --route-capture, only benchmark snapshots from this MoE layer_id.",
     )
     parser.add_argument(
         "--cluster",
@@ -1499,7 +1472,7 @@ def parse_args():
 def print_model_registry():
     print("Registered models:")
     for key, cfg in MODELS.items():
-        wired = "ok" if cfg["op_bs8"] and cfg["op_bs64"] else "not wired"
+        wired = "ok" if cfg["op_bs8"] else "not wired"
         print(
             f"  {key:<10s} {cfg['display_name']:<32s} "
             f"E={cfg['E']} N_HALF={cfg['N_HALF']} K={cfg['K']}  [{wired}]"
@@ -1582,7 +1555,7 @@ def main():
     )
     print(f"  {'-' * 4}  {'-' * 3}  {'-' * 5}  {'-' * 10}  {'-' * 11}  {'-' * 8}")
     for M, tk in perf_configs:
-        path = "BS8" if M <= 8 else "BS64"
+        path = "BS8" if M <= 8 else "BS16"
         # Reuse the accuracy seed for this M so both runs feed the same
         # inputs to the kernel.  Keeps debug logs (same routing, same
         # quantized inputs) consistent across accuracy and perf phases.
