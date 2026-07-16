@@ -87,7 +87,7 @@ are in "Shipped configurations" at the end of this document.
 ## Phase pipeline
 
 ```text
-Phase 1  routing (calc warps: topK_BS8)          ∥  routing-window TMA:
+Phase 1  routing (calc warps: topK)              ∥  routing-window TMA:
                                                     full [BS,K] bf16 tile
                                                     → SHM bf16_in_full,
                                                     completion on bar_rwin
@@ -121,7 +121,7 @@ SHM, so the work is *replicated* across the grid rather than partitioned
 
 Within one block, two things run concurrently:
 
-- **Calc warps 0–7 — top-k routing (`topK_BS8`)**: one warp per token
+- **Calc warps 0–7 — top-k routing (`topK`)**: one warp per token
   (warp w handles token w; warps ≥ `batch_size` return immediately).
   Within a warp, lane t owns experts `{t, t+32, t+64, ...}` in registers
   (`E/32` per lane — 8 for E=256).  The warp runs `top_k` rounds of
@@ -399,7 +399,7 @@ expert:
 
 ## Routing mechanics (Phase 1/2 deep-dive)
 
-`topK_BS8` (one warp per token, experts distributed lane-cyclically,
+`topK` (one warp per token, experts distributed lane-cyclically,
 `NUM_EXPERTS % 32 == 0` keeps score arrays in registers):
 
 - Fast path (softmax+renormalize, or sigmoid): select top-k on raw logits

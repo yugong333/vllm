@@ -283,7 +283,8 @@ void launch_moe_monokernel(
 //
 // Emitted from csrc/moe/moe_monokernel/shapes.json by tools/gen_shapes.py:
 //   * config_table_generated.inc — MONO_CONFIGS_<shape>(X) X-macro tables
-//     (id, GRID, DCT, KUP, KDN, SLOTS); id 0 == shipped default per shape.
+//     (id, GRID, DCT, KUP, KDN, SLOTS, UCH, DPD); id 0 == shipped default
+//     per shape.
 //   * wrapper_generated.inc — MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION for
 //     each shape's named op, the `dispatch_tunable_<shape>` helpers (inside
 //     namespace moe_monokernel), the `*_tunable_impl` free functions, and the

@@ -153,6 +153,31 @@ struct down_k_step {
   static constexpr std::uint32_t value = test<Dims>(0);
 };
 
+// DOWN_PIPE_DEPTH: down-proj weight/activation TMA ring depth (tunable via
+// the config table's DPD column).  Optional on the Dims tag; defaults to 2
+// (the classic double buffer — SHM layout and SASS byte-identical for every
+// Dims that doesn't declare it, including all named BS8/BS16 ops).  4
+// selects the rolling ring: at iter s the launcher arms slot (s+2)&3, so a
+// weight tile has two compute windows to land and the fetch stream runs
+// through the per-expert epilogue/sync bubble.  Must be a power of two so
+// `s & (DOWN_PIPE_DEPTH - 1)` folds to a mask.
+template <typename Dims>
+struct down_pipe_depth {
+ private:
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::KernelConfig::DOWN_PIPE_DEPTH) {
+    return (std::uint32_t)D::KernelConfig::DOWN_PIPE_DEPTH;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return 2u;
+  }
+
+ public:
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
 // K_STEP_UP: K-width per outer up-proj K-step.  Multiple of 128; must divide
 // Dims::HIDDEN_STATES.  Scales are still applied at every 128-K boundary
 // (the block-wise FP8 quantization granularity).
@@ -331,7 +356,30 @@ struct MoEGemmSpec {
     // Routing (Phase 1/2) sub-phases.
     int64_t t_start;
     int64_t t_after_topk;
+    // Fine topK sub-phases.  Recorded by block-0 thread-0, which owns
+    // calc warp 0 (token 0 in pass 0, token 8 in pass 1).  The *_metric /
+    // *_select splits are gated to the pass-0 token so they measure a
+    // single token's metric-build vs k-selection cost; *_pass0 / *_pass1
+    // bracket each routing pass (pass1 is BS16-only, else left at 0).
+    // Profiling-only (written under MONO_PROFILE_PHASE_TIMING).
+    int64_t t_topk_after_metric;
+    int64_t t_topk_after_select;
+    int64_t t_topk_after_pass0;
+    int64_t t_topk_after_pass1;
     int64_t t_after_sync_calc;
+    // Phase-2 quantize-warp timeline, recorded by warp 1 lane 0
+    // (threadIdx 32) — the calc/quantize warp that in Phase 2 waits on the
+    // bf16 routing-window TMA (bar_rwin) then quantizes.  Confirms the
+    // overlapped bf16 fetch + fp8 quantize are hidden under topK/prepare:
+    //   fetch-wait  = t_q_after_rwin_wait - t_q_phase2_enter  (~0 => fetch
+    //                 already landed while topK ran)
+    //   quantize    = t_q_after_quantize  - t_q_after_rwin_wait
+    // Compare t_q_after_quantize against warp 0's t_after_prepare_phaseC to
+    // see which side gates the Phase-2 trailing __syncthreads.
+    // Profiling-only.
+    int64_t t_q_phase2_enter;
+    int64_t t_q_after_rwin_wait;
+    int64_t t_q_after_quantize;
     int64_t t_after_prepare_phaseA;
     int64_t t_after_prepare_phaseB;
     int64_t t_after_prepare_phaseC;
@@ -570,6 +618,21 @@ struct MoECoreDims {
                 "Dims::N must be a multiple of K_STEP_DOWN for the WGMMA "
                 "down-projection.");
 
+  // ── Down-proj TMA pipeline depth (DOWN_PIPE_DEPTH tunable) ────────────
+  // 2 = classic double buffer (default); 4 = rolling ring with 2 K-steps
+  // of lookahead (arm slot (s+2)&3 at iter s).  See the down_pipe_depth
+  // detector for the opt-in mechanics.
+  static constexpr std::uint32_t DOWN_PIPE_DEPTH = down_pipe_depth<Dims>::value;
+  static_assert(DOWN_PIPE_DEPTH == 2u || DOWN_PIPE_DEPTH == 4u,
+                "DOWN_PIPE_DEPTH must be 2 (double buffer) or 4 (rolling "
+                "ring); other depths have no launcher implementation.");
+  static_assert(DOWN_PIPE_DEPTH == 2u ||
+                    (Dims::N / K_STEP_DOWN) % DOWN_PIPE_DEPTH == 0u,
+                "DOWN_PIPE_DEPTH == 4 requires K_TILES_DOWN (= N / "
+                "K_STEP_DOWN) to be a multiple of 4 so the cross-expert "
+                "stitch at iters K_TILES-2 / K_TILES-1 lands the next "
+                "expert's tiles 0,1 on ring slots 0,1.");
+
   // ── Up-proj outer K-step (K_STEP_UP tunable) ──────────────────────────
   static constexpr std::uint32_t K_STEP_UP = up_k_step<Dims>::value;
   static constexpr std::uint32_t K_SUBSTEPS_UP = K_STEP_UP / K_STEP_WGMMA;
@@ -700,12 +763,14 @@ struct MoE_SHM {
 
       static constexpr uint32_t DOWN_ACT_K_SUBSTEPS = CoreDims::K_SUBSTEPS_DOWN;
 
-      // Down-proj activation double-buffer: one outer K-step's worth of fp8
-      // activations = K_SUBSTEPS_DOWN SWZ128 atoms (8 tok × 128 K-bytes
-      // each).  1024-B alignment required by SWIZZLE_128B (the XOR pattern
-      // is only consistent within 1024-B-aligned regions).
+      // Down-proj activation ring (DOWN_PIPE_DEPTH slots; 2 = the classic
+      // double buffer): one outer K-step's worth of fp8 activations =
+      // K_SUBSTEPS_DOWN SWZ128 atoms (8 tok × 128 K-bytes each) per slot.
+      // 1024-B alignment required by SWIZZLE_128B (the XOR pattern is only
+      // consistent within 1024-B-aligned regions).
       alignas(1024)
-          AQ_element a_down_wgmma[2][DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
+          AQ_element a_down_wgmma[CoreDims::DOWN_PIPE_DEPTH]
+                                 [DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
                                  [FP8_ACT_NUM_CHUNKS][FP8_ACT_K_CHUNK];
 
       // Single-buffer FP8 activations covering the full K range, produced
@@ -752,9 +817,13 @@ struct MoE_SHM {
                                             [BF16_IN_FULL_BS][BF16_IN_FULL_K];
         // Up-proj weight slots (Phase 3), UP_W_SLOTS deep.
         alignas(1024) W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
-        // Down-proj weight double-buffer (Phase 4).
+        // Down-proj weight ring (Phase 4), DOWN_PIPE_DEPTH slots (2 = the
+        // classic double buffer).  Slot size scales with K_STEP_DOWN, so a
+        // 4-deep ring at KDN=128 occupies the same bytes as the 2-deep at
+        // KDN=256.
         alignas(1024) W_element
-            w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL][CoreDims::K_STEP_WGMMA];
+            w_down_wgmma[CoreDims::DOWN_PIPE_DEPTH][W_DOWN_WGMMA_M_TOTAL]
+                        [CoreDims::K_STEP_WGMMA];
       };
 
       // Per-expert down-proj activation scales, loaded once per expert
@@ -778,10 +847,31 @@ struct MoE_SHM {
           2 * shm_up_scale_cols<Dims>::value;
       S_element up_scale[2][UP_SCALE_TILE_SIZE];
 
+      // NOTE on down_out bank conflicts (measured 2026-07-15, BS16): the
+      // unpadded T_TILE=16 stride gives the epilogue writeback a 4-way
+      // STS conflict and the deferred accumulate's [col][rank] reads a
+      // 16-way LDS conflict — but padding the stride (+1 and +2 both
+      // profiled under ncu) produced NO speedup: the conflicted accesses
+      // live on prefetch warps / epilogue slots hidden behind WGMMA and
+      // TMA waits, so they are off the critical path (+1 even regressed
+      // stores by breaking the STS.64 pair merge).  Keep the compact
+      // layout; do not re-add a pad without an end-to-end win.
+      // Under MONO_BS16_DIRECT_EPILOGUE the BS16 path never touches
+      // down_out (calc warps fold final_d straight into out_accum), so
+      // its extent collapses to 1 row — reclaiming DOWN_COL_TILE×T_TILE×4
+      // bytes from the partial_result union.  That reclaim is what lets
+      // the DCT=512 raw/decoupled configs (4/5) fit the BS16 SHM budget
+      // (their full-extent layout is ~9 KB over the 232 KB opt-in cap).
+      // BS<=8 and non-macro builds keep the full extent.
+      static constexpr uint32_t DOWN_OUT_ROWS =
+  #if defined(MONO_BS16_DIRECT_EPILOGUE)
+          (Dims::BS == 16) ? 1u :
+  #endif
+                           CoreDims::DOWN_COL_TILE;
       union {
         // Down-proj per-expert output scratch (Phase-4 epilogue →
         // deferred accumulate).
-        T_element down_out[CoreDims::DOWN_COL_TILE][CoreDims::T_TILE];
+        T_element down_out[DOWN_OUT_ROWS][CoreDims::T_TILE];
         // Up-proj post-SiLU fp32 scratch: calc warps write the per-lane
         // silu(gate)*up*rw combine at the K-loop tail of expert e; PF
         // warps drain it during expert e+1's K-loop (deferred epilogue).
@@ -802,14 +892,26 @@ struct MoE_SHM {
 
       // ── mbarriers (16-B alignment required by SM90 mbarrier PTX) ─────
       // bar_w: up-proj weight pipeline, one per lookahead slot; the
-      // down-proj reuses slots 0..1 as its ping-pong.  bar_a: down-proj
-      // activation double-buffer, armed/consumed exclusively by Phase 4
-      // (re-initialized there).  bar_rwin: Phase-1 routing-window load
-      // (arrival_count = 1), waited on by warps 1..11 at the start of
-      // Phase 2.
-      alignas(16) uint64_t bar_w[UP_W_SLOTS];
-      alignas(16) uint64_t bar_a[2];
+      // down-proj reuses slots 0..DOWN_PIPE_DEPTH-1 as its ring (sized
+      // for whichever phase needs more).  bar_a: down-proj activation
+      // ring, armed/consumed exclusively by Phase 4 (re-initialized
+      // there).  bar_rwin: Phase-1 routing-window load (arrival_count =
+      // 1), waited on by warps 1..11 at the start of Phase 2.
+      static constexpr uint32_t BAR_W_COUNT =
+          (UP_W_SLOTS > CoreDims::DOWN_PIPE_DEPTH)
+              ? UP_W_SLOTS
+              : CoreDims::DOWN_PIPE_DEPTH;
+      alignas(16) uint64_t bar_w[BAR_W_COUNT];
+      alignas(16) uint64_t bar_a[CoreDims::DOWN_PIPE_DEPTH];
       alignas(16) uint64_t bar_rwin;
+      // Consumer→producer "last slot consumed" signal for the down-proj
+      // early tile-1 arm (MONO_BS16_EARLY_ARM experiment): one lane per
+      // calc warp arrives (count 8) after the LAST K-step's final WGMMA
+      // read; the launcher waits it and immediately arms the NEXT
+      // expert's tile-1 weight TMA — instead of learning the slot is
+      // free two CTA barriers later at the next expert's s=0.  Unused
+      // (dead 8 B) when the experiment macro is off.
+      alignas(16) uint64_t bar_last_empty;
 
       // ── Phase 3 → Phase 4 (expert, token) reorganization tables ──────
       //
@@ -913,7 +1015,7 @@ struct MoE_SHM {
   std::uint32_t expert_count;
 
   // Flat routing results: [tok * MAX_TOPK + k] = expert id / routing weight
-  // of the token's k-th selection.  Written by topK_BS8.  The uint64
+  // of the token's k-th selection.  Written by topK.  The uint64
   // alignment lets consumers vector-load one token's 8 ids.
   static constexpr uint32_t MAX_TOPK = 8;
   alignas(uint64_t) uint16_t

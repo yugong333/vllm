@@ -69,7 +69,7 @@ struct base_explicit_uch_or_zero {
 // by config_id.  config_id 0 always equals the bare `Base` Dims.
 template <typename Base, std::uint32_t GRID, std::uint32_t DCT,
           std::uint32_t KUP, std::uint32_t KDN, std::uint32_t SLOTS,
-          std::uint32_t UCH = 0>
+          std::uint32_t UCH = 0, std::uint32_t DPD = 0>
 struct DimsTunable {
   static constexpr uint32_t HIDDEN_STATES = Base::HIDDEN_STATES;
   static constexpr uint32_t K = Base::K;
@@ -105,6 +105,13 @@ struct DimsTunable {
                          : (((2u * N * DCT) / (128u * HIDDEN_STATES) > 0u)
                                 ? (2u * N * DCT) / (128u * HIDDEN_STATES)
                                 : 1u));
+    // Down-proj weight/activation TMA pipeline depth.  0 (default) keeps
+    // the classic 2-slot double buffer — byte-identical SHM layout and
+    // SASS for every pre-existing config.  4 selects the rolling 4-deep
+    // ring (arm slot (s+2)&3 at iter s, 2 K-steps of lookahead), which
+    // keeps DRAM busy through the per-expert epilogue/sync window on the
+    // memory-bound down phase.  Requires (N / K_STEP_DOWN) % 4 == 0.
+    static constexpr std::uint32_t DOWN_PIPE_DEPTH = (DPD != 0u) ? DPD : 2u;
     static constexpr bool USE_PAIR_LAYOUT = Base::KernelConfig::USE_PAIR_LAYOUT;
   };
 };

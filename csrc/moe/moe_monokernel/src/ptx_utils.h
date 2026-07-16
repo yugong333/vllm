@@ -246,6 +246,29 @@ __device__ static __forceinline__ void mbarrier_arrive_expect_tx(
 }
 
 /**
+ * @brief Plain arrive on an mbarrier (no transaction bytes).
+ *
+ * Consumer-side "slot empty" signal for producer/consumer pipelines: each
+ * consuming warp arrives once per phase after its last read of the guarded
+ * buffer; the producer waits the phase via mbarrier_try_wait_parity before
+ * overwriting.  The arrive carries release semantics for the consumer's
+ * prior SHM reads.
+ */
+__device__ static __forceinline__ void mbarrier_arrive(std::uint64_t* bar) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
+  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
+  [[maybe_unused]] std::uint64_t state;
+  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];\n"
+               : "=l"(state)
+               : "r"(bar_addr)
+               : "memory");
+#else
+  (void)bar;
+  asm volatile("trap;");
+#endif
+}
+
+/**
  * @brief Non-blocking parity-based wait on an mbarrier.
  *
  * Returns true iff the barrier completed for the expected phase.  Typical

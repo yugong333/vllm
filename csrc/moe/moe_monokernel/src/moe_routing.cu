@@ -66,8 +66,9 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
 }
 
 /**
- * @brief Top-K expert selection for BS <= 8 (one warp per token), writing
- * shmem->topk_ids_flat / topk_weights_flat.
+ * @brief Top-K expert selection for one token (one warp per token; BS<=16
+ * routes two tokens per warp), writing shmem->topk_ids_flat /
+ * topk_weights_flat.
  *
  * Calc warps only.
  *
@@ -91,7 +92,14 @@ __device__ static __forceinline__ void topK_one_token(
     uint32_t warp_idx, uint32_t top_k, ScoringFunc scoring_func,
     bool renormalize, const __nv_bfloat16* __restrict__ router_logits,
     MoE_SHM<Dims>* shmem, const float* __restrict__ expert_bias,
-    float routed_scaling_factor) {
+    float routed_scaling_factor, MoEGemmSpec<Dims>* spec = nullptr,
+    bool profile = false) {
+  // `spec`/`profile` are only used by MONO_PROFILE_PHASE_TIMING; both fold
+  // away in the default build.  `profile` is a compile-time constant at
+  // every call site, so the BS8/BS16 non-profiling instruction stream is
+  // unchanged.
+  (void)spec;
+  (void)profile;
   static_assert(Dims::BS * Dims::NUM_EXPERTS < UINT32_MAX,
                 "Batch size or number of experts too high for uint32 indices.");
 
@@ -103,7 +111,7 @@ __device__ static __forceinline__ void topK_one_token(
   // scores[] / expert_id[] arrays stay in registers instead of spilling
   // to local memory.
   static_assert(Dims::NUM_EXPERTS % 32u == 0u,
-                "topK_BS8 requires NUM_EXPERTS to be a multiple of 32 so "
+                "topK requires NUM_EXPERTS to be a multiple of 32 so "
                 "every thread owns exactly NUM_EXPERTS/32 experts (keeps the "
                 "per-thread arrays register-resident).");
   constexpr uint32_t MAX_PER_THREAD = Dims::NUM_EXPERTS / 32u;
@@ -127,6 +135,8 @@ __device__ static __forceinline__ void topK_one_token(
     scores[i] = (isnan(metric) || isinf(metric)) ? -FLT_MAX : metric;
     expert_id[i] = idx;
   }
+
+  MONO_PHASE_TIMESTAMP_IF(t_topk_after_metric, profile);
 
   // ── Slow path: softmax + renormalize=False ─────────────────────────────
   if (scoring_func == ScoringFunc::SOFTMAX && !renormalize) {
@@ -189,6 +199,8 @@ __device__ static __forceinline__ void topK_one_token(
     }
   }
 
+  MONO_PHASE_TIMESTAMP_IF(t_topk_after_select, profile);
+
   // Convert selected scores → weights + (re)normalize.  All lanes hold
   // identical topk arrays; thread 0 writes.
   if (tid == 0) {
@@ -249,28 +261,33 @@ __device__ static __forceinline__ void topK_one_token(
  * instruction stream is unchanged.
  */
 template <typename Dims>
-__device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
-                         bool renormalize,
-                         const __nv_bfloat16* __restrict__ router_logits,
-                         uint32_t num_tokens, MoE_SHM<Dims>* shmem,
-                         const float* __restrict__ expert_bias = nullptr,
-                         float routed_scaling_factor = 1.0f) {
-  static_assert(Dims::BS <= 16, "topK_BS8 supports BS<=16");
+__device__ void topK(uint32_t top_k, ScoringFunc scoring_func,
+                     bool renormalize,
+                     const __nv_bfloat16* __restrict__ router_logits,
+                     uint32_t num_tokens, MoE_SHM<Dims>* shmem,
+                     const float* __restrict__ expert_bias = nullptr,
+                     float routed_scaling_factor = 1.0f,
+                     MoEGemmSpec<Dims>* spec = nullptr) {
+  static_assert(Dims::BS <= 16, "topK supports BS<=16");
   using CoreDims = MoECoreDims<Dims>;
+  (void)spec;  // only read by MONO_PROFILE_PHASE_TIMING
 
   const uint32_t warp_idx = get_calc_warp<Dims>();
   if (warp_idx < num_tokens) {
+    // pass 0 carries the per-token metric/select split (thread 0 → token 0).
     topK_one_token<Dims>(warp_idx, top_k, scoring_func, renormalize,
                          router_logits, shmem, expert_bias,
-                         routed_scaling_factor);
+                         routed_scaling_factor, spec, /*profile=*/true);
   }
+  MONO_PHASE_TIMESTAMP(t_topk_after_pass0);
   if constexpr (Dims::BS == 16) {
     const uint32_t tok2 = warp_idx + CoreDims::CALC_WARP_COUNT;  // 8..15
     if (tok2 < num_tokens) {
       topK_one_token<Dims>(tok2, top_k, scoring_func, renormalize,
                            router_logits, shmem, expert_bias,
-                           routed_scaling_factor);
+                           routed_scaling_factor, spec, /*profile=*/false);
     }
+    MONO_PHASE_TIMESTAMP(t_topk_after_pass1);
   }
 }
 

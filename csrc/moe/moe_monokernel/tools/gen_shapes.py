@@ -303,18 +303,27 @@ def config_uch_arg(c):
     return int(c.get("uch", 0) or 0)
 
 
+def config_dpd_arg(c):
+    """Explicit DOWN_PIPE_DEPTH template arg for DimsTunable; 0 means the
+    classic 2-slot double buffer (default, byte-identical to pre-knob)."""
+    return int(c.get("dpd", 0) or 0)
+
+
 def config_x_line(c):
     note = f"  /* {c['note']} */" if c.get("note") else ""
     return (
         f"  X({c['id']}, {c['grid']}, {c['dct']}, {c['kup']}, "
-        f"{c['kdn']}, {c['slots']}, {config_uch_arg(c)}){note}"
+        f"{c['kdn']}, {c['slots']}, {config_uch_arg(c)}, "
+        f"{config_dpd_arg(c)}){note}"
     )
 
 
 def emit_config_table(shapes):
     """MONO_CONFIGS_<KEY>(X) X-macro tables.
 
-    Columns: id, GRID, DCT, KUP, KDN, SLOTS, explicit UCH (0 = derive/preserve).
+    Columns: id, GRID, DCT, KUP, KDN, SLOTS, explicit UCH (0 =
+    derive/preserve), explicit DPD (down TMA pipe depth; 0 = classic
+    2-slot double buffer).
     """
     out = [GEN_HEADER]
     for s in shapes:
@@ -326,9 +335,7 @@ def emit_config_table(shapes):
         if ids16:
             out.append(f"#define MONO_CONFIGS_BS16_{nm}(X) \\")
             out.append(
-                " \\\n".join(
-                    config_x_line(c) for c in s["configs"] if c["id"] in ids16
-                )
+                " \\\n".join(config_x_line(c) for c in s["configs"] if c["id"] in ids16)
             )
             out.append("")
     return "\n".join(out)
@@ -368,21 +375,20 @@ def emit_wrapper(shapes):
         out.append("    const std::optional<torch::Tensor>& eb, double rsf,")
         out.append("    int64_t config_id) {")
         out.append(
-            "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH)           " + "\\"
+            "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH, DPD)      " + "\\"
         )
-        out.append(
-            "  case ID:                                              " + "\\"
-        )
+        out.append("  case ID:                                              " + "\\")
         out.append(
             "    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
-            "KDN, SLOTS, UCH>>(  " + "\\"
+            "KDN, SLOTS, UCH, DPD>>(  " + "\\"
         )
         out.append(
             "        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
             "eb, rsf,       " + "\\"
         )
         out.append(
-            f'        "{nm}_cfg" #ID);                                             ' + "\\"
+            f'        "{nm}_cfg" #ID);                                             '
+            + "\\"
         )
         out.append("    return;")
         out.append("  switch (config_id) {")
@@ -408,21 +414,22 @@ def emit_wrapper(shapes):
             out.append("    const std::optional<torch::Tensor>& eb, double rsf,")
             out.append("    int64_t config_id) {")
             out.append(
-                "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH)           " + "\\"
+                "#define X(ID, GRID, DCT, KUP, KDN, SLOTS, UCH, DPD)      " + "\\"
             )
             out.append(
                 "  case ID:                                              " + "\\"
             )
             out.append(
                 "    launch_moe_monokernel<DimsTunable<Base, GRID, DCT, KUP, "
-                "KDN, SLOTS, UCH>>(  " + "\\"
+                "KDN, SLOTS, UCH, DPD>>(  " + "\\"
             )
             out.append(
                 "        ai, rl, ewu, esu, ewd, esd, ao, sp, top_k, sf, renorm, "
                 "eb, rsf,       " + "\\"
             )
             out.append(
-                f'        "{nm}_bs16_cfg" #ID);                                  ' + "\\"
+                f'        "{nm}_bs16_cfg" #ID);                                  '
+                + "\\"
             )
             out.append("    return;")
             out.append("  switch (config_id) {")
@@ -708,6 +715,7 @@ def emit_python(data):
                 k_step_down=c["kdn"],
                 up_w_slots=c["slots"],
                 up_col_halves=uch_by_cfg[c["id"]],
+                down_pipe_depth=(config_dpd_arg(c) or 2),
             )
             for c in s["configs"]
         }
