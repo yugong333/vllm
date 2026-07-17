@@ -320,57 +320,27 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     shm->out_accum[tok][col] = 0.f;
   }
   constexpr std::uint32_t DOWN_PIPE_DEPTH = CoreDims::DOWN_PIPE_DEPTH;
-  // MONO_BS16_EARLY_ARM experiment (BS16, 2-slot ring only): calc warps
-  // signal "last K-step's slot consumed" on bar_last_empty (one lane per
-  // calc warp) right after the final WGMMA read, and the launcher arms
-  // the NEXT expert's tile-1 weight TMA on that signal — concurrent with
-  // the epilogue and both expert-boundary CTA syncs, instead of two
-  // barriers later at the next expert's s=0.  Targets the measured
-  // exposed fetch waits (iter0 0.95 µs + iter1 0.40 µs per expert).
-  #if defined(MONO_BS16_EARLY_ARM)
-  constexpr bool EARLY_ARM_ACTIVE =
-      (Dims::BS == 16 && DOWN_PIPE_DEPTH == 2u);
-  #else
-  constexpr bool EARLY_ARM_ACTIVE = false;
-  #endif
+  constexpr std::uint32_t DOWN_WEIGHT_SLOTS = CoreDims::DOWN_WEIGHT_SLOTS;
+  constexpr bool WEIGHT_ONLY_DEEP = DOWN_WEIGHT_SLOTS != DOWN_PIPE_DEPTH;
   if (is_tma_launcher_thread<Dims>()) {
-#pragma unroll
-    for (std::uint32_t i = 0; i < DOWN_PIPE_DEPTH; ++i) {
+  #pragma unroll
+    for (std::uint32_t i = 0; i < DOWN_WEIGHT_SLOTS; ++i) {
       mbarrier_init(&shm->bar_w[i], 1u);
-      mbarrier_init(&shm->bar_a[i], 1u);
     }
-    if constexpr (EARLY_ARM_ACTIVE) {
-      mbarrier_init(&shm->bar_last_empty, CoreDims::CALC_WARP_COUNT);
+  #pragma unroll
+    for (std::uint32_t i = 0; i < DOWN_PIPE_DEPTH; ++i) {
+      mbarrier_init(&shm->bar_a[i], 1u);
     }
     fence_mbarrier_init_release_cluster();
   }
   __syncthreads();
 
-  MONO_PHASE_TIMESTAMP(t_down_after_prologue);
-
   const std::uint32_t expert_count = shmem->expert_count;
 
-  // Parity state is hoisted OUT of the expert loop: for K_TILES_DOWN ==
-  // DOWN_PIPE_DEPTH each slot is visited once per expert and ends at
-  // phase 1, so a blind per-expert reset to 0 would deadlock the next
-  // expert's wait.  Keeping it continuous works for any K_TILES_DOWN.
-  std::uint32_t parity_w[DOWN_PIPE_DEPTH] = {};
+  // Parity state is hoisted out of the expert loop and follows each ring's
+  // independent continuous logical stream.
+  std::uint32_t parity_w[DOWN_WEIGHT_SLOTS] = {};
   std::uint32_t parity_a[DOWN_PIPE_DEPTH] = {};
-  // Launcher-side phase for bar_last_empty (one completed phase per
-  // expert — every expert's calc warps arrive exactly once; the launcher
-  // consumes a phase only when a next expert exists, which stays aligned
-  // because parity is tracked per WAIT).
-  [[maybe_unused]] std::uint32_t parity_empty = 0u;
-
-  // NOTE (2026-07-15): a DEFERRED epilogue writeback (drain final_d →
-  // down_out at the NEXT expert's s=0, overlapping the tile-0 bar_w
-  // wait, with the PF accumulate window shifted to s >= 1) was fully
-  // implemented and ncu-profiled: 144.19 µs vs 144.64 µs baseline —
-  // within noise.  The MONO_PROFILE_SKIP_DOWN_WRITEBACK bound (~11 µs)
-  // is dominated by dead-code elimination of the final_d scale-apply
-  // FMA chain, not the SHM stores (~0.16 µs/expert, matching the phase
-  // timing).  Reverted to keep the simpler in-loop epilogue; do not
-  // re-attempt without a plan that overlaps the scale-apply ARITHMETIC.
 
   // ── Per-expert loop (start = down_group, stride = DOWN_GROUPS) ────────
   for (std::uint32_t e = down_group; e < expert_count; e += DOWN_GROUPS) {
@@ -403,8 +373,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // Load weight scales (warp 9) + per-expert activation scales (warp 8)
     // in parallel; both are fixed across the expert's K-steps.
     if (is_prefetch_warp<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-    #pragma unroll
+  #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         moe_load_down_wgmma_weight_scale_tile<Dims>(
             expert_scales_down, id, base_col + h * 128u, shm->w_down_scale[h]);
@@ -412,7 +381,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       moe_load_down_wgmma_act_scale_per_expert<
           Dims, Dims::N / CoreDims::DOWN_ACT_BLOCK_SIZE, CoreDims::T_TILE,
           /*RunPw=*/0u>(spec, shmem, id, shm->a_down_scale);
-  #endif
     }
 
     // ── Priming: K-step 0 weight + activation TMAs ────────────────────
@@ -426,26 +394,17 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     // (kk*DOWN_COL_HALVES + h)*128.  All atoms retire into one bar_w arm.
     const bool need_first_expert_prime = (e == down_group);
     if (need_first_expert_prime && is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-      // 2-deep: prime K-step 0 only (the in-loop launcher covers s+1).
-      // 4-deep: prime K-steps 0 AND 1 into ring slots 0,1 — the in-loop
-      // launcher then arms slot (s+2)&3 each iter, so it fills slots 2,3
-      // at s=0,1 and cross-stitches the NEXT expert into slots 0,1 at the
-      // last two iters.
-      // EARLY_ARM (BS16, 2-deep): prime K-steps 0 AND 1 — for non-first
-      // experts tile 1 is early-armed by the previous expert's launcher,
-      // so the first expert must be primed to the same depth (the s=0
-      // intra arm is skipped on this path).
-      constexpr std::uint32_t PRIME_STEPS =
-          (DOWN_PIPE_DEPTH == 4u || EARLY_ARM_ACTIVE) ? 2u : 1u;
-    #pragma unroll
-      for (std::uint32_t ps = 0; ps < PRIME_STEPS; ++ps) {
+      constexpr std::uint32_t WEIGHT_PRIME_STEPS =
+          WEIGHT_ONLY_DEEP ? 2u : (DOWN_PIPE_DEPTH == 4u ? 2u : 1u);
+      constexpr std::uint32_t ACT_PRIME_STEPS = DOWN_PIPE_DEPTH == 4u ? 2u : 1u;
+  #pragma unroll
+      for (std::uint32_t ps = 0; ps < WEIGHT_PRIME_STEPS; ++ps) {
         const std::uint32_t prime_k = ps * K_STEP_DOWN;
         mbarrier_arrive_expect_tx(&shm->bar_w[ps],
                                   /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             W_element* dest_base =
                 &shm->w_down_wgmma[ps][(kk * DOWN_COL_HALVES + h) * 128u][0];
@@ -461,11 +420,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         // Activation tile — only when tokens route to this expert.  With
         // routed_count == 0 nothing is armed; the WGMMA computes on
         // garbage that the rank-filtered accumulate never reads (fp8 e4m3
-        // has no NaN encoding, so garbage can't fault).
-        if (routed_count > 0u) {
+        // has no NaN encoding, so garbage can't fault).  The weight-only
+        // ring deliberately primes just activation tile 0.
+        if (ps < ACT_PRIME_STEPS && routed_count > 0u) {
           mbarrier_arrive_expect_tx(&shm->bar_a[ps],
                                     /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
             tma_load_down_wgmma_activation_bulk(
                 down_activations_desc,
@@ -476,39 +436,22 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           }
         }
       }
-  #endif
     }
 
     // ── BS16: expert-top activation issue (non-first experts) ──────────
-    // The cross-expert stitch (last K-step launcher branch) issues ONLY
-    // the next expert's weight tiles on the BS16 path; the activation
-    // tiles for THIS expert are issued here instead.  Publication gating
-    // is inherited for free: the warp-8 act-scale loader above polls the
-    // very same scale-sentinel cells for this expert and ends with
-    // __threadfence + __syncwarp, so this launcher-issued TMA (later in
-    // warp-8 program order) can only run once the fp8 payload is
-    // published.  This removes the sentinel poll from the PREVIOUS
-    // expert's launcher branch, where it stalled the whole block's
-    // K-loop trailing __syncthreads whenever the next expert's up-group
-    // was late.  The 4 KB activation fetch overlaps the 64 KB weight
-    // wait at s=0 (bar_w before bar_a on the calc side).
+    // Publication gating is inherited from the warp-8 act-scale loader
+    // above: it polls this expert's scale sentinels and ends with
+    // __threadfence + __syncwarp, so this later warp-8 TMA issue can only run
+    // once the fp8 payload is published.
     if constexpr (Dims::BS == 16) {
       if (!need_first_expert_prime && is_tma_launcher_thread<Dims>() &&
           routed_count > 0u) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-        // Mirror the prime: tiles 0..PRIME_STEPS-1 (1 for the 2-deep
-        // buffer, 2 for the 4-deep ring or the EARLY_ARM path, whose
-        // s=0 intra arm is skipped); later tiles come from the in-loop
-        // s+1 / (s+2)&3 arms as usual.  Slots 0,1 are safe to fill here:
-        // their last consumers were the previous expert's K-steps,
-        // ordered behind the expert-bottom sync.
-        constexpr std::uint32_t ACT_TOP_STEPS =
-            (DOWN_PIPE_DEPTH == 4u || EARLY_ARM_ACTIVE) ? 2u : 1u;
-    #pragma unroll
+        constexpr std::uint32_t ACT_TOP_STEPS = DOWN_PIPE_DEPTH == 4u ? 2u : 1u;
+  #pragma unroll
         for (std::uint32_t ps = 0; ps < ACT_TOP_STEPS; ++ps) {
           mbarrier_arrive_expect_tx(&shm->bar_a[ps],
                                     /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
             tma_load_down_wgmma_activation_bulk(
                 down_activations_desc,
@@ -518,16 +461,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 /*bar_smem_ptr=*/&shm->bar_a[ps]);
           }
         }
-  #endif
       }
     }
 
     // Publish the prologue zero-fill + mbarrier inits and this expert's
     // scale tiles before the WGMMA consumers wait on the barriers.
     __syncthreads();
-
-    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_scales,
-                            e == down_group + DOWN_GROUPS);
 
     // ── Main K-loop ─────────────────────────────────────────────────────
     // Per step: calc warps wait bar_w/bar_a and run the WGMMA chain; the
@@ -537,43 +476,41 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     const bool has_prev_expert = (e != down_group);
     const std::uint32_t prev_id =
         has_prev_expert ? shmem->experts[e - DOWN_GROUPS].id : 0u;
+    const std::uint32_t expert_ordinal = (e - down_group) / DOWN_GROUPS;
     for (std::uint32_t s = 0; s < K_TILES_DOWN; ++s) {
-      const std::uint32_t read_slot = s & (DOWN_PIPE_DEPTH - 1u);
+      const std::uint32_t logical_weight_tile =
+          expert_ordinal * K_TILES_DOWN + s;
+      const std::uint32_t read_w_slot =
+          logical_weight_tile & (DOWN_WEIGHT_SLOTS - 1u);
+      const std::uint32_t read_a_slot = s & (DOWN_PIPE_DEPTH - 1u);
 
       if (is_calc) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-        while (!mbarrier_try_wait_parity(&shm->bar_w[read_slot],
-                                         parity_w[read_slot])) {
+        while (!mbarrier_try_wait_parity(&shm->bar_w[read_w_slot],
+                                         parity_w[read_w_slot])) {
         }
-        parity_w[read_slot] ^= 1;
+        parity_w[read_w_slot] ^= 1;
 
         if (routed_count > 0u) {
-          while (!mbarrier_try_wait_parity(&shm->bar_a[read_slot],
-                                           parity_a[read_slot])) {
+          while (!mbarrier_try_wait_parity(&shm->bar_a[read_a_slot],
+                                           parity_a[read_a_slot])) {
           }
-          parity_a[read_slot] ^= 1;
+          parity_a[read_a_slot] ^= 1;
         }
-  #endif
-        MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter0_after_wait,
-                                e == down_group + DOWN_GROUPS && s == 0u);
-        MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter1_after_wait,
-                                e == down_group + DOWN_GROUPS && s == 1u);
 
-  #ifndef MONO_PROFILE_SKIP_CALC_DOWN
         const void* a_slot_base =
-            (const void*)&shm->w_down_wgmma[read_slot][0][0];
+            (const void*)&shm->w_down_wgmma[read_w_slot][0][0];
         const std::uint32_t wg_offset_bytes = is_wg1 ? 8192u : 0u;
         constexpr std::uint32_t W_ATOM_BYTES = DOWN_W_TX_BYTES_PER_HALF;
 
         constexpr std::uint32_t A_K_STRIDE = 2u * A_LBO;
         constexpr std::uint32_t B_K_STRIDE = 2u * B_LBO;
         const void* b_slot_base =
-            (const void*)&shm->a_down_wgmma[read_slot][0][0][0][0];
+            (const void*)&shm->a_down_wgmma[read_a_slot][0][0][0][0];
         // Bytes per K-substep activation atom: T_TILE rows × 128 B/row
         // (1024 B at BS<=8, 2048 B at BS=16).
         constexpr std::uint32_t B_SUBSTEP_BYTES = CoreDims::T_TILE * 128u;
 
-    #pragma unroll
+  #pragma unroll
         for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
           // One fence per commit/wait pair; hoisting it out of the kk loop
           // would merge the substeps into one WGMMA supergroup without the
@@ -583,7 +520,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           const void* b_kk_base =
               (const void*)((const char*)b_slot_base + kk * B_SUBSTEP_BYTES);
 
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             const std::uint32_t atom_off_bytes =
                 (kk * DOWN_COL_HALVES + h) * W_ATOM_BYTES;
@@ -591,8 +528,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                 (const void*)((const char*)a_slot_base + atom_off_bytes +
                               wg_offset_bytes);
 
-              // 2 chained WGMMAs into the lo chunk (K[0..63])...
-    #pragma unroll
+            // 2 chained WGMMAs into the lo chunk (K[0..63])...
+  #pragma unroll
             for (std::uint32_t j = 0; j < 2; ++j) {
               const void* a_ptr =
                   (const void*)((const char*)a_base + j * A_K_STRIDE);
@@ -618,8 +555,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               }
             }
 
-              // ...and 2 into the hi chunk (K[64..127]).
-    #pragma unroll
+            // ...and 2 into the hi chunk (K[64..127]).
+  #pragma unroll
             for (std::uint32_t j = 2; j < WGMMAS_PER_SUBSTEP; ++j) {
               const void* a_ptr =
                   (const void*)((const char*)a_base + j * A_K_STRIDE);
@@ -666,7 +603,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           const std::uint32_t ws_col =
               (W_DOWN_SCALE_COLS > 1) ? (s * K_SUBSTEPS_DOWN + kk) : 0u;
 
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
             const float ws = shm->w_down_scale[h][my_wg][ws_col];
             final_d[h][0] += chunk_d_lo[h][0] * as_lo_02 * ws +
@@ -693,7 +630,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             const float as_hi_46 = shm->a_down_scale[block_hi][tok_46];
             const float as_lo_57 = shm->a_down_scale[block_lo][tok_57];
             const float as_hi_57 = shm->a_down_scale[block_hi][tok_57];
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
               const float ws = shm->w_down_scale[h][my_wg][ws_col];
               final_d_hi[h][0] += chunk_d_lo_hi[h][0] * as_lo_46 * ws +
@@ -710,25 +647,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   chunk_d_hi_hi[h][3] = 0.f;
             }
           }
-          MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter0_after_compute,
-                                  e == down_group + DOWN_GROUPS && s == 0u &&
-                                      kk == K_SUBSTEPS_DOWN - 1u);
-          MONO_PHASE_TIMESTAMP_IF(t_down_e1_iter1_after_compute,
-                                  e == down_group + DOWN_GROUPS && s == 1u &&
-                                      kk == K_SUBSTEPS_DOWN - 1u);
         }  // end kk substep loop
-  #endif
-        if constexpr (EARLY_ARM_ACTIVE) {
-          // "Last slot consumed" signal for the launcher's early tile-1
-          // arm.  Program-ordered after the step's wgmma_wait_group, so
-          // every SHM read of slot (K_TILES_DOWN-1)&1 has retired.  One
-          // lane per calc warp → arrival count CALC_WARP_COUNT.  Kept
-          // OUTSIDE the SKIP_CALC_DOWN guard so the launcher's wait
-          // cannot deadlock under that profiling flag.
-          if (s == K_TILES_DOWN - 1u && lane == 0u) {
-            mbarrier_arrive(&shm->bar_last_empty);
-          }
-        }
       }
 
       // Launcher (in parallel with the WGMMAs above):
@@ -747,8 +666,86 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                     "either disable the lookahead branch or introduce a "
                     "per-expert slot offset.");
       if (is_tma_launcher_thread<Dims>()) {
-  #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-        if constexpr (DOWN_PIPE_DEPTH == 4u) {
+        if constexpr (WEIGHT_ONLY_DEEP) {
+          // Four weight stages over a continuous two-tiles-per-expert
+          // stream, while activations remain the classic two-deep ring.
+          // At logical tile q, issue q+2: next expert's tile s.  The
+          // destination is distinct from both current-expert weight slots.
+          static_assert(K_TILES_DOWN == 2u && DOWN_WEIGHT_SLOTS == 4u &&
+                            DOWN_PIPE_DEPTH == 2u,
+                        "weight-only lookahead schedule requires 2 K-tiles, "
+                        "4 weight slots, and 2 activation slots");
+          if (e + DOWN_GROUPS < expert_count) {
+            const std::uint32_t next_e = e + DOWN_GROUPS;
+            const std::uint32_t next_id = shmem->experts[next_e].id;
+            const std::uint32_t la_slot =
+                (logical_weight_tile + 2u) & (DOWN_WEIGHT_SLOTS - 1u);
+            const std::uint32_t next_k_start = s * K_STEP_DOWN;
+            mbarrier_arrive_expect_tx(&shm->bar_w[la_slot],
+                                      /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
+  #pragma unroll
+            for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+  #pragma unroll
+              for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
+                W_element* dest_base =
+                    &shm->w_down_wgmma[la_slot]
+                                      [(kk * DOWN_COL_HALVES + h) * 128u][0];
+                tma_load_down_wgmma_tile(
+                    down_weights_desc, /*expert_id=*/next_id,
+                    /*K=*/Dims::HIDDEN_STATES,
+                    /*base_col=*/base_col + h * 128u,
+                    /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                    /*dest_smem_ptr=*/(void*)dest_base,
+                    /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
+              }
+            }
+          }
+
+          // Activation remains two-deep: fetch the current expert's tile 1
+          // during tile 0.  BS16 gets the next expert's tile 0 at expert top
+          // after publication; BS<=8 retains its legacy tail poll+issue.
+          if (s + 1u < K_TILES_DOWN && routed_count > 0u) {
+            const std::uint32_t next_a_slot = (s + 1u) & (DOWN_PIPE_DEPTH - 1u);
+            const std::uint32_t next_k_start = (s + 1u) * K_STEP_DOWN;
+            mbarrier_arrive_expect_tx(&shm->bar_a[next_a_slot],
+                                      /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+  #pragma unroll
+            for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+              tma_load_down_wgmma_activation_bulk(
+                  down_activations_desc,
+                  /*k_start=*/next_k_start + kk * K_STEP_WGMMA,
+                  /*expert_slot_start=*/expert_start,
+                  /*dest_smem_ptr=*/
+                  &shm->a_down_wgmma[next_a_slot][kk][0][0][0],
+                  /*bar_smem_ptr=*/&shm->bar_a[next_a_slot]);
+            }
+          }
+          if constexpr (Dims::BS != 16) {
+            if (s + 1u >= K_TILES_DOWN && e + DOWN_GROUPS < expert_count) {
+              const std::uint32_t next_e = e + DOWN_GROUPS;
+              const std::uint32_t next_id = shmem->experts[next_e].id;
+              const std::uint32_t next_routed_count =
+                  static_cast<std::uint32_t>(shm->expert_routed_count[next_id]);
+              const std::uint32_t next_expert_start =
+                  static_cast<std::uint32_t>(shm->expert_slot_start[next_id]);
+              if (next_routed_count > 0u) {
+                moe_wait_expert_scales_published<Dims>(
+                    spec, shmem, next_expert_start, next_routed_count);
+                mbarrier_arrive_expect_tx(&shm->bar_a[0],
+                                          /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
+  #pragma unroll
+                for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
+                  tma_load_down_wgmma_activation_bulk(
+                      down_activations_desc,
+                      /*k_start=*/kk * K_STEP_WGMMA,
+                      /*expert_slot_start=*/next_expert_start,
+                      /*dest_smem_ptr=*/&shm->a_down_wgmma[0][kk][0][0][0],
+                      /*bar_smem_ptr=*/&shm->bar_a[0]);
+                }
+              }
+            }
+          }
+        } else if constexpr (DOWN_PIPE_DEPTH == 4u) {
           // ── 4-deep rolling ring, arm distance 2 ─────────────────────
           // At iter s arm ring slot (s+2)&3 for the tile its consumer
           // reads 2 iters later, giving each weight TMA two compute
@@ -773,26 +770,25 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             const std::uint32_t nk = la_tile * K_STEP_DOWN;
             mbarrier_arrive_expect_tx(&shm->bar_w[la_slot],
                                       /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
+  #pragma unroll
               for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
                 W_element* dest_base =
                     &shm->w_down_wgmma[la_slot]
                                       [(kk * DOWN_COL_HALVES + h) * 128u][0];
-                tma_load_down_wgmma_tile(
-                    down_weights_desc, /*expert_id=*/id,
-                    /*K=*/Dims::HIDDEN_STATES,
-                    /*base_col=*/base_col + h * 128u,
-                    /*k_start=*/nk + kk * K_STEP_WGMMA,
-                    /*dest_smem_ptr=*/(void*)dest_base,
-                    /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
+                tma_load_down_wgmma_tile(down_weights_desc, /*expert_id=*/id,
+                                         /*K=*/Dims::HIDDEN_STATES,
+                                         /*base_col=*/base_col + h * 128u,
+                                         /*k_start=*/nk + kk * K_STEP_WGMMA,
+                                         /*dest_smem_ptr=*/(void*)dest_base,
+                                         /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
               }
             }
             if (routed_count > 0u) {
               mbarrier_arrive_expect_tx(&shm->bar_a[la_slot],
                                         /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
               for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
                 tma_load_down_wgmma_activation_bulk(
                     down_activations_desc,
@@ -815,20 +811,20 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             const std::uint32_t nk = next_tile * K_STEP_DOWN;
             mbarrier_arrive_expect_tx(&shm->bar_w[la_slot],
                                       /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
+  #pragma unroll
               for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
                 W_element* dest_base =
                     &shm->w_down_wgmma[la_slot]
                                       [(kk * DOWN_COL_HALVES + h) * 128u][0];
-                tma_load_down_wgmma_tile(
-                    down_weights_desc, /*expert_id=*/next_id,
-                    /*K=*/Dims::HIDDEN_STATES,
-                    /*base_col=*/base_col + h * 128u,
-                    /*k_start=*/nk + kk * K_STEP_WGMMA,
-                    /*dest_smem_ptr=*/(void*)dest_base,
-                    /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
+                tma_load_down_wgmma_tile(down_weights_desc,
+                                         /*expert_id=*/next_id,
+                                         /*K=*/Dims::HIDDEN_STATES,
+                                         /*base_col=*/base_col + h * 128u,
+                                         /*k_start=*/nk + kk * K_STEP_WGMMA,
+                                         /*dest_smem_ptr=*/(void*)dest_base,
+                                         /*bar_smem_ptr=*/&shm->bar_w[la_slot]);
               }
             }
             if constexpr (Dims::BS != 16) {
@@ -841,7 +837,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                     spec, shmem, next_expert_start, next_routed_count);
                 mbarrier_arrive_expect_tx(&shm->bar_a[la_slot],
                                           /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
                 for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
                   tma_load_down_wgmma_activation_bulk(
                       down_activations_desc,
@@ -861,19 +857,15 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               (void)nk;
             }
           }
-        } else if ((s + 1 < K_TILES_DOWN) && (!EARLY_ARM_ACTIVE || s > 0)) {
-          // (EARLY_ARM: the s=0 arm is skipped — tile 1's weights were
-          // early-armed by the previous expert's launcher, or by the
-          // prime for the group's first expert, and tile 1's activations
-          // were issued at the expert top.)
+        } else if (s + 1 < K_TILES_DOWN) {
           const std::uint32_t next_slot = (s + 1) & 1;
           const std::uint32_t next_k_start = (s + 1) * K_STEP_DOWN;
 
           mbarrier_arrive_expect_tx(&shm->bar_w[next_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
               W_element* dest_base =
                   &shm->w_down_wgmma[next_slot]
@@ -891,7 +883,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           if (routed_count > 0u) {
             mbarrier_arrive_expect_tx(&shm->bar_a[next_slot],
                                       /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
               tma_load_down_wgmma_activation_bulk(
                   down_activations_desc,
@@ -902,22 +894,16 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   /*bar_smem_ptr=*/&shm->bar_a[next_slot]);
             }
           }
-        } else if (s + 1 >= K_TILES_DOWN && e + DOWN_GROUPS < expert_count) {
-          // (The explicit `s + 1 >= K_TILES_DOWN` guard matters on the
-          // EARLY_ARM path: the intra branch above also rejects s == 0
-          // there, and without this guard s=0 would FALL THROUGH into
-          // the cross-expert stitch — double-arming slots still being
-          // read.  For non-EARLY_ARM builds the condition is redundant
-          // and folds away.)
+        } else if (e + DOWN_GROUPS < expert_count) {
           const std::uint32_t lookahead_slot = (s + 1) & 1;  // == 0
           const std::uint32_t next_e = e + DOWN_GROUPS;
           const std::uint32_t next_id = shmem->experts[next_e].id;
 
           mbarrier_arrive_expect_tx(&shm->bar_w[lookahead_slot],
                                     /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
           for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
+  #pragma unroll
             for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
               W_element* dest_base =
                   &shm->w_down_wgmma[lookahead_slot]
@@ -932,39 +918,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             }
           }
 
-          if constexpr (EARLY_ARM_ACTIVE) {
-            // EARLY tile-1 arm: wait for the calc warps' "last slot
-            // consumed" signal (arrives right after this step's final
-            // WGMMA read — i.e. the end of C), then immediately arm +
-            // issue the NEXT expert's tile-1 weights into slot 1.
-            // Without this, the arm waits for the epilogue + bottom
-            // sync + top sync (the next expert's s=0 launcher branch),
-            // leaving the tile-1 fetch latency exposed as the measured
-            // iter1 wait.  The launcher spins here concurrently with
-            // the calc epilogue/syncs — off every CTA-barrier path.
-            while (!mbarrier_try_wait_parity(&shm->bar_last_empty,
-                                             parity_empty)) {
-            }
-            parity_empty ^= 1u;
-            mbarrier_arrive_expect_tx(&shm->bar_w[1],
-                                      /*tx_bytes=*/DOWN_W_TX_BYTES_TOTAL);
-    #pragma unroll
-            for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
-    #pragma unroll
-              for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-                W_element* dest_base =
-                    &shm->w_down_wgmma[1]
-                                      [(kk * DOWN_COL_HALVES + h) * 128u][0];
-                tma_load_down_wgmma_tile(
-                    down_weights_desc, /*expert_id=*/next_id,
-                    /*K=*/Dims::HIDDEN_STATES,
-                    /*base_col=*/base_col + h * 128u,
-                    /*k_start=*/K_STEP_DOWN + kk * K_STEP_WGMMA,
-                    /*dest_smem_ptr=*/(void*)dest_base,
-                    /*bar_smem_ptr=*/&shm->bar_w[1]);
-              }
-            }
-          }
           if constexpr (Dims::BS != 16) {
             // BS<=8 (legacy placement): sentinel-gate + issue the next
             // expert's activation tile here.  The next expert's fp8
@@ -980,7 +933,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
                   spec, shmem, next_expert_start, next_routed_count);
               mbarrier_arrive_expect_tx(&shm->bar_a[lookahead_slot],
                                         /*tx_bytes=*/DOWN_A_TX_BYTES_TOTAL);
-    #pragma unroll
+  #pragma unroll
               for (std::uint32_t kk = 0; kk < K_SUBSTEPS_DOWN; ++kk) {
                 tma_load_down_wgmma_activation_bulk(
                     down_activations_desc,
@@ -992,15 +945,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               }
             }
           }
-          // BS16: the next expert's activation tile is issued at ITS OWN
-          // expert-top launcher block instead (behind the warp-8 scale
-          // loader's publication poll + __syncwarp), so a late-publishing
-          // next expert can no longer stall THIS expert's K-loop trailing
-          // __syncthreads via the launcher spinning in the sentinel poll.
-          // The 4 KB activation fetch is covered by the 64 KB weight
-          // wait at the next expert's s=0.
         }
-  #endif
       }
 
       // ── Deferred accumulate of the PREVIOUS expert (prefetch warps) ──
@@ -1019,14 +964,8 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // sync); down_rank is routing-recorded and immutable in Phase 4;
       // slices are disjoint so += never double-adds.
       if (is_prefetch_warp<Dims>()) {
-  #if !defined(MONO_PROFILE_SKIP_CALC_DOWN) &&     \
-      !defined(MONO_PROFILE_SKIP_DOWN_EPILOGUE) && \
-      !defined(MONO_PROFILE_SKIP_DOWN_ACCUM)
         constexpr unsigned NUM_ACC_STEPS =
             (K_TILES_DOWN > 1u) ? (K_TILES_DOWN - 1u) : 1u;
-        MONO_PHASE_TIMESTAMP_IF_TID(
-            t_down_e1_pf_before_accum, e == down_group + DOWN_GROUPS && s == 0u,
-            CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP);
         if (has_prev_expert && s < NUM_ACC_STEPS) {
           const unsigned acc_slice = s;
           const unsigned thread_in_pf =
@@ -1035,7 +974,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           constexpr unsigned PF_THREADS =
               CoreDims::PREFETCH_WARP_COUNT * CoreDims::THREADS_PER_WARP;
           if constexpr (Dims::BS == 16) {
-  #if !defined(MONO_BS16_DIRECT_EPILOGUE)
             // BS16: per-RANK accumulate via the slot→token inverse map.
             // Iterate ONLY the previous expert's routed ranks —
             // out_accum[slot_to_token[prev_start+rank]][col] +=
@@ -1061,8 +999,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               shm->out_accum[tok][col] +=
                   shm->partial_result.down_out[col][rank];
             }
-  #endif  // !MONO_BS16_DIRECT_EPILOGUE (direct: calc accumulated at the
-          // previous expert's epilogue; nothing staged to drain here)
           } else {
             const uint8_t* prev_rank = shm->down_rank[prev_id];
             // Slice s covers [floor(s*total/N), floor((s+1)*total/N)):
@@ -1082,10 +1018,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
             }
           }
         }
-        MONO_PHASE_TIMESTAMP_IF_TID(
-            t_down_e1_pf_after_accum, e == down_group + DOWN_GROUPS && s == 0u,
-            CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP);
-  #endif
       }
 
       // Align all warps before the next step's WGMMA reads the new slot.
@@ -1108,58 +1040,13 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
     }  // end K-loop
 
-    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_kloop, e == down_group);
-    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_kloop,
-                            e == down_group + DOWN_GROUPS);
-
     // ── End-of-expert: final_d → down_out[DOWN_COL_TILE][8] ─────────────
     // Half h covers output cols [base_col + h*128, +128); within a half,
     // WG1 owns the upper 64 cols.
     if (is_calc) {
-  #if !defined(MONO_PROFILE_SKIP_CALC_DOWN) &&     \
-      !defined(MONO_PROFILE_SKIP_DOWN_EPILOGUE) && \
-      !defined(MONO_PROFILE_SKIP_DOWN_WRITEBACK)
       const std::uint32_t wg_row_offset = is_wg1 ? 64u : 0u;
       const std::uint32_t col_base = (lane % 4) * 2;
-  #if defined(MONO_BS16_DIRECT_EPILOGUE)
-      if constexpr (Dims::BS == 16) {
-        // ── DIRECT epilogue experiment (BS16) ──────────────────────────
-        // Fold final_d straight into out_accum on the calc warps —
-        // no down_out staging, no PF deferred accumulate, no last-expert
-        // final accumulate.  The RMWs overlap the next expert's stitched
-        // tile-0 fetch (in flight since this expert's last K-step), i.e.
-        // they fill the same window the calc warps would otherwise spend
-        // in the s=0 bar_w wait.  Each thread owns fixed (out_col, rank)
-        // fragment cells: ranks >= routed_count carry garbage and are
-        // skipped; rank → token via the routing-built slot_to_token.
-        // Within an expert every (tok, out_col) target is owned by
-        // exactly one thread (distinct tokens per rank); across experts
-        // the RMWs are ordered by the expert-bottom __syncthreads — so
-        // no atomics are needed.
-        const std::uint32_t es =
-            static_cast<std::uint32_t>(shm->expert_slot_start[id]);
-    #pragma unroll
-        for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
-          const std::uint32_t row_base =
-              h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
-          const std::uint32_t ranks[4] = {col_base + 0u, col_base + 1u,
-                                          col_base + 8u, col_base + 9u};
-          const float v_lo[4] = {final_d[h][0], final_d[h][1],
-                                 final_d_hi[h][0], final_d_hi[h][1]};
-          const float v_hi[4] = {final_d[h][2], final_d[h][3],
-                                 final_d_hi[h][2], final_d_hi[h][3]};
-    #pragma unroll
-          for (std::uint32_t p = 0; p < 4u; ++p) {
-            if (ranks[p] < routed_count) {
-              const std::uint32_t tok = shm->slot_to_token[es + ranks[p]];
-              shm->out_accum[tok][row_base + 0] += v_lo[p];
-              shm->out_accum[tok][row_base + 8] += v_hi[p];
-            }
-          }
-        }
-      } else {
-  #endif
-    #pragma unroll
+  #pragma unroll
       for (std::uint32_t h = 0; h < DOWN_COL_HALVES; ++h) {
         const std::uint32_t row_base =
             h * 128u + wg_row_offset + warp_in_wg * 16 + lane / 4;
@@ -1186,21 +1073,11 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
               final_d_hi[h][3];
         }
       }
-  #if defined(MONO_BS16_DIRECT_EPILOGUE)
-      }  // end `if constexpr (Dims::BS == 16) { direct } else { staged }`
-  #endif
-  #endif
     }
 
     // Publishes this expert's down_out to the next expert's deferred
-    // accumulate (staged path).  Direct-epilogue BS16: still required —
-    // it orders this expert's out_accum RMWs before the next expert's
-    // (different threads can target the same (tok, col) across experts).
+    // accumulate.
     __syncthreads();
-
-    MONO_PHASE_TIMESTAMP_IF(t_down_after_expert0_accum, e == down_group);
-    MONO_PHASE_TIMESTAMP_IF(t_down_e1_after_writeback,
-                            e == down_group + DOWN_GROUPS);
   }  // end expert loop
 
   // ── Final accumulate for the LAST expert in this block's group ────────
@@ -1208,16 +1085,12 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // it here with all warps (the K-loop is done, PF warps are free).  The
   // expert loop's trailing sync already published down_out.  Blocks whose
   // group had zero experts skip (down_out was never written).
-  #if !defined(MONO_PROFILE_SKIP_CALC_DOWN) &&     \
-      !defined(MONO_PROFILE_SKIP_DOWN_EPILOGUE) && \
-      !defined(MONO_PROFILE_SKIP_DOWN_ACCUM)
   if (expert_count > down_group) {
     const std::uint32_t e_last =
         down_group +
         ((expert_count - 1u - down_group) / DOWN_GROUPS) * DOWN_GROUPS;
     const std::uint32_t last_id = shmem->experts[e_last].id;
     if constexpr (Dims::BS == 16) {
-  #if !defined(MONO_BS16_DIRECT_EPILOGUE)
       // Per-rank final accumulate via the slot→token inverse map
       // (mirrors the deferred accumulate).  All warps participate — the
       // K-loop is done.
@@ -1232,11 +1105,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
         const unsigned tok = shm->slot_to_token[last_start + rank];
         shm->out_accum[tok][col] += shm->partial_result.down_out[col][rank];
       }
-  #else
-      // Direct epilogue: every expert (incl. the last) already
-      // accumulated into out_accum at its own end-of-expert epilogue.
-      (void)last_id;
-  #endif
     } else {
       const uint8_t* last_rank = shm->down_rank[last_id];
       for (unsigned tok_col = thread_in_block;
@@ -1252,9 +1120,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     }
   }
   __syncthreads();
-  #endif
-
-  MONO_PHASE_TIMESTAMP(t_down_after_all_experts);
 
   // ── atomicAdd out_accum into the global single-buffer accumulator ─────
   // Phase 5 reads each cell once (no cross-group reduction); the

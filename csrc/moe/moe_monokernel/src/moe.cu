@@ -166,7 +166,8 @@ __device__ void moe_kernel_topk_BS8(
   if (warp_id == 0) {
     prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
   } else {
-    // warp 1 lane 0 (threadIdx 32) timestamps the fetch-wait + quantize.
+    // Warps 1..11 quantize in the 384-thread block.  warp 1 lane 0
+    // (threadIdx 32) timestamps the fetch-wait + quantize.
     MONO_PHASE_TIMESTAMP_IF_TID(t_q_phase2_enter, true,
                                 CoreDims::THREADS_PER_WARP);
 #ifndef MONO_PROFILE_SKIP_PREFETCH_UP

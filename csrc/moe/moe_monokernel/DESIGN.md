@@ -237,11 +237,12 @@ The same 128 blocks re-map: `down_group = blockIdx.x / DOWN_GRID`,
     buffers) then running the lo/hi WGMMA chains per substep per
     col-half with scale-apply; at the loop tail they write the
     accumulators to `down_out` in SHM.
-    - warp 8 lane 0 (launcher): prefetches K-step s+1 during step s; on
-    the last step prefetches the *next expert's* step-0 weight +
-    activation tiles instead (inter-expert lookahead).  The activation
-    tile is one bulk TMA per 128-K substep covering all ≤ 8 routed rows
-    of the expert (fetched from the contiguous `temp_fp8` slab).
+    - warp 8 lane 0 (launcher): prefetches K-step s+1 during step s.  On
+    the last step, BS≤8 prefetches the next expert's step-0 weight and
+    activation tiles; BS16 cross-stitches only the weights, then issues
+    activation at the next expert's top after its publication-gated
+    activation-scale load.  The calc side still waits `bar_w` before
+    `bar_a`.
     - warp 8 (PF0): loads the expert's per-token activation scales;
     warp 9 (PF1): loads the expert's weight scales — both once per
     expert, in parallel, before the K-loop.
@@ -377,10 +378,11 @@ expert:
   (bank-conflict-free broadcast in the scale-apply).
 - K-loop over `K_TILES_DOWN = N / K_STEP_DOWN` with a 2-slot weight +
   activation TMA double-buffer (`bar_w[0..1]`, `bar_a[0..1]`, reinitialized in
-  the down-proj prologue).  The launcher prefetches step s+1 during step s;
-  at the last step it instead prefetches the *next expert's* step-0 tiles
-  (inter-expert lookahead — requires `K_TILES_DOWN` even so the freed slot is
-  the one the next expert's s=0 wait reads).  Parity state is hoisted out of
+  the down-proj prologue).  The launcher prefetches step s+1 during step s.
+  At the last step, BS≤8 cross-stitches the next expert's step-0 weight and
+  activation; BS16 cross-stitches only the weight and issues activation at
+  the next expert's top.  `K_TILES_DOWN` must be even so the freed slot is
+  the one the next expert's s=0 wait reads.  Parity state is hoisted out of
   the expert loop and never reset.
 - When `routed_count == 0` for an expert, no activation TMA is armed; the
   WGMMA computes on garbage that the rank-filtered accumulate never reads
@@ -469,8 +471,9 @@ Persistent GM workspace, one per process (allocated by the caller, ≥
 - `down_partial_out[BS][K]` fp32 — Phase 4 atomicAdd target.
 - reserved dead bytes (former software-barrier counter regions; kept so the
   `phase_timestamps` offsets stay stable).
-- `phase_timestamps` — clock64 instrumentation, only written under
-  `MONO_PROFILE_PHASE_TIMING`.
+- `phase_timestamps` — profiling instrumentation, only written under
+  `MONO_PROFILE_PHASE_TIMING`; most fields use `clock64`, while cross-warp
+  TMA-delivery fields use PTX `%globaltimer`.
 - sentinel-handoff tail state: `temp_act_scale_alt` (the second scale
   buffer), `launch_flip[GRID_SIZE]` (per-block private launch counters →
   buffer parity), `down_ready[2][DOWN_GRID]` (Phase-4→5 arrival counters).
@@ -491,9 +494,11 @@ producing warp stores the payload, then `__syncwarp()` +
 `__threadfence()` + `atomicExch` of the scale (`moe_publish_act_scale`),
 clamped to >= FLT_MIN so the sentinel `+0.0f` is never a valid value.  The
 down-projection polls exactly the cells of the expert it is about to
-consume (device-scope atomic reads) before reading scales or issuing the
-activation TMA; the inter-expert lookahead TMA has its own sweep-poll
-(`moe_wait_expert_scales_published`).  This gives per-expert granularity —
+consume (device-scope atomic reads) before reading scales or issuing an
+activation TMA.  BS≤8's cross-expert activation lookahead uses an explicit
+sweep-poll (`moe_wait_expert_scales_published`); BS16 instead inherits the
+same publication gate from its expert-top activation-scale loader before
+issuing activation there.  This gives per-expert granularity —
 down work for an expert starts as soon as that expert's rows are
 published — and covers coupled and decoupled carves uniformly.
 
@@ -570,9 +575,10 @@ CMakeLists.txt — see the commented examples there):
   garbage (timing only).  Routing always runs (loop bounds must be valid).
 - `MONO_PROFILE_SKIP_UP_EPILOGUE` — elide the up-proj epilogue (accumulators
   kept alive via a volatile sink).
-- `MONO_PROFILE_PHASE_TIMING` — block-0 clock64 timestamps at phase
-  boundaries into `spec->phase_timestamps`; output stays correct, overhead
-  negligible.  Read back from the scratchpad tail in Python.
+- `MONO_PROFILE_PHASE_TIMING` — block-0 `clock64` timestamps at phase
+  boundaries plus PTX `%globaltimer` fields for cross-warp TMA delivery,
+  stored in `spec->phase_timestamps`; output stays correct. Profiling only;
+  keep disabled in production.
 
 ## Shipped configurations (from shapes.json)
 

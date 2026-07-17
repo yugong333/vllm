@@ -1199,23 +1199,19 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # "Profiling hooks").  Output is GARBAGE under any SKIP flag — timing
     # only:
     #
-    #   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warps compiled out
-    #   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches compiled out
-    #   MONO_PROFILE_SKIP_CALC_DOWN     : down-proj calc warps compiled out
-    #   MONO_PROFILE_SKIP_PREFETCH_DOWN : down-proj prefetches compiled out
+    #   MONO_PROFILE_SKIP_CALC_UP     : up-proj calc warps compiled out
+    #   MONO_PROFILE_SKIP_PREFETCH_UP : up-proj prefetches compiled out
     #
     # IMPORTANT — use `set_property(... APPEND PROPERTY COMPILE_DEFINITIONS
     # ...)`, NOT `set_source_files_properties(... PROPERTIES ...)`: the
     # latter REPLACES the property, so a second call silently wipes out
     # everything set before it.
-    #
-    # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
-    #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_SKIP_CALC_DOWN")
 
-    # Phase-timing instrumentation — per-phase clock64() timestamps from
-    # block 0 into the scratchpad's `phase_timestamps` struct (read back
-    # from Python).  Output stays CORRECT; overhead negligible.
+    # Phase-timing instrumentation — block-0 clock64() phase timestamps
+    # stored in the scratchpad's `phase_timestamps` struct. Output stays
+    # CORRECT.
     #
+    # Keep disabled in production; enable only for profile_phase_timing.py.
     # set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
     #   APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
   else()

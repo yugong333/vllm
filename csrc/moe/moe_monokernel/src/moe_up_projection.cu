@@ -468,7 +468,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // current K-loop and the routing tables are immutable.
       static_assert(K_TILES >= 2,
                     "Deferred up-proj writeback requires K_TILES >= 2.");
-      constexpr uint32_t PF = CoreDims::PREFETCH_WARP_COUNT;  // 4
+      constexpr uint32_t PF = CoreDims::PREFETCH_WARP_COUNT;
       constexpr uint32_t WAVES = (Dims::BS + PF - 1u) / PF;
       constexpr uint32_t DEFER_ITERS = K_TILES - 1u;
       static_assert(WAVES <= DEFER_ITERS,
@@ -1056,7 +1056,7 @@ __device__ inline void moe_up_projection_BS8_122B_wgmma_tma(
       // output features via 4 post_silu reads.
       static_assert(K_TILES >= 2,
                     "Deferred up-proj writeback requires K_TILES >= 2.");
-      constexpr uint32_t PF = CoreDims::PREFETCH_WARP_COUNT;  // 4
+      constexpr uint32_t PF = CoreDims::PREFETCH_WARP_COUNT;
       constexpr uint32_t WAVES = (Dims::BS + PF - 1u) / PF;
       constexpr uint32_t DEFER_ITERS = K_TILES - 1u;
       static_assert(WAVES <= DEFER_ITERS,

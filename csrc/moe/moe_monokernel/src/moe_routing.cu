@@ -261,8 +261,7 @@ __device__ static __forceinline__ void topK_one_token(
  * instruction stream is unchanged.
  */
 template <typename Dims>
-__device__ void topK(uint32_t top_k, ScoringFunc scoring_func,
-                     bool renormalize,
+__device__ void topK(uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
                      const __nv_bfloat16* __restrict__ router_logits,
                      uint32_t num_tokens, MoE_SHM<Dims>* shmem,
                      const float* __restrict__ expert_bias = nullptr,

@@ -10,23 +10,17 @@
   #include "moe_interface.h"
 
   // ── Profiling build flags ──────────────────────────────────────────────────
-  // Compile out one side of a phase to isolate compute vs data-movement cost
-  // (see DESIGN.md "Profiling hooks").  Output is garbage under any SKIP flag —
-  // timing only.  Arms and waits are elided in pairs so nothing deadlocks:
+  // Compile out one side of the up-projection to isolate compute vs
+  // data-movement cost (see DESIGN.md "Profiling hooks"). Output is garbage
+  // under either SKIP flag — timing only. Arms and waits are elided in pairs:
   //
-  //   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warp bodies compiled out
-  //   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches compiled out
-  //   MONO_PROFILE_SKIP_CALC_DOWN     : down-proj calc warp bodies compiled out
-  //   MONO_PROFILE_SKIP_PREFETCH_DOWN : down-proj prefetches compiled out
+  //   MONO_PROFILE_SKIP_CALC_UP     : up-proj calc warp bodies compiled out
+  //   MONO_PROFILE_SKIP_PREFETCH_UP : up-proj prefetches compiled out
   //
-  // MONO_PROFILE_SKIP_CALC / MONO_PROFILE_SKIP_PREFETCH cascade to both the
-  // up and down variants.
+  // Generic SKIP flags cascade only to the UP profiling variants.
   #ifdef MONO_PROFILE_SKIP_CALC
     #ifndef MONO_PROFILE_SKIP_CALC_UP
       #define MONO_PROFILE_SKIP_CALC_UP
-    #endif
-    #ifndef MONO_PROFILE_SKIP_CALC_DOWN
-      #define MONO_PROFILE_SKIP_CALC_DOWN
     #endif
   #endif
 
@@ -34,15 +28,13 @@
     #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
       #define MONO_PROFILE_SKIP_PREFETCH_UP
     #endif
-    #ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-      #define MONO_PROFILE_SKIP_PREFETCH_DOWN
-    #endif
   #endif
 
 // ── Phase-timing instrumentation ───────────────────────────────────────────
-// MONO_PROFILE_PHASE_TIMING enables per-phase clock64() timestamps written by
-// block 0 into `spec->phase_timestamps` (readable from Python via the
-// scratchpad).  Output stays correct; overhead is negligible.
+// MONO_PROFILE_PHASE_TIMING writes block-0 clock64() phase timestamps into
+// `spec->phase_timestamps` (readable from Python via the scratchpad). Output
+// stays correct; this profiling-only definition must remain disabled in
+// production.
   #ifdef MONO_PROFILE_PHASE_TIMING
     #define MONO_PHASE_TIMESTAMP(field)             \
       do {                                          \
@@ -153,14 +145,10 @@ struct down_k_step {
   static constexpr std::uint32_t value = test<Dims>(0);
 };
 
-// DOWN_PIPE_DEPTH: down-proj weight/activation TMA ring depth (tunable via
-// the config table's DPD column).  Optional on the Dims tag; defaults to 2
-// (the classic double buffer — SHM layout and SASS byte-identical for every
-// Dims that doesn't declare it, including all named BS8/BS16 ops).  4
-// selects the rolling ring: at iter s the launcher arms slot (s+2)&3, so a
-// weight tile has two compute windows to land and the fetch stream runs
-// through the per-expert epilogue/sync bubble.  Must be a power of two so
-// `s & (DOWN_PIPE_DEPTH - 1)` folds to a mask.
+// DOWN_PIPE_DEPTH: down-proj activation TMA ring depth (tunable via the
+// config table's DPD column).  Optional on the Dims tag; defaults to 2.
+// Legacy DPD=4 configs use the same depth for weights through the
+// DOWN_WEIGHT_SLOTS fallback below.
 template <typename Dims>
 struct down_pipe_depth {
  private:
@@ -172,6 +160,26 @@ struct down_pipe_depth {
   template <typename>
   static constexpr std::uint32_t test(...) {
     return 2u;
+  }
+
+ public:
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
+// DOWN_WEIGHT_SLOTS: independent down-proj weight ring depth.  Dims without
+// this knob inherit DOWN_PIPE_DEPTH, preserving the classic 2-deep path and
+// the existing coupled 4-deep weight+activation configuration.
+template <typename Dims>
+struct down_weight_slots {
+ private:
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::KernelConfig::DOWN_WEIGHT_SLOTS) {
+    return (std::uint32_t)D::KernelConfig::DOWN_WEIGHT_SLOTS;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return down_pipe_depth<Dims>::value;
   }
 
  public:
@@ -405,23 +413,6 @@ struct MoEGemmSpec {
     int64_t t_up_e1_pf_iter0_after_silu;
     int64_t t_after_up;
     int64_t t_after_barrier2;
-    // Down-projection sub-phases.
-    int64_t t_down_after_prologue;
-    int64_t t_down_after_expert0_kloop;
-    int64_t t_down_after_expert0_accum;
-    // Steady-state (second expert, e1 = down_group + DOWN_GROUPS) per-expert
-    // breakdown: scale loads, per-iter TMA wait vs WGMMA compute, epilogue
-    // writeback, and the deferred accumulate bracket (PF warp 8 lane 0).
-    int64_t t_down_e1_after_scales;
-    int64_t t_down_e1_iter0_after_wait;
-    int64_t t_down_e1_iter0_after_compute;
-    int64_t t_down_e1_iter1_after_wait;
-    int64_t t_down_e1_iter1_after_compute;
-    int64_t t_down_e1_after_kloop;
-    int64_t t_down_e1_after_writeback;
-    int64_t t_down_e1_pf_before_accum;
-    int64_t t_down_e1_pf_after_accum;
-    int64_t t_down_after_all_experts;
     int64_t t_after_down;
     int64_t t_after_barrier3;
     // Calc-warp epilogue breakdown of expert 0 (combine / store / snapshot).
@@ -533,8 +524,9 @@ __device__ __forceinline__ void moe_publish_act_scale(
 }
 
 // Maximum supported dimensions.  Sizes only the max-SHM / max-scratchpad
-// bookkeeping (`get_moe_max_*`); never launched.
-using Dims_Max = MoEDimensions<1024, 1024, 6144, 512>;
+// bookkeeping (`get_moe_max_*`); never launched.  N raised 1024 → 2048
+// for the synthetic down-boundary benchmark shape (e256_n2048_k2048).
+using Dims_Max = MoEDimensions<1024, 2048, 6144, 512>;
 
 // Block-wise quantization detection for the SHM scale-tile sizing below.
 template <typename Dims>
@@ -618,20 +610,27 @@ struct MoECoreDims {
                 "Dims::N must be a multiple of K_STEP_DOWN for the WGMMA "
                 "down-projection.");
 
-  // ── Down-proj TMA pipeline depth (DOWN_PIPE_DEPTH tunable) ────────────
-  // 2 = classic double buffer (default); 4 = rolling ring with 2 K-steps
-  // of lookahead (arm slot (s+2)&3 at iter s).  See the down_pipe_depth
-  // detector for the opt-in mechanics.
+  // ── Down-proj TMA pipeline depths ────────────────────────────────────
+  // DOWN_PIPE_DEPTH sizes the activation ring and remains the legacy
+  // coupled weight+activation depth.  DOWN_WEIGHT_SLOTS may independently
+  // deepen only the static weight stream.
   static constexpr std::uint32_t DOWN_PIPE_DEPTH = down_pipe_depth<Dims>::value;
+  static constexpr std::uint32_t DOWN_WEIGHT_SLOTS =
+      down_weight_slots<Dims>::value;
   static_assert(DOWN_PIPE_DEPTH == 2u || DOWN_PIPE_DEPTH == 4u,
-                "DOWN_PIPE_DEPTH must be 2 (double buffer) or 4 (rolling "
-                "ring); other depths have no launcher implementation.");
+                "DOWN_PIPE_DEPTH must be 2 or 4.");
+  static_assert(DOWN_WEIGHT_SLOTS == 2u || DOWN_WEIGHT_SLOTS == 4u,
+                "DOWN_WEIGHT_SLOTS must be 2 or 4.");
   static_assert(DOWN_PIPE_DEPTH == 2u ||
                     (Dims::N / K_STEP_DOWN) % DOWN_PIPE_DEPTH == 0u,
                 "DOWN_PIPE_DEPTH == 4 requires K_TILES_DOWN (= N / "
-                "K_STEP_DOWN) to be a multiple of 4 so the cross-expert "
-                "stitch at iters K_TILES-2 / K_TILES-1 lands the next "
-                "expert's tiles 0,1 on ring slots 0,1.");
+                "K_STEP_DOWN) to be a multiple of 4.");
+  static_assert(DOWN_WEIGHT_SLOTS == DOWN_PIPE_DEPTH ||
+                    (DOWN_WEIGHT_SLOTS == 4u && DOWN_PIPE_DEPTH == 2u &&
+                     Dims::N / K_STEP_DOWN == 2u),
+                "The independent four-slot weight ring currently requires "
+                "a two-slot activation ring and exactly two K-steps per "
+                "expert.");
 
   // ── Up-proj outer K-step (K_STEP_UP tunable) ──────────────────────────
   static constexpr std::uint32_t K_STEP_UP = up_k_step<Dims>::value;
@@ -768,10 +767,9 @@ struct MoE_SHM {
       // K_SUBSTEPS_DOWN SWZ128 atoms (8 tok × 128 K-bytes each) per slot.
       // 1024-B alignment required by SWIZZLE_128B (the XOR pattern is only
       // consistent within 1024-B-aligned regions).
-      alignas(1024)
-          AQ_element a_down_wgmma[CoreDims::DOWN_PIPE_DEPTH]
-                                 [DOWN_ACT_K_SUBSTEPS][CoreDims::T_TILE]
-                                 [FP8_ACT_NUM_CHUNKS][FP8_ACT_K_CHUNK];
+      alignas(1024) AQ_element
+          a_down_wgmma[CoreDims::DOWN_PIPE_DEPTH][DOWN_ACT_K_SUBSTEPS]
+                      [CoreDims::T_TILE][FP8_ACT_NUM_CHUNKS][FP8_ACT_K_CHUNK];
 
       // Single-buffer FP8 activations covering the full K range, produced
       // once per launch by Phase-2 routing_phase_quantize and read directly
@@ -817,12 +815,11 @@ struct MoE_SHM {
                                             [BF16_IN_FULL_BS][BF16_IN_FULL_K];
         // Up-proj weight slots (Phase 3), UP_W_SLOTS deep.
         alignas(1024) W_element w_wgmma[UP_W_SLOTS][W_WGMMA_M_TOTAL][W_WGMMA_K];
-        // Down-proj weight ring (Phase 4), DOWN_PIPE_DEPTH slots (2 = the
-        // classic double buffer).  Slot size scales with K_STEP_DOWN, so a
-        // 4-deep ring at KDN=128 occupies the same bytes as the 2-deep at
-        // KDN=256.
+        // Down-proj weight ring (Phase 4).  By default its depth inherits
+        // DOWN_PIPE_DEPTH; the weight-only lookahead uses four 128x256
+        // stages while keeping the activation ring two-deep.
         alignas(1024) W_element
-            w_down_wgmma[CoreDims::DOWN_PIPE_DEPTH][W_DOWN_WGMMA_M_TOTAL]
+            w_down_wgmma[CoreDims::DOWN_WEIGHT_SLOTS][W_DOWN_WGMMA_M_TOTAL]
                         [CoreDims::K_STEP_WGMMA];
       };
 
@@ -854,24 +851,12 @@ struct MoE_SHM {
       // profiled under ncu) produced NO speedup: the conflicted accesses
       // live on prefetch warps / epilogue slots hidden behind WGMMA and
       // TMA waits, so they are off the critical path (+1 even regressed
-      // stores by breaking the STS.64 pair merge).  Keep the compact
+      // stores by breaking the STS.64 pair merge). Keep the compact
       // layout; do not re-add a pad without an end-to-end win.
-      // Under MONO_BS16_DIRECT_EPILOGUE the BS16 path never touches
-      // down_out (calc warps fold final_d straight into out_accum), so
-      // its extent collapses to 1 row — reclaiming DOWN_COL_TILE×T_TILE×4
-      // bytes from the partial_result union.  That reclaim is what lets
-      // the DCT=512 raw/decoupled configs (4/5) fit the BS16 SHM budget
-      // (their full-extent layout is ~9 KB over the 232 KB opt-in cap).
-      // BS<=8 and non-macro builds keep the full extent.
-      static constexpr uint32_t DOWN_OUT_ROWS =
-  #if defined(MONO_BS16_DIRECT_EPILOGUE)
-          (Dims::BS == 16) ? 1u :
-  #endif
-                           CoreDims::DOWN_COL_TILE;
       union {
         // Down-proj per-expert output scratch (Phase-4 epilogue →
         // deferred accumulate).
-        T_element down_out[DOWN_OUT_ROWS][CoreDims::T_TILE];
+        T_element down_out[CoreDims::DOWN_COL_TILE][CoreDims::T_TILE];
         // Up-proj post-SiLU fp32 scratch: calc warps write the per-lane
         // silu(gate)*up*rw combine at the K-loop tail of expert e; PF
         // warps drain it during expert e+1's K-loop (deferred epilogue).
@@ -891,27 +876,15 @@ struct MoE_SHM {
                          [CoreDims::DOWN_COL_TILE + OUT_ACCUM_ROW_PAD];
 
       // ── mbarriers (16-B alignment required by SM90 mbarrier PTX) ─────
-      // bar_w: up-proj weight pipeline, one per lookahead slot; the
-      // down-proj reuses slots 0..DOWN_PIPE_DEPTH-1 as its ring (sized
-      // for whichever phase needs more).  bar_a: down-proj activation
-      // ring, armed/consumed exclusively by Phase 4 (re-initialized
-      // there).  bar_rwin: Phase-1 routing-window load (arrival_count =
-      // 1), waited on by warps 1..11 at the start of Phase 2.
+      // bar_w: up/down weight pipeline, sized for whichever phase uses more
+      // slots.  bar_a remains the independently sized down activation ring.
       static constexpr uint32_t BAR_W_COUNT =
-          (UP_W_SLOTS > CoreDims::DOWN_PIPE_DEPTH)
+          (UP_W_SLOTS > CoreDims::DOWN_WEIGHT_SLOTS)
               ? UP_W_SLOTS
-              : CoreDims::DOWN_PIPE_DEPTH;
+              : CoreDims::DOWN_WEIGHT_SLOTS;
       alignas(16) uint64_t bar_w[BAR_W_COUNT];
       alignas(16) uint64_t bar_a[CoreDims::DOWN_PIPE_DEPTH];
       alignas(16) uint64_t bar_rwin;
-      // Consumer→producer "last slot consumed" signal for the down-proj
-      // early tile-1 arm (MONO_BS16_EARLY_ARM experiment): one lane per
-      // calc warp arrives (count 8) after the LAST K-step's final WGMMA
-      // read; the launcher waits it and immediately arms the NEXT
-      // expert's tile-1 weight TMA — instead of learning the slot is
-      // free two CTA barriers later at the next expert's s=0.  Unused
-      // (dead 8 B) when the experiment macro is off.
-      alignas(16) uint64_t bar_last_empty;
 
       // ── Phase 3 → Phase 4 (expert, token) reorganization tables ──────
       //

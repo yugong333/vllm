@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monokernel config feasibility enumerator.
 
 Given an MoE shape (N, K, E, BS) and GPU limits (SM count, SHM cap), enumerate
@@ -27,6 +29,7 @@ Usage:
   enum_configs.py --shape 35b --mode coupled --verify   # nvcc cross-check
   enum_configs.py --N 1024 --K 3072 --E 256 --bs 8 --mode both
 """
+
 import argparse
 import json
 import math
@@ -55,7 +58,7 @@ def detect_shm_budget(default=SHM_BUDGET_BYTES):
 
       1. torch.cuda.get_device_properties(d).shared_memory_per_block_optin —
          the opt-in max (exactly the attribute the kernel raises to).
-      2. cudart cudaDeviceGetAttribute(MaxSharedMemoryPerBlockOptin=97).
+      2. cudart cudaDeviceGetAttribute(cudaDevAttrMaxSharedMemoryPerBlockOptin=97).
       3. `default` as a last resort, with a stderr warning.
 
     Returns the integer byte budget.  Never raises — falls back to `default`.
@@ -63,10 +66,14 @@ def detect_shm_budget(default=SHM_BUDGET_BYTES):
     # 1) torch — shared_memory_per_block_optin is the opt-in dynamic-SHM max.
     try:
         import torch
+
         if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            v = getattr(torch.cuda.get_device_properties(dev),
-                        "shared_memory_per_block_optin", 0)
+            dev = torch.accelerator.current_device_index()
+            v = getattr(
+                torch.cuda.get_device_properties(dev),
+                "shared_memory_per_block_optin",
+                0,
+            )
             if v:
                 return int(v)
     except Exception:
@@ -75,6 +82,7 @@ def detect_shm_budget(default=SHM_BUDGET_BYTES):
     # 2) cudart attribute 97 = cudaDevAttrMaxSharedMemoryPerBlockOptin.
     try:
         import ctypes
+
         rt = ctypes.CDLL("libcudart.so")
         val = ctypes.c_int()
         if rt.cudaDeviceGetAttribute(ctypes.byref(val), 97, 0) == 0 and val.value:
@@ -83,9 +91,11 @@ def detect_shm_budget(default=SHM_BUDGET_BYTES):
         pass
 
     # 3) last resort.
-    print(f"[enum_configs] WARNING: could not detect SHM opt-in budget; "
-          f"using default {default // 1024} KB (pass --shm-budget to override).",
-          file=sys.stderr)
+    print(
+        f"[enum_configs] WARNING: could not detect SHM opt-in budget; "
+        f"using default {default // 1024} KB (pass --shm-budget to override).",
+        file=sys.stderr,
+    )
     return default
 
 
@@ -107,41 +117,56 @@ def detect_sm_count(default=H200_SM_COUNT):
     # 1) torch (authoritative; multi_processor_count is the real SM count).
     try:
         import torch
+
         if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
+            dev = torch.accelerator.current_device_index()
             return torch.cuda.get_device_properties(dev).multi_processor_count
     except Exception:
         pass
 
     # 2) nvidia-smi name → SM-count table (no torch needed).
     KNOWN_SM = {
-        "H200": 132, "H100": 132, "H800": 132,
-        "A100": 108, "A800": 108,
-        "L40S": 142, "L40": 142, "L4": 58,
-        "B200": 148, "GH200": 132,
+        "H200": 132,
+        "H100": 132,
+        "H800": 132,
+        "A100": 108,
+        "A800": 108,
+        "L40S": 142,
+        "L40": 142,
+        "L4": 58,
+        "B200": 148,
+        "GH200": 132,
     }
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL, timeout=10).decode()
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).decode()
         name = out.splitlines()[0].strip() if out.strip() else ""
         for key, sm in KNOWN_SM.items():
             if key in name:
                 return sm
         if name:
-            print(f"[enum_configs] WARNING: GPU '{name}' not in the SM table; "
-                  f"falling back to {default} SMs (pass --sms to override).",
-                  file=sys.stderr)
+            print(
+                f"[enum_configs] WARNING: GPU '{name}' not in the SM table; "
+                f"falling back to {default} SMs (pass --sms to override).",
+                file=sys.stderr,
+            )
     except Exception:
         pass
 
     # 3) last resort.
-    print(f"[enum_configs] WARNING: could not detect GPU SM count; "
-          f"using default {default} (pass --sms to override).",
-          file=sys.stderr)
+    print(
+        f"[enum_configs] WARNING: could not detect GPU SM count; "
+        f"using default {default} (pass --sms to override).",
+        file=sys.stderr,
+    )
     return default
-ATOM = 128                     # SWZ128 / WGMMA-M software atom (col & K unit)
-WGMMA_K = 128                  # one K-substep = 128 (4x m64n8k32)
+
+
+ATOM = 128  # SWZ128 / WGMMA-M software atom (col & K unit)
+WGMMA_K = 128  # one K-substep = 128 (4x m64n8k32)
 BS_DEFAULT = 8
 TOPK_MAX = 8
 
@@ -154,6 +179,15 @@ SHAPES = {
 # Tunable ranges (multiples of 128 upward for K-steps; powers of two for slots).
 K_STEP_CHOICES = [128, 256, 384, 512, 768]
 UP_W_SLOTS_CHOICES = [2, 4, 8]
+DOWN_W_SLOTS_CHOICES = [2, 4]
+
+
+def down_w_slot_choices(N, kdn):
+    """Launcher-supported down-weight depths for this K-step geometry."""
+    choices = [2]
+    if N // kdn == 2:
+        choices.append(4)
+    return choices
 
 
 def divisors_in_atoms(total_rows):
@@ -162,7 +196,7 @@ def divisors_in_atoms(total_rows):
     return [d for d in range(1, n_atoms + 1) if n_atoms % d == 0]
 
 
-def shm_estimate(N, K, bs, dct, uch, kup, kdn, slots):
+def shm_estimate(N, K, bs, dct, uch, kup, kdn, slots, down_w_slots=2):
     """Analytic SHM estimate (bytes) for fast pruning.
 
     Mirrors the MoE_SHM<Dims> union: the dominant region is the max of the
@@ -176,9 +210,8 @@ def shm_estimate(N, K, bs, dct, uch, kup, kdn, slots):
     bf16_in = K * bs * 2
     # up weight slots: SLOTS * (UCH atoms) * (K_STEP_UP/128 substeps) * 128*128 fp8.
     up_w = slots * uch * (kup // WGMMA_K) * ATOM * ATOM
-    # down weight double-buffer: 2 * (DCT/128 atoms) * (K_STEP_DOWN/128 substeps)
-    #                              * 128*128 fp8.
-    down_w = 2 * (dct // ATOM) * (kdn // WGMMA_K) * ATOM * ATOM
+    # Down weight ring: independently tunable slot count.
+    down_w = down_w_slots * (dct // ATOM) * (kdn // WGMMA_K) * ATOM * ATOM
     union = max(bf16_in, up_w, down_w)
     # Per-config fixed remainder (scales, mbarriers, padded fp8_act_full,
     # post_silu_scratch, sorted-slot bookkeeping) is NOT constant — it grows
@@ -214,8 +247,8 @@ def enum_coupled(N, K, E, bs, sm_count, shm_budget):
     bpe_atoms = sorted(up_div & down_div)
     out = []
     for bpe in bpe_atoms:
-        dct = (down_rows // bpe)         # down col tile (rows in K)
-        up_tile = up_rows // bpe         # up col tile (rows in 2N)
+        dct = down_rows // bpe  # down col tile (rows in K)
+        up_tile = up_rows // bpe  # up col tile (rows in 2N)
         if dct % ATOM != 0 or up_tile % ATOM != 0:
             continue
         uch = coupled_uch(N, dct, K)
@@ -262,16 +295,43 @@ def enum_coupled(N, K, E, bs, sm_count, shm_budget):
                         # (UP_GROUPS / DOWN_GROUPS <= NUM_EXPERTS asserts).
                         if groups > E or grid // down_grid > E:
                             continue
-                        shm = shm_estimate(N, K, bs, dct, uch, kup, kdn, slots)
-                        if shm > shm_budget:
-                            continue
-                        out.append(dict(
-                            mode="coupled", N=N, K=K, E=E, bs=bs,
-                            grid=grid, groups=groups, bpe=bpe,
-                            down_col_tile=dct, up_col_halves=uch,
-                            k_step_up=kup, k_step_down=kdn, up_w_slots=slots,
-                            up_grid=bpe, down_grid=down_grid,
-                            shm_est=shm, sms_used=grid))
+                        for down_w_slots in down_w_slot_choices(N, kdn):
+                            shm = shm_estimate(
+                                N,
+                                K,
+                                bs,
+                                dct,
+                                uch,
+                                kup,
+                                kdn,
+                                slots,
+                                down_w_slots,
+                            )
+                            if shm > shm_budget:
+                                continue
+                            out.append(
+                                dict(
+                                    mode="coupled",
+                                    N=N,
+                                    K=K,
+                                    E=E,
+                                    bs=bs,
+                                    grid=grid,
+                                    groups=groups,
+                                    bpe=bpe,
+                                    down_col_tile=dct,
+                                    up_col_halves=uch,
+                                    k_step_up=kup,
+                                    k_step_down=kdn,
+                                    up_w_slots=slots,
+                                    down_weight_slots=down_w_slots,
+                                    down_pipe_depth=2,
+                                    up_grid=bpe,
+                                    down_grid=down_grid,
+                                    shm_est=shm,
+                                    sms_used=grid,
+                                )
+                            )
     return out
 
 
@@ -284,11 +344,11 @@ def enum_decoupled(N, K, E, bs, sm_count, shm_budget):
     for up_bpe in up_bpes:
         up_tile = up_rows // up_bpe
         uch = up_tile // ATOM
-        if uch < 1 or uch > 2:        # kernel limit until task 4
+        if uch < 1 or uch > 2:  # kernel limit until task 4
             continue
         for down_bpe in down_bpes:
             dct = K // down_bpe
-            if dct % ATOM != 0 or dct // ATOM > 4:   # kernel: DCT <= 512
+            if dct % ATOM != 0 or dct // ATOM > 4:  # kernel: DCT <= 512
                 continue
             # grid equality + integer barrier ratio.
             #   grid = up_groups*up_bpe = down_groups*down_bpe <= SMs
@@ -323,18 +383,44 @@ def enum_decoupled(N, K, E, bs, sm_count, shm_budget):
                             # Inter-expert lookahead: K_TILES_DOWN even.
                             if (N // kdn) % 2 != 0:
                                 continue
-                            shm = shm_estimate(N, K, bs, dct, uch, kup, kdn,
-                                               slots)
-                            if shm > shm_budget:
-                                continue
-                            out.append(dict(
-                                mode="decoupled", N=N, K=K, E=E, bs=bs,
-                                grid=grid, up_groups=up_groups,
-                                down_groups=down_groups, barrier_ratio=R,
-                                up_bpe=up_bpe, down_bpe=down_bpe,
-                                down_col_tile=dct, up_col_halves=uch,
-                                k_step_up=kup, k_step_down=kdn,
-                                up_w_slots=slots, shm_est=shm, sms_used=grid))
+                            for down_w_slots in down_w_slot_choices(N, kdn):
+                                shm = shm_estimate(
+                                    N,
+                                    K,
+                                    bs,
+                                    dct,
+                                    uch,
+                                    kup,
+                                    kdn,
+                                    slots,
+                                    down_w_slots,
+                                )
+                                if shm > shm_budget:
+                                    continue
+                                out.append(
+                                    dict(
+                                        mode="decoupled",
+                                        N=N,
+                                        K=K,
+                                        E=E,
+                                        bs=bs,
+                                        grid=grid,
+                                        up_groups=up_groups,
+                                        down_groups=down_groups,
+                                        barrier_ratio=R,
+                                        up_bpe=up_bpe,
+                                        down_bpe=down_bpe,
+                                        down_col_tile=dct,
+                                        up_col_halves=uch,
+                                        k_step_up=kup,
+                                        k_step_down=kdn,
+                                        up_w_slots=slots,
+                                        down_weight_slots=down_w_slots,
+                                        down_pipe_depth=2,
+                                        shm_est=shm,
+                                        sms_used=grid,
+                                    )
+                                )
     return out
 
 
@@ -345,14 +431,15 @@ PROBE_TEMPLATE = r"""
 #include "moe_internal.h"
 #include <cstdio>
 using namespace moe_monokernel;
-template <uint32_t NN, uint32_t KK, uint32_t GRID, uint32_t DCT,
-          uint32_t KUP, uint32_t KDN, uint32_t SLOTS>
+template <uint32_t NN, uint32_t KK, uint32_t BATCH, uint32_t GRID,
+          uint32_t DCT, uint32_t KUP, uint32_t KDN, uint32_t SLOTS,
+          uint32_t UCH, uint32_t DWS>
 struct GDims {
   static constexpr uint32_t HIDDEN_STATES = KK;
   static constexpr uint32_t K = KK;
   static constexpr uint32_t N = NN;
-  static constexpr uint32_t BS = 8;
-  static constexpr uint32_t M = 8;
+  static constexpr uint32_t BS = BATCH;
+  static constexpr uint32_t M = BATCH;
   static constexpr uint32_t NUM_EXPERTS = 256;
   static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
   static constexpr uint32_t BLOCK_SCALE_ROW = 128;
@@ -370,6 +457,8 @@ struct GDims {
     static constexpr uint32_t K_STEP_UP = KUP;
     static constexpr uint32_t DOWN_COL_TILE = DCT;
     static constexpr uint32_t UP_W_SLOTS = SLOTS;
+    static constexpr uint32_t UP_COL_HALVES = UCH;
+    static constexpr uint32_t DOWN_WEIGHT_SLOTS = DWS;
     static constexpr bool USE_PAIR_LAYOUT = true;
   };
 };
@@ -396,9 +485,21 @@ def _compile_run(rows_src, idxs, src_dir):
         with open(cu, "w") as f:
             f.write(src)
         cp = subprocess.run(
-            ["nvcc", "-gencode", "arch=compute_90a,code=sm_90a", "-std=c++17",
-             "--expt-relaxed-constexpr", "-I", src_dir, cu, "-o", exe],
-            capture_output=True, text=True)
+            [
+                "nvcc",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
+                "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "-I",
+                src_dir,
+                cu,
+                "-o",
+                exe,
+            ],
+            capture_output=True,
+            text=True,
+        )
         if cp.returncode != 0:
             return None  # at least one config in this batch is infeasible
         run = subprocess.run([exe], capture_output=True, text=True)
@@ -418,10 +519,21 @@ def verify_shm(configs, src_dir):
     feasible majority still gets exact sizes and the infeasible ones are
     marked None (dropped).  Returns {idx: bytes-or-None}.
     """
+
     def row_line(i, c):
-        return ("  row<GDims<%d,%d,%d,%d,%d,%d,%d>>(%d);" % (
-            c["N"], c["K"], c["grid"], c["down_col_tile"], c["k_step_up"],
-            c["k_step_down"], c["up_w_slots"], i))
+        return "  row<GDims<{},{},{},{},{},{},{},{},{},{}>>({});".format(
+            c["N"],
+            c["K"],
+            c["bs"],
+            c["grid"],
+            c["down_col_tile"],
+            c["k_step_up"],
+            c["k_step_down"],
+            c["up_w_slots"],
+            c["up_col_halves"],
+            c["down_weight_slots"],
+            i,
+        )
 
     results = {}
 
@@ -445,30 +557,49 @@ def verify_shm(configs, src_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--shape", choices=SHAPES.keys(),
-                    help="named shape (35b / 122b)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--shape", choices=SHAPES.keys(), help="named shape (35b / 122b)")
     ap.add_argument("--N", type=int, help="moe_intermediate_size (N_HALF)")
     ap.add_argument("--K", type=int, help="hidden_size")
     ap.add_argument("--E", type=int, default=256)
-    ap.add_argument("--bs", type=int, default=BS_DEFAULT)
-    ap.add_argument("--mode", choices=["coupled", "decoupled", "both"],
-                    default="coupled")
-    ap.add_argument("--sms", type=int, default=None,
-                    help="SM count ceiling for grid feasibility (grid <= SMs). "
-                         "Default: auto-detect the local GPU (torch / "
-                         "nvidia-smi), falling back to H200=132.")
-    ap.add_argument("--shm-budget", type=int, default=None,
-                    help="Per-block dynamic SHM ceiling in bytes (sizeof "
-                         "MoE_SHM must fit). Default: auto-detect the local "
-                         "GPU's opt-in max, falling back to 224 KB.")
-    ap.add_argument("--verify", action="store_true",
-                    help="nvcc cross-check exact sizeof(MoE_SHM) + feasibility")
+    ap.add_argument(
+        "--bs",
+        type=int,
+        default=None,
+        help="Batch size; defaults to the named shape value or 8",
+    )
+    ap.add_argument(
+        "--mode", choices=["coupled", "decoupled", "both"], default="coupled"
+    )
+    ap.add_argument(
+        "--sms",
+        type=int,
+        default=None,
+        help="SM count ceiling for grid feasibility (grid <= SMs). "
+        "Default: auto-detect the local GPU (torch / "
+        "nvidia-smi), falling back to H200=132.",
+    )
+    ap.add_argument(
+        "--shm-budget",
+        type=int,
+        default=None,
+        help="Per-block dynamic SHM ceiling in bytes (sizeof "
+        "MoE_SHM must fit). Default: auto-detect the local "
+        "GPU's opt-in max, falling back to 224 KB.",
+    )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="nvcc cross-check exact sizeof(MoE_SHM) + feasibility",
+    )
     ap.add_argument("--json", help="write config list to this path")
-    ap.add_argument("--src-dir", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "src"),
-        help="monokernel src dir (for --verify nvcc -I)")
+    ap.add_argument(
+        "--src-dir",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"),
+        help="monokernel src dir (for --verify nvcc -I)",
+    )
     args = ap.parse_args()
 
     # Resolve hardware ceilings: explicit flags win; otherwise detect the GPU.
@@ -479,9 +610,11 @@ def main():
 
     if args.shape:
         s = SHAPES[args.shape]
-        N, K, E, bs = s["N"], s["K"], s["E"], s["bs"]
+        N, K, E = s["N"], s["K"], s["E"]
+        bs = args.bs if args.bs is not None else s["bs"]
     elif args.N and args.K:
-        N, K, E, bs = args.N, args.K, args.E, args.bs
+        N, K, E = args.N, args.K, args.E
+        bs = args.bs if args.bs is not None else BS_DEFAULT
     else:
         ap.error("provide --shape or both --N and --K")
 
@@ -491,15 +624,16 @@ def main():
     if args.mode in ("decoupled", "both"):
         configs += enum_decoupled(N, K, E, bs, args.sms, args.shm_budget)
 
-    print(f"# shape N={N} K={K} E={E} bs={bs} | mode={args.mode} | "
-          f"SMs={args.sms} SHM_budget={args.shm_budget//1024}KB", file=sys.stderr)
-    print(f"# {len(configs)} candidate(s) after analytic pruning",
-          file=sys.stderr)
+    print(
+        f"# shape N={N} K={K} E={E} bs={bs} | mode={args.mode} | "
+        f"SMs={args.sms} SHM_budget={args.shm_budget // 1024}KB",
+        file=sys.stderr,
+    )
+    print(f"# {len(configs)} candidate(s) after analytic pruning", file=sys.stderr)
 
     if args.verify:
         src_dir = os.path.normpath(args.src_dir)
-        print(f"# verifying exact SHM via nvcc (-I {src_dir}) ...",
-              file=sys.stderr)
+        print(f"# verifying exact SHM via nvcc (-I {src_dir}) ...", file=sys.stderr)
         shm = verify_shm(configs, src_dir)
         kept = []
         n_assert = n_budget = 0
@@ -521,19 +655,32 @@ def main():
                 continue
             kept.append(c)
         configs = kept
-        print(f"# {len(configs)} feasible after nvcc verify "
-              f"({n_assert} rejected by geometry static_assert, "
-              f"{n_budget} over SHM budget)", file=sys.stderr)
+        print(
+            f"# {len(configs)} feasible after nvcc verify "
+            f"({n_assert} rejected by geometry static_assert, "
+            f"{n_budget} over SHM budget)",
+            file=sys.stderr,
+        )
 
     # Sort: fewer SMs first is NOT the goal; keep stable by (grid desc, shm asc).
-    configs.sort(key=lambda c: (-c["sms_used"],
-                                c.get("shm_exact", c["shm_est"])))
+    configs.sort(key=lambda c: (-c["sms_used"], c.get("shm_exact", c["shm_est"])))
 
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(N=N, K=K, E=E, bs=bs, mode=args.mode,
-                           sms=args.sms, shm_budget=args.shm_budget,
-                           configs=configs), f, indent=2)
+            json.dump(
+                dict(
+                    N=N,
+                    K=K,
+                    E=E,
+                    bs=bs,
+                    mode=args.mode,
+                    sms=args.sms,
+                    shm_budget=args.shm_budget,
+                    configs=configs,
+                ),
+                f,
+                indent=2,
+            )
         print(f"# wrote {len(configs)} configs -> {args.json}", file=sys.stderr)
 
     # Human-readable table to stdout.
@@ -541,17 +688,22 @@ def main():
         shm_kb = c.get("shm_exact_kb", c["shm_est"] // 1024)
         tag = "exact" if "shm_exact_kb" in c else "est"
         if c["mode"] == "coupled":
-            print(f"coupled  grid={c['grid']:3d} bpe={c['bpe']} "
-                  f"groups={c['groups']:2d} DCT={c['down_col_tile']:3d} "
-                  f"UCH={c['up_col_halves']} KUP={c['k_step_up']:3d} "
-                  f"KDN={c['k_step_down']:3d} SLOTS={c['up_w_slots']} "
-                  f"SHM={shm_kb}KB({tag})")
+            print(
+                f"coupled  grid={c['grid']:3d} bpe={c['bpe']} "
+                f"groups={c['groups']:2d} DCT={c['down_col_tile']:3d} "
+                f"UCH={c['up_col_halves']} KUP={c['k_step_up']:3d} "
+                f"KDN={c['k_step_down']:3d} SLOTS={c['up_w_slots']} "
+                f"DWS={c['down_weight_slots']} SHM={shm_kb}KB({tag})"
+            )
         else:
-            print(f"decoup   grid={c['grid']:3d} up={c['up_groups']}x{c['up_bpe']} "
-                  f"dn={c['down_groups']}x{c['down_bpe']} R={c['barrier_ratio']} "
-                  f"DCT={c['down_col_tile']:3d} UCH={c['up_col_halves']} "
-                  f"KUP={c['k_step_up']:3d} KDN={c['k_step_down']:3d} "
-                  f"SLOTS={c['up_w_slots']} SHM={shm_kb}KB({tag})")
+            print(
+                f"decoup   grid={c['grid']:3d} up={c['up_groups']}x{c['up_bpe']} "
+                f"dn={c['down_groups']}x{c['down_bpe']} R={c['barrier_ratio']} "
+                f"DCT={c['down_col_tile']:3d} UCH={c['up_col_halves']} "
+                f"KUP={c['k_step_up']:3d} KDN={c['k_step_down']:3d} "
+                f"SLOTS={c['up_w_slots']} DWS={c['down_weight_slots']} "
+                f"SHM={shm_kb}KB({tag})"
+            )
 
 
 if __name__ == "__main__":

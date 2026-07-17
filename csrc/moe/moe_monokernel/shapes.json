@@ -18,17 +18,18 @@
       "N": 512,
       "K": 2048,
       "bs16": true,
-      "bs16_config_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+      "bs16_config_ids": [0, 1, 2, 3, 6, 7, 8],
       "default_top_k": 8,
       "configs": [
         {"id": 0, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 4, "note": "default, UCH=1 interleaved"},
         {"id": 1, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 4},
         {"id": 2, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2},
         {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
-        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave); BS16 fits ONLY with MONO_BS16_DIRECT_EPILOGUE (down_out reclaim)"},
-        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128; BS16 fits ONLY with MONO_BS16_DIRECT_EPILOGUE (down_out reclaim)"},
+        {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave); remains excluded from BS16 because staged SHM does not fit"},
+        {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128; remains excluded from BS16 because staged SHM does not fit"},
         {"id": 6, "grid": 128, "dct": 256, "kup": 128, "kdn": 128, "slots": 2, "uch": 2, "note": "BS16-safe decoupled/raw candidate: UCH=2 with DCT=256 to stay within SHM budget"},
-        {"id": 7, "grid": 128, "dct": 256, "kup": 256, "kdn": 128, "slots": 4, "dpd": 4, "note": "config-0 up side + 4-deep down TMA ring (KDN=128, DPD=4): 2 K-steps of down lookahead to keep DRAM busy through the per-expert epilogue"}
+        {"id": 7, "grid": 128, "dct": 256, "kup": 256, "kdn": 128, "slots": 4, "dpd": 4, "note": "config-0 up side + 4-deep down TMA ring (KDN=128, DPD=4): 2 K-steps of down lookahead to keep DRAM busy through the per-expert epilogue"},
+        {"id": 8, "grid": 128, "dct": 128, "kup": 256, "kdn": 256, "slots": 4, "uch": 1, "dpd": 2, "dws": 4, "note": "weight-only 4-stage down ring: DCT=128, KDN=256, activation depth 2; continuous cross-expert weight stream"}
       ]
     },
     {
@@ -118,6 +119,21 @@
         {"id": 3, "grid": 128, "dct": 256, "kup": 256, "kdn": 256, "slots": 2},
         {"id": 4, "grid": 128, "dct": 512, "kup": 256, "kdn": 128, "slots": 2, "note": "UCH=2 raw (no interleave)"},
         {"id": 5, "grid": 128, "dct": 512, "kup": 128, "kdn": 128, "slots": 2, "note": "UCH=2 raw, KUP=128"}
+      ]
+    },
+    {
+      "_comment": "SYNTHETIC down-boundary benchmark (2026-07-16): 35B-like E/K/top_k but N_half = K = 2048, so the down-proj reduction dim is 2048 and one down expert runs K_TILES_DOWN = 8 KDN=256 K-steps — vs 2 on the 35B BS16 base op — with the SAME DCT=128 / KDN=256 / DOWN_GROUPS=8 down geometry. Isolates whether amortizing the per-expert boundary over 4x more iterations removes the down-phase DRAM comb (the up phase's 8-step steadiness hypothesis). UCH derives to 2 (raw two-TMA up-proj, no interleave).",
+      "key": "e256_n2048_k2048",
+      "aliases": ["down2048"],
+      "display_name": "Synthetic down-K2048 (E256 N_half2048 K2048) block-wise FP8",
+      "E": 256,
+      "N": 2048,
+      "K": 2048,
+      "bs16": true,
+      "bs16_config_ids": [0],
+      "default_top_k": 8,
+      "configs": [
+        {"id": 0, "grid": 128, "dct": 128, "kup": 256, "kdn": 256, "slots": 2, "note": "matches the 35B BS16 base op's down geometry (DCT=128, KDN=256, DOWN_GRID=16, DOWN_GROUPS=8) but with 8 down K-steps/expert; UCH=2 raw, UP_GRID=16, UP_GROUPS=8 (coupled). DPD=4 isolation test 2026-07-16: 68.3% vs 68.0% DRAM, 373 vs 377 us — pipeline depth is NOT the down-phase DRAM limiter."}
       ]
     },
     {

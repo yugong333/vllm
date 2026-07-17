@@ -363,9 +363,10 @@ def moe_monokernel_topk(
     assert expert_weights_down.dtype is torch.float8_e4m3fn
     assert expert_scales_down.dtype is torch.float32
 
-    assert M <= 8, (
+    assert M <= 16, (
         f"moe_monokernel_topk: unsupported batch size M={M}. "
-        "Only the BS8 (M<=8) TMA+WGMMA path is supported."
+        "Only the BS8 (M<=8) and BS16 (8<M<=16, shapes with bs16=true in "
+        "shapes.json) TMA+WGMMA paths are supported."
     )
 
     # M-row tensors are safe for any M <= 8: the kernel's memory footprint
@@ -401,7 +402,35 @@ def moe_monokernel_topk(
             f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
             f"Supported: {supported}; block-wise FP8."
         )
-    op_name = row["tunable_op"] if config_id >= 0 else row["named_op"]
+    if M > 8:
+        # BS16 path: use the named default for config_id < 0, or the BS16
+        # tunable dispatcher for config_id >= 0.  This lets the BS16 path
+        # sweep the same coupled (UCH=1/interleaved) and decoupled/raw
+        # (UCH>=2/no-interleave) config candidates as BS8.
+        op_name_bs16 = row.get("named_op_bs16")
+        tunable_op_bs16 = row.get("tunable_op_bs16")
+        assert op_name_bs16 is not None, (
+            f"moe_monokernel_topk: M={M} > 8 but shape "
+            f"E{E} N{N} K{K} ({row['display_name']}) has no BS16 op. "
+            'Set "bs16": true for the shape in shapes.json and rebuild.'
+        )
+        if config_id >= 0:
+            bs16_ids = row.get("bs16_config_ids") or []
+            assert config_id in bs16_ids, (
+                f"moe_monokernel_topk: M={M} > 8 config_id={config_id} is "
+                f"not supported by the BS16 op for E{E} N{N} K{K} "
+                f"({row['display_name']}). Supported BS16 config ids: {bs16_ids}"
+            )
+            assert tunable_op_bs16 is not None, (
+                f"moe_monokernel_topk: M={M} > 8 shape "
+                f"E{E} N{N} K{K} ({row['display_name']}) has no BS16 "
+                "tunable op. Regenerate shapes and rebuild."
+            )
+            op_name = tunable_op_bs16
+        else:
+            op_name = op_name_bs16
+    else:
+        op_name = row["tunable_op"] if config_id >= 0 else row["named_op"]
     low_level_op = getattr(torch.ops._moe_C, op_name)
 
     # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with SWIZZLE_128B on
