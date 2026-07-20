@@ -1,0 +1,68 @@
+{
+  "model": "qwen3.5_122b",
+  "shape": "122b",
+  "top_k": 8,
+  "acc_threshold": 0.999,
+  "perf_source": "route_capture",
+  "interleave_overhead_mb": 1536.0,
+  "best_per_M": {
+    "8": {
+      "config_id": 1,
+      "speedup": 1.9767181245316106,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 384,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    }
+  },
+  "best_interleave_per_M": {},
+  "best_no_interleave_per_M": {
+    "8": {
+      "config_id": 1,
+      "speedup": 1.9767181245316106,
+      "knobs": {
+        "grid": 128,
+        "down_col_tile": 384,
+        "k_step_up": 256,
+        "k_step_down": 128,
+        "up_w_slots": 2
+      },
+      "interleave": false,
+      "up_col_halves": 2
+    }
+  },
+  "config_table": {
+    "0": {
+      "grid": 128,
+      "down_col_tile": 384,
+      "k_step_up": 128,
+      "k_step_down": 128,
+      "up_w_slots": 2,
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "1": {
+      "grid": 128,
+      "down_col_tile": 384,
+      "k_step_up": 256,
+      "k_step_down": 128,
+      "up_w_slots": 2,
+      "interleave": false,
+      "up_col_halves": 2
+    },
+    "2": {
+      "grid": 128,
+      "down_col_tile": 384,
+      "k_step_up": 128,
+      "k_step_down": 128,
+      "up_w_slots": 4,
+      "interleave": false,
+      "up_col_halves": 2
+    }
+  }
+}

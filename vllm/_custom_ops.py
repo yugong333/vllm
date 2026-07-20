@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -14,6 +15,7 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -203,6 +205,329 @@ def paged_attention_v2(
         blocksparse_block_size,
         blocksparse_head_sliding_step,
     )
+
+
+# Scoring function constants matching the CUDA enum ScoringFunc
+MOE_SCORING_SIGMOID = 0
+MOE_SCORING_SOFTMAX = 1
+
+
+def _resolve_monokernel_config_id(E: int, N: int, K: int) -> int:
+    """Resolve the monokernel KernelConfig id for a shape from the
+    `MONOKERNEL_CONFIG` env var.  Returns -1 (use shipped default) if unset
+    or unparsable.
+
+    Accepted forms:
+      MONOKERNEL_CONFIG=2                 -> id 2 for ANY shape
+      MONOKERNEL_CONFIG=122b:2,35b:1      -> per-shape ids by name/alias
+      MONOKERNEL_CONFIG=E256N2048K3072:2  -> per-shape ids by E/N/K key (N fused)
+
+    Shape metadata + the parse live in the generated registry
+    (vllm.model_executor.layers.fused_moe.monokernel_shapes), so new shapes
+    declared in csrc/moe/moe_monokernel/shapes.json are picked up with no edit
+    here.  N is the FUSED gate+up dim (2*N_half), matching the weight tensor.
+    """
+    import os
+
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes
+
+    return monokernel_shapes.resolve_config_id(
+        E, N, K, os.environ.get("MONOKERNEL_CONFIG", "")
+    )
+
+
+def _monokernel_config_is_raw_upproj(E: int, N: int, K: int, config_id: int) -> bool:
+    """True if the selected config uses the raw two-TMA up-proj (UCH>=2) and
+    therefore must NOT be fed Python-interleaved weights.  Delegates to the
+    generated registry (per-shape raw-config-id sets)."""
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes
+
+    return monokernel_shapes.config_is_raw_upproj(E, N, K, config_id)
+
+
+def moe_monokernel_topk(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    expert_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+    config_id: int = -1,
+) -> torch.Tensor:
+    """MoE monokernel with configurable top-K routing, scoring function,
+    and renormalization.
+
+    `config_id` selects a tuned KernelConfig variant (grid / down-col-tile /
+    K-step / weight-TMA slots).  The default -1 means "use the shipped
+    default kernel" (the original named op, byte-identical to pre-tuning
+    behavior).  A non-negative id routes to the shape's `_tunable` op and
+    that config_id; id 0 of the tunable op is itself the shipped default, so
+    -1 and 0 produce the same kernel.  If unset here, it is resolved from the
+    `MONOKERNEL_CONFIG` env var (see `_resolve_monokernel_config_id`).
+
+    Supports top_k from 1 to 8, softmax or sigmoid scoring, and optional
+    weight renormalization. Designed for models like Qwen3 Coder FP8
+    (128 experts, top_k=8, softmax, renormalize=True).
+
+    Args:
+        activations_in: Input activations [M, K] in bfloat16
+        router_logits: Router logits [M, E] in bfloat16
+        expert_weights_up: Up-projection weights [E, 2*N, K] in fp8
+        expert_scales_up: Up-projection scales [E, 2*N, 1] in float32
+        expert_weights_down: Down-projection weights [E, K, N] in fp8
+        expert_scales_down: Down-projection scales [E, K, 1] in float32
+        scratchpad: Temporary storage tensor
+        top_k: Number of experts per token (1-8)
+        scoring_func: "softmax" or "sigmoid"
+        renormalize: Whether to renormalize top-K weights to sum to 1
+        expert_bias: Optional per-expert selection bias [E] in float32
+            (GLM-style ``e_score_correction_bias``). When provided (sigmoid
+            scoring only), experts are ranked by ``sigmoid(logit) + bias`` while
+            the routing weight stays the unbiased ``sigmoid(logit)`` — matching
+            grouped_topk's biased-select / unbiased-weight split. ``None`` =>
+            rank on the raw logits (default; byte-identical to the Qwen path).
+        routed_scaling_factor: Scalar folded into every routing weight
+            (GLM's ``routed_scaling_factor``). Default 1.0 => no-op.
+    """
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "The optimized moe kernel is only available on CUDA platforms"
+        )
+
+    assert activations_in.dim() == 2
+    assert router_logits.dim() == 2
+    assert expert_weights_up.dim() == 3
+    assert expert_scales_up.dim() == 3
+    assert expert_weights_down.dim() == 3
+    assert expert_scales_down.dim() == 3
+
+    assert activations_in.is_contiguous()
+    assert router_logits.is_contiguous()
+    assert expert_weights_up.is_contiguous()
+    assert expert_scales_up.is_contiguous()
+    assert expert_weights_down.is_contiguous()
+    assert expert_scales_down.is_contiguous()
+
+    assert 1 <= top_k <= 8, f"top_k must be between 1 and 8, got {top_k}"
+    assert scoring_func in ("softmax", "sigmoid"), (
+        f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func}"
+    )
+
+    scoring_func_int = (
+        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
+    )
+
+    E = router_logits.size(1)
+    M = activations_in.size(0)
+    # Derive N and K from actual tensor shapes — works for any model/TP config
+    N = expert_weights_up.size(1)  # gate+up fused: 2*N_half
+    K = expert_weights_up.size(2)  # hidden states
+
+    assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
+    assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
+    assert expert_weights_down.size() == (E, K, N // 2), (
+        f"size is: {expert_weights_down.size()}"
+    )
+
+    # Scale shapes: block-wise (128×128) → [E, ceil(rows/128), ceil(cols/128)]
+    N_half = N // 2
+    up_scale_rows = (N + 127) // 128  # ceil(2*N_half / 128)
+    up_scale_cols = (K + 127) // 128  # ceil(K / 128)
+    down_scale_rows = (K + 127) // 128  # ceil(K / 128)
+    down_scale_cols = (N_half + 127) // 128  # ceil(N_half / 128)
+    assert expert_scales_up.size() == (E, up_scale_rows, up_scale_cols), (
+        f"expert_scales_up size is: {expert_scales_up.size()}, "
+        f"expected: ({E}, {up_scale_rows}, {up_scale_cols})"
+    )
+    assert expert_scales_down.size() == (E, down_scale_rows, down_scale_cols), (
+        f"expert_scales_down size is: {expert_scales_down.size()}, "
+        f"expected: ({E}, {down_scale_rows}, {down_scale_cols})"
+    )
+
+    assert activations_in.dtype is torch.bfloat16
+    # The kernel reads router logits as bfloat16 (const __nv_bfloat16*). Some
+    # gates (e.g. GLM 5.2's GateLinear) emit fp32 logits, so cast here rather
+    # than asserting — the bias (added in fp32 inside the kernel) preserves the
+    # selection metric's precision; only the logit itself is rounded to bf16,
+    # which matches what bf16-gate models already feed.
+    if router_logits.dtype is not torch.bfloat16:
+        router_logits = router_logits.to(torch.bfloat16)
+    assert expert_weights_up.dtype is torch.float8_e4m3fn
+    assert expert_scales_up.dtype is torch.float32
+    assert expert_weights_down.dtype is torch.float8_e4m3fn
+    assert expert_scales_down.dtype is torch.float32
+
+    assert M <= 16, (
+        f"moe_monokernel_topk: unsupported batch size M={M}. "
+        "Only the BS8 (M<=8) and BS16 (8<M<=16, shapes with bs16=true in "
+        "shapes.json) TMA+WGMMA paths are supported."
+    )
+
+    # M-row tensors are safe for any M <= 8: the kernel's memory footprint
+    # matches the logical batch size on both sides.  The activation TMA
+    # descriptor is built over the REAL row count (the TMA engine
+    # hardware-zeros out-of-bounds box rows), and Phase 5 writes exactly
+    # rows [0, M) of the output.  (A former 8-row padding workaround here
+    # covered an OOB read/write when the descriptor was still built over
+    # a fixed 8 rows; removed with the kernel-side fix, 2026-07-14.)
+    # Allocate output tensor (separate from input for top-K accumulation).
+    activations_out = torch.zeros_like(activations_in)
+
+    # Resolve the config selection: an explicit non-negative `config_id`
+    # wins; otherwise consult the MONOKERNEL_CONFIG env var (per-shape).
+    # -1 => use the shipped default named op (today's behavior).
+    if config_id is None or config_id < 0:
+        config_id = _resolve_monokernel_config_id(E, N, K)
+
+    # Dispatch by (E, N, K) shape via the generated registry.  N here is the
+    # fused gate+up dim = 2 * moe_intermediate_size.  Every shape declared in
+    # csrc/moe/moe_monokernel/shapes.json is routable with no edit here; with a
+    # non-negative config_id we route to the `_tunable` op (trailing config_id),
+    # otherwise the named default op.
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes
+
+    row = monokernel_shapes.row_for(E, N, K)
+    if row is None:
+        supported = ", ".join(
+            f"E{r['E']} N{r['N_fused']} K{r['K']} ({r['display_name']})"
+            for r in monokernel_shapes.SHAPES
+        )
+        raise AssertionError(
+            f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
+            f"Supported: {supported}; block-wise FP8."
+        )
+    if M > 8:
+        # BS16 path: use the named default for config_id < 0, or the BS16
+        # tunable dispatcher for config_id >= 0.  This lets the BS16 path
+        # sweep the same coupled (UCH=1/interleaved) and decoupled/raw
+        # (UCH>=2/no-interleave) config candidates as BS8.
+        op_name_bs16 = row.get("named_op_bs16")
+        tunable_op_bs16 = row.get("tunable_op_bs16")
+        assert op_name_bs16 is not None, (
+            f"moe_monokernel_topk: M={M} > 8 but shape "
+            f"E{E} N{N} K{K} ({row['display_name']}) has no BS16 op. "
+            'Set "bs16": true for the shape in shapes.json and rebuild.'
+        )
+        if config_id >= 0:
+            bs16_ids = row.get("bs16_config_ids") or []
+            assert config_id in bs16_ids, (
+                f"moe_monokernel_topk: M={M} > 8 config_id={config_id} is "
+                f"not supported by the BS16 op for E{E} N{N} K{K} "
+                f"({row['display_name']}). Supported BS16 config ids: {bs16_ids}"
+            )
+            assert tunable_op_bs16 is not None, (
+                f"moe_monokernel_topk: M={M} > 8 shape "
+                f"E{E} N{N} K{K} ({row['display_name']}) has no BS16 "
+                "tunable op. Regenerate shapes and rebuild."
+            )
+            op_name = tunable_op_bs16
+        else:
+            op_name = op_name_bs16
+    else:
+        op_name = row["tunable_op"] if config_id >= 0 else row["named_op"]
+    low_level_op = getattr(torch.ops._moe_C, op_name)
+
+    # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with SWIZZLE_128B on
+    # both weight sides.  The down-projection weights are passed raw — the
+    # TMA hardware applies the core-matrix XOR swizzle at write time.
+    #
+    # Up-projection weight handling differs by variant:
+    #   * 35B (N=1024, K=2048): a single 128-row TMA fetches each WGMMA
+    #     A-tile, so the up-weights must be repacked via
+    #     `interleave_for_tma_wgmma_up_v2` (gate/up PAIR interleave so
+    #     silu(gate)*up is a per-lane register op after the WGMMA). The
+    #     repack is cached on the weight tensor's `_tma_interleaved_up_v2`
+    #     attribute so subsequent calls are free.
+    #   * 122B (N=2048, K=3072): gate and up are fetched with two separate
+    #     TMAs straight from the raw `[E, 2*N, K]` layout, so NO interleave
+    #     is applied — the raw weights are passed through unchanged.
+    # The interleave is needed ONLY for the UCH==1 single-TMA up-proj (the
+    # 35B default).  UCH==2 configs (35B ids 4/5, all 122B) use the raw
+    # two-TMA fork and must receive the unmodified weights.
+    # Interleave is needed ONLY for the UCH==1 single-TMA up-proj.  A shape
+    # whose configs are ALL raw (UCH>=2) — e.g. the 122B — never interleaves;
+    # a mixed shape (e.g. 35B: interleave default, raw ids 4/5) interleaves
+    # unless the selected config is one of its raw ids.
+    raw_upproj = _monokernel_config_is_raw_upproj(E, N, K, config_id)
+    needs_interleave = (not row["all_raw"]) and (not raw_upproj)
+    if needs_interleave:
+        from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
+            interleave_for_tma_wgmma_up_v2,
+        )
+
+        up_weights = getattr(expert_weights_up, "_tma_interleaved_up_v2", None)
+        if up_weights is None:
+            up_weights = interleave_for_tma_wgmma_up_v2(expert_weights_up).contiguous()
+            with contextlib.suppress(AttributeError, RuntimeError):
+                expert_weights_up._tma_interleaved_up_v2 = up_weights
+    else:
+        up_weights = expert_weights_up
+
+    # Optional GLM-style routing controls.  `expert_bias` (per-expert
+    # selection bias, float32 [E]) must live on the activation device; a
+    # None passes through as a null Tensor? to the raw-logit ranking path.
+    if expert_bias is not None:
+        assert expert_bias.dtype is torch.float32, (
+            f"expert_bias must be float32, got {expert_bias.dtype}"
+        )
+        assert expert_bias.numel() == E, (
+            f"expert_bias must have E={E} entries, got {expert_bias.numel()}"
+        )
+        expert_bias = expert_bias.contiguous()
+
+    op_args = [
+        activations_in,
+        router_logits,
+        up_weights,
+        expert_scales_up,
+        expert_weights_down,
+        expert_scales_down,
+        activations_out,
+        scratchpad,
+        top_k,
+        scoring_func_int,
+        renormalize,
+        expert_bias,
+        float(routed_scaling_factor),
+    ]
+    # The tunable op takes a trailing config_id; the named default op does not.
+    if config_id >= 0:
+        op_args.append(config_id)
+    low_level_op(*op_args)
+
+    return activations_out
+
+
+def moe_monokernel_topk_fake(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    expert_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+    config_id: int = -1,
+) -> torch.Tensor:
+    return torch.empty_like(activations_in)
+
+
+direct_register_custom_op(
+    op_name="moe_monokernel_topk",
+    op_func=moe_monokernel_topk,
+    mutates_args=[],
+    fake_impl=moe_monokernel_topk_fake,
+)
 
 
 def paged_attention_rocm(

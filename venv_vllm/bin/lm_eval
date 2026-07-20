@@ -1,0 +1,6 @@
+#!/fsx/export/workspaces/ygkyle/vllm/venv_vllm/bin/python3
+import sys
+from lm_eval.__main__ import cli_evaluate
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(cli_evaluate())

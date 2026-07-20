@@ -382,6 +382,24 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/custom_all_reduce.cu"
     "csrc/libtorch_stable/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
 
+  if(VLLM_GPU_LANG STREQUAL "CUDA" AND
+     DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
+
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(COOPERATIVE_TOPK_ARCHS
+        "9.0a;10.0f;10.1f;10.3f;11.0f;12.0f;12.1f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(COOPERATIVE_TOPK_ARCHS
+        "9.0a;10.0a;10.1a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    endif()
+
+    if(COOPERATIVE_TOPK_ARCHS)
+      list(APPEND VLLM_GPU_FLAGS "-DVLLM_ENABLE_COOPERATIVE_TOPK=1")
+
+    endif()
+  endif()
+
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
@@ -497,6 +515,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_STABLE_EXT_SRC}"
       CUDA_ARCHS "${CUDA_ARCHS}")
+
+    if(COOPERATIVE_TOPK_ARCHS)
+      list(APPEND VLLM_STABLE_EXT_SRC
+        "csrc/libtorch_stable/cooperative_topk.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "csrc/libtorch_stable/cooperative_topk.cu"
+        CUDA_ARCHS "${COOPERATIVE_TOPK_ARCHS}")
+    endif()
 
     # Only build Marlin kernels if we are building for at least some compatible archs.
     # Keep building Marlin for 9.0 as there are some group sizes and shapes that
@@ -843,9 +869,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0f" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0f;11.0f" "${CUDA_ARCHS}")
   else()
-    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.3a" "${CUDA_ARCHS}")
+    cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
   endif()
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
     set(CUTLASS_MOE_SM100_SRCS "csrc/libtorch_stable/quantization/w8a8/cutlass/moe/grouped_mm_c3x_sm100.cu")
@@ -1049,6 +1075,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_C_stable_libtorch PRIVATE
       TORCH_TARGET_VERSION=0x020B000000000000ULL)
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
+    if(COOPERATIVE_TOPK_ARCHS)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_COOPERATIVE_TOPK=1)
+    endif()
     # Needed by CUTLASS kernels
     target_compile_definitions(_C_stable_libtorch PRIVATE
       CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
@@ -1113,6 +1143,95 @@ set_gencode_flags_for_srcs(
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_MOE_WNA16_SRC
     "csrc/libtorch_stable/moe/moe_wna16.cu")
+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
+    # moe_tma.cu is a standalone host-side TU that defines the
+    # CUtensorMap descriptor factories consumed by the TMA WGMMA variant.
+    # Unlike the other src/*.cu files, it is NOT #included into moe.cu —
+    # it is compiled independently and linked.
+    set(SRCS
+       "csrc/moe/moe_monokernel/moe_wrapper.cu"
+       "csrc/moe/moe_monokernel/src/moe_tma.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "9.0a")
+    list(APPEND VLLM_MOE_EXT_SRC "${SRCS}")
+    message(STATUS "Building optimized MoE kernel for archs: 9.0a")
+
+    # moe_wrapper.cu #includes src/moe.cu which in turn #includes all other
+    # .cu/.h files in src/.  CMake's dependency scanner doesn't always detect
+    # #included .cu files, so we list them explicitly here.
+    set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu" APPEND PROPERTY
+      OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_up_projection.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_down_projection.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_scale_inputs.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_routing.cu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_internal.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_interface.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
+        # Generated per-shape code (tools/gen_shapes.py from shapes.json).
+        # moe_interface.h includes dims_generated.inc; moe_wrapper.cu includes
+        # config_table + wrapper + impls (the m.impl registrations).  Listed so
+        # editing shapes.json + regenerating triggers a rebuild.
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/generated/dims_generated.inc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/generated/config_table_generated.inc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/generated/wrapper_generated.inc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/generated/impls_generated.inc"
+    )
+    # The stable MoE binding TU includes defs_generated.inc (the m.def schemas);
+    # rebuild it when shapes.json is regenerated.
+    set_property(SOURCE "csrc/libtorch_stable/moe/torch_bindings.cpp" APPEND PROPERTY
+      OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/generated/defs_generated.inc"
+    )
+    # moe_tma.cu depends on moe_tma.h; declare so rebuilds happen when
+    # the header changes.
+    set_property(SOURCE "csrc/moe/moe_monokernel/src/moe_tma.cu" APPEND PROPERTY
+      OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
+    )
+
+    # Monokernel profiling flags (see csrc/moe/moe_monokernel/DESIGN.md
+    # "Profiling hooks").  Output is GARBAGE under any SKIP flag — timing
+    # only:
+    #
+    #   MONO_PROFILE_SKIP_CALC_UP     : up-proj calc warps compiled out
+    #   MONO_PROFILE_SKIP_PREFETCH_UP : up-proj prefetches compiled out
+    #
+    # IMPORTANT — use `set_property(... APPEND PROPERTY COMPILE_DEFINITIONS
+    # ...)`, NOT `set_source_files_properties(... PROPERTIES ...)`: the
+    # latter REPLACES the property, so a second call silently wipes out
+    # everything set before it.
+
+    # Phase-timing instrumentation — block-0 clock64() phase timestamps
+    # stored in the scratchpad's `phase_timestamps` struct. Output stays
+    # CORRECT.
+    #
+    # Keep disabled in production; enable only for profile_phase_timing.py.
+    # Toggle a measurement build with
+    #   cmake --preset release -DMONO_PROFILE_PHASE_TIMING=ON
+    # Defaults OFF so production builds are unaffected.
+    option(MONO_PROFILE_PHASE_TIMING
+      "Emit monokernel phase timestamps (profiling only)" OFF)
+    if (MONO_PROFILE_PHASE_TIMING)
+      set_property(SOURCE "csrc/moe/moe_monokernel/moe_wrapper.cu"
+        APPEND PROPERTY COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
+    endif()
+  else()
+    if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0)
+      message(STATUS "Not building moe _wrapper.cu as CUDA Compiler version is "
+                     "not >= 12.0, we recommend upgrading to CUDA 12.0 or "
+                     "later if you intend on running FP8 quantized models on "
+                     "Hopper.")
+    else()
+      message(STATUS "Not building optimized MoE kernel as no compatible archs found "
+                     "in CUDA target architectures")
+    endif()
+  endif()
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_MOE_WNA16_SRC}"
